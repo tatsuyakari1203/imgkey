@@ -35,6 +35,25 @@ from keyer import (
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
+HEAVY_OPTIONAL_MODULES = frozenset(
+    {
+        "accelerate",
+        "einops",
+        "huggingface_hub",
+        "kornia",
+        "numba",
+        "onnxruntime",
+        "onnxruntime_gpu",
+        "pymatting",
+        "safetensors",
+        "scipy",
+        "skimage",
+        "timm",
+        "torch",
+        "torchvision",
+        "transformers",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -1187,7 +1206,7 @@ def run_phase3_guided_alpha_tests() -> None:
     assert max_alpha_diff <= 1, f"guided tiled/full alpha diff should be <=1, got {max_alpha_diff}"
     assert max_rgba_diff <= 1, f"guided tiled/full RGBA diff should be <=1, got {max_rgba_diff}"
 
-    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    forbidden = HEAVY_OPTIONAL_MODULES
     imported = forbidden & set(sys.modules)
     assert not imported, f"guided alpha refinement must not import heavy optional modules: {sorted(imported)}"
 
@@ -1305,7 +1324,7 @@ def run_phase4_tile_local_screen_tests() -> None:
             f"checker={seam['max_checker_diff_visible']}"
         )
 
-    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    forbidden = HEAVY_OPTIONAL_MODULES
     imported = forbidden & set(sys.modules)
     assert not imported, f"tile-local screen model must not import heavy optional modules: {sorted(imported)}"
 
@@ -1386,7 +1405,7 @@ def run_phase5_crop_render_tests() -> None:
     crop_tiles = _count_tile_progress(crop_stages)
     assert 0 < crop_tiles < full_tiles, f"crop preview should color-render fewer tiles than full render ({crop_tiles}/{full_tiles})"
 
-    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    forbidden = HEAVY_OPTIONAL_MODULES
     imported = forbidden & set(sys.modules)
     assert not imported, f"crop-only render must not import heavy optional modules: {sorted(imported)}"
 
@@ -1524,7 +1543,7 @@ def run_phase6_tile_local_nearest_inner_tests() -> None:
             "nearest-inner fallback must not materialize full-image float32 RGB debug buffers"
         )
 
-    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    forbidden = HEAVY_OPTIONAL_MODULES
     imported = forbidden & set(sys.modules)
     assert not imported, f"tile-local nearest-inner fallback must not import heavy optional modules: {sorted(imported)}"
 
@@ -1843,13 +1862,13 @@ def run_v4_edge_repair_tests() -> None:
     )
     assert labels is None and label_to_flat is None, "oversized exports should skip nearest-inner labels and fall back safely"
 
-    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    forbidden = HEAVY_OPTIONAL_MODULES
     imported = forbidden & set(sys.modules)
     assert not imported, f"default v4 edge repair path must not import heavy optional modules: {sorted(imported)}"
 
 
 def run_optional_ai_seam_tests() -> None:
-    heavy_modules = {"torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu", "pymatting", "scipy", "numba"}
+    heavy_modules = HEAVY_OPTIONAL_MODULES
     before = {name for name in heavy_modules if name in sys.modules}
     missing_model = Path(".artifact") / "missing-birefnet-model"
 
@@ -1878,11 +1897,77 @@ def run_optional_ai_seam_tests() -> None:
     assert after == before, f"AI capability checks must not import heavy runtimes: {after - before}"
 
 
+def run_gpu_runtime_probe_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert "torch" not in sys.modules, "smoke test start should not have torch imported"
+    gpu_runtime = importlib.import_module("gpu_runtime")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing gpu_runtime must not import heavy runtimes: {after_import - before}"
+
+    fake_smi = {
+        "available": False,
+        "path": None,
+        "error": "nvidia-smi was not found on PATH",
+        "driver_version": None,
+        "cuda_version": None,
+        "gpus": [],
+    }
+
+    def missing_torch_loader() -> object:
+        raise ImportError("No module named 'torch'")
+
+    missing_probe = gpu_runtime.probe_gpu(torch_loader=missing_torch_loader, nvidia_smi_probe=lambda: fake_smi)
+    assert missing_probe["status"] == "unavailable"
+    assert missing_probe["available"] is False
+    assert missing_probe["reason"] == "torch_import_failed"
+    assert missing_probe["torch"]["import_success"] is False
+    assert "ImportError" in missing_probe["torch"]["import_error"]
+    assert missing_probe["cuda"]["is_available"] is False
+    assert missing_probe["matmul_smoke"]["ran"] is False
+    assert "pytorch" in missing_probe["message"].lower()
+
+    class FakeVersion:
+        cuda = None
+
+    class FakeCuda:
+        def get_arch_list(self) -> list[str]:
+            return ["sm_120"]
+
+        def is_available(self) -> bool:
+            return False
+
+        def device_count(self) -> int:
+            return 0
+
+    class FakeTorch:
+        __version__ = "0.test"
+        version = FakeVersion()
+        cuda = FakeCuda()
+
+    cpu_probe = gpu_runtime.probe_gpu(torch_loader=lambda: FakeTorch(), nvidia_smi_probe=lambda: fake_smi)
+    assert cpu_probe["status"] == "unavailable"
+    assert cpu_probe["reason"] == "cuda_unavailable"
+    assert cpu_probe["torch"]["import_success"] is True
+    assert cpu_probe["torch"]["version"] == "0.test"
+    assert cpu_probe["cuda"]["arch_list"] == ["sm_120"]
+    assert cpu_probe["matmul_smoke"]["ran"] is False
+    assert "cuda" in cpu_probe["message"].lower()
+
+    for probe in (missing_probe, cpu_probe):
+        round_tripped = json.loads(json.dumps(probe))
+        for key in ("schema_version", "status", "message", "torch", "cuda", "nvidia_smi", "matmul_smoke"):
+            assert key in round_tripped, f"gpu runtime probe JSON missing {key}"
+
+    after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_probe == before, f"fake gpu probe tests must not import heavy runtimes: {after_probe - before}"
+
+
 def run_import_compile_tests() -> None:
-    for source in ("app.py", "keyer.py", "smoke_test.py", "ai_assist.py"):
+    for source in ("app.py", "keyer.py", "smoke_test.py", "ai_assist.py", "gpu_runtime.py"):
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
+    importlib.import_module("gpu_runtime")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1908,6 +1993,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
     run_optional_ai_seam_tests()
+    run_gpu_runtime_probe_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()

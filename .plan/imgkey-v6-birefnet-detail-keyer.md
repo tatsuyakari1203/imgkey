@@ -139,10 +139,13 @@ Isolation:
 - Own `gpu_runtime.py`, docs/tests. No model inference yet. UI display of GPU Status belongs to Phase 5.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added `gpu_runtime.py` with lazy torch-only-inside-probe CUDA diagnostics, `python -m gpu_runtime --probe --json`, nvidia-smi driver/GPU/VRAM reporting, CUDA device metadata, and a CUDA matmul smoke test. CPU/no-torch environments return valid JSON with an actionable unavailable status and do not crash.
 
 
 
@@ -169,10 +172,13 @@ Acceptance:
 - GPU environment reports RTX 5060 Ti/CUDA/matmul success.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added smoke coverage for `gpu_runtime` import fencing and JSON probe shape using fake missing/CPU-only torch loaders; verified the real probe reports RTX 5060 Ti via nvidia-smi while PyTorch is not installed in this environment.
 
 
 ---
@@ -195,7 +201,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -213,7 +219,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
