@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import hashlib
 import importlib
+import json
 from pathlib import Path
 import py_compile
 import sys
+from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ai_assist import BiRefNetAlphaAssist, CorridorKeyPlugin, check_birefnet_availability, check_corridorkey_availability
 from keyer import (
@@ -23,6 +26,7 @@ from keyer import (
 
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
+ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,12 @@ class DiagnosticFixture:
     rgb: np.ndarray
     settings: KeySettings
     notes: str
+    known_background_mask: np.ndarray | None = None
+    foreground_core_mask: np.ndarray | None = None
+    soft_edge_mask: np.ndarray | None = None
+    expected_alpha: np.ndarray | None = None
+    expected_foreground_rgb: np.ndarray | tuple[int, int, int] | None = None
+    diagnostic_only: bool = True
 
 
 def _disc_alpha(h: int, w: int, radius: float, feather: float = 0.0) -> np.ndarray:
@@ -46,6 +56,91 @@ def _composite_rgb(background: np.ndarray, foreground: tuple[int, int, int], alp
     bg = background.astype(np.float32)
     rgb = bg * (1.0 - alpha[:, :, None]) + fg * alpha[:, :, None]
     return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _composite_rgb_array(background: np.ndarray, foreground_rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    bg = background.astype(np.float32)
+    fg = foreground_rgb.astype(np.float32)
+    rgb = bg * (1.0 - alpha[:, :, None]) + fg * alpha[:, :, None]
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _masks_from_alpha(alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    known_background = alpha <= 0.002
+    foreground_core = alpha >= 0.995
+    soft_edge = (alpha > 0.002) & (alpha < 0.995)
+    return known_background, foreground_core, soft_edge
+
+
+def _expected_foreground_array(fixture: DiagnosticFixture) -> np.ndarray | None:
+    expected = fixture.expected_foreground_rgb
+    if expected is None:
+        return None
+    if isinstance(expected, tuple):
+        return np.broadcast_to(np.asarray(expected, dtype=np.uint8).reshape(1, 1, 3), fixture.rgb.shape).copy()
+    if expected.shape != fixture.rgb.shape:
+        raise AssertionError(f"{fixture.name}: expected foreground RGB shape mismatch")
+    return expected.astype(np.uint8, copy=False)
+
+
+def _expected_rgba_for_fixture(fixture: DiagnosticFixture) -> np.ndarray | None:
+    if fixture.expected_alpha is None:
+        return None
+    fg = _expected_foreground_array(fixture)
+    if fg is None:
+        return None
+    alpha_u8 = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgba = np.zeros((*alpha_u8.shape, 4), dtype=np.uint8)
+    rgba[:, :, :3] = fg
+    rgba[:, :, 3] = alpha_u8
+    rgba[alpha_u8 == 0, :3] = 0
+    return rgba
+
+
+def _fixture_masks(fixture: DiagnosticFixture) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    shape = fixture.rgb.shape[:2]
+    if fixture.known_background_mask is not None:
+        known_background = fixture.known_background_mask.astype(bool, copy=False)
+    elif fixture.expected_alpha is not None:
+        known_background = fixture.expected_alpha <= 0.002
+    else:
+        known_background = np.zeros(shape, dtype=bool)
+
+    if fixture.foreground_core_mask is not None:
+        foreground_core = fixture.foreground_core_mask.astype(bool, copy=False)
+    elif fixture.expected_alpha is not None:
+        foreground_core = fixture.expected_alpha >= 0.995
+    else:
+        foreground_core = np.zeros(shape, dtype=bool)
+
+    if fixture.soft_edge_mask is not None:
+        soft_edge = fixture.soft_edge_mask.astype(bool, copy=False)
+    elif fixture.expected_alpha is not None:
+        soft_edge = (fixture.expected_alpha > 0.002) & (fixture.expected_alpha < 0.995)
+    else:
+        soft_edge = np.zeros(shape, dtype=bool)
+    return known_background, foreground_core, soft_edge
+
+
+def _array_sha256(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.shape).encode("utf-8"))
+    digest.update(str(contiguous.dtype).encode("utf-8"))
+    digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _edge_fringe_fixture(
@@ -185,6 +280,231 @@ def antialiased_edge_fixture() -> DiagnosticFixture:
     )
 
 
+def blue_gradient_screen_fixture() -> DiagnosticFixture:
+    h, w = 540, 760
+    x_grad = np.linspace(-20, 20, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-14, 16, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(30 + x_grad * 0.45 + y_grad * 0.18, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(80 + x_grad * 0.35 - y_grad * 0.20, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(235 + x_grad + y_grad * 0.55, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 150, feather=12.0)
+    foreground = (224, 170, 118)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="blue_gradient_screen",
+        rgb=_composite_rgb(background, foreground, alpha),
+        settings=KeySettings(
+            key_color=(30, 80, 235),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+        ),
+        notes="v5 baseline diagnostic: blue screen with horizontal/vertical illumination gradient.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def green_gradient_screen_fixture() -> DiagnosticFixture:
+    h, w = 540, 760
+    x_grad = np.linspace(-24, 22, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-18, 18, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(4 + x_grad * 0.12 + y_grad * 0.10, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(220 + x_grad + y_grad * 0.65, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(45 + x_grad * 0.16 - y_grad * 0.25, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 150, feather=12.0)
+    foreground = (218, 162, 124)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="green_gradient_screen",
+        rgb=_composite_rgb(background, foreground, alpha),
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+        ),
+        notes="v5 baseline diagnostic: green screen with shadow/highlight gradient.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def same_key_foreground_core_fixture() -> DiagnosticFixture:
+    h, w = 520, 700
+    key_color = (0, 220, 50)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = key_color
+    alpha = _disc_alpha(h, w, 155, feather=5.0)
+    foreground = np.zeros((h, w, 3), dtype=np.uint8)
+    foreground[:, :] = (214, 156, 120)
+    yy, xx = np.indices((h, w))
+    key_like_core = ((xx - w // 2) ** 2) / float(62**2) + ((yy - (h // 2 - 8)) ** 2) / float(42**2) <= 1.0
+    foreground[key_like_core] = (3, 210, 55)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    foreground_core = foreground_core | key_like_core
+    return DiagnosticFixture(
+        name="same_key_foreground_core",
+        rgb=_composite_rgb_array(background, foreground, alpha),
+        settings=KeySettings(key_color=key_color, aggressive_interior_removal=False, fringe_band_radius=3),
+        notes="v5 baseline diagnostic: disconnected foreground core intentionally matches the key color.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def hair_lines_fixture() -> DiagnosticFixture:
+    h, w = 420, 620
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = (0, 220, 45)
+    scale = 3
+    mask_image = Image.new("L", (w * scale, h * scale), 0)
+    draw = ImageDraw.Draw(mask_image)
+    root_x = w // 2
+    root_y = h // 2 + 95
+    for index in range(19):
+        offset = index - 9
+        x0 = (root_x + offset * 8) * scale
+        y0 = root_y * scale
+        x1 = (root_x + offset * 20) * scale
+        y1 = (h // 2 - 125 - abs(offset) * 2) * scale
+        x_mid = (root_x + offset * 13 + (-1) ** index * 20) * scale
+        y_mid = (h // 2 - 12 - abs(offset) * 5) * scale
+        draw.line([(x0, y0), (x_mid, y_mid), (x1, y1)], fill=245, width=max(2, scale * 2))
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    alpha = np.asarray(mask_image.resize((w, h), resampling), dtype=np.float32) / 255.0
+    foreground = (62, 42, 30)
+    rgb = _composite_rgb(background, foreground, alpha)
+    known_background = alpha <= 0.002
+    foreground_core = alpha >= 0.88
+    soft_edge = (alpha > 0.02) & (alpha < 0.88)
+    return DiagnosticFixture(
+        name="hair_lines",
+        rgb=rgb,
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=6,
+            fringe_band_radius=2,
+        ),
+        notes="v5 baseline diagnostic: sub-pixel anti-aliased hair-like lines over a green screen.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def semi_transparent_glass_fixture() -> DiagnosticFixture:
+    h, w = 500, 700
+    x_grad = np.linspace(-18, 16, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-10, 14, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(28 + x_grad * 0.25, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(78 - y_grad * 0.10, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(235 + x_grad * 0.80 + y_grad * 0.45, 0, 255).astype(np.uint8)
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    ellipse = ((xx - w / 2.0) ** 2) / float(165**2) + ((yy - h / 2.0) ** 2) / float(118**2)
+    glass = np.clip((1.16 - ellipse) / 0.24, 0.0, 1.0) * 0.48
+    highlight = (np.abs((yy - h / 2.0) - 0.32 * (xx - w / 2.0)) < 4.0) & (ellipse < 0.78)
+    alpha = np.maximum(glass, highlight.astype(np.float32) * 0.82)
+    foreground = (226, 242, 255)
+    rgb = _composite_rgb(background, foreground, alpha)
+    known_background = alpha <= 0.002
+    foreground_core = alpha >= 0.80
+    soft_edge = (alpha > 0.02) & (alpha < 0.80)
+    return DiagnosticFixture(
+        name="semi_transparent_glass",
+        rgb=rgb,
+        settings=KeySettings(
+            key_color=(30, 80, 235),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+        ),
+        notes="v5 baseline diagnostic: semi-transparent glass body and bright highlight over blue screen.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def white_gray_black_composite_fixture() -> DiagnosticFixture:
+    h, w = 380, 540
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = (0, 220, 48)
+    alpha = _disc_alpha(h, w, 112, feather=18.0)
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    stem = (np.abs(xx - w / 2.0) < 16.0) & (yy > h / 2.0 - 96) & (yy < h / 2.0 + 112)
+    alpha = np.maximum(alpha, stem.astype(np.float32) * 0.92)
+    foreground = (235, 182, 92)
+    rgb = _composite_rgb(background, foreground, alpha)
+    known_background = alpha <= 0.002
+    foreground_core = alpha >= 0.90
+    soft_edge = (alpha > 0.02) & (alpha < 0.90)
+    return DiagnosticFixture(
+        name="white_gray_black_composite",
+        rgb=rgb,
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+        ),
+        notes="v5 baseline diagnostic: fixture used to compare black/white/gray/checkerboard composites.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def large_tile_gradient_runtime_fixture() -> DiagnosticFixture:
+    h, w = 1152, 1536
+    x_grad = np.linspace(-24, 26, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-18, 20, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(4 + y_grad * 0.10, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(220 + x_grad + y_grad * 0.55, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(46 + x_grad * 0.15 - y_grad * 0.20, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 330, feather=9.0)
+    foreground = (220, 164, 128)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="large_tile_gradient_runtime",
+        rgb=_composite_rgb(background, foreground, alpha),
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+            tile_size=384,
+            tile_overlap=56,
+        ),
+        notes="v5 baseline diagnostic: large gradient screen fixture for tiled-vs-full comparisons.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
 def large_synthetic_fixture() -> DiagnosticFixture:
     # Runtime-only synthetic case; do not commit generated images.
     h, w = 1536, 2048
@@ -208,9 +528,30 @@ def diagnostic_fixtures(include_large: bool = False) -> list[DiagnosticFixture]:
         uneven_gradient_fixture(),
         same_color_island_fixture(),
         antialiased_edge_fixture(),
+        blue_gradient_screen_fixture(),
+        green_gradient_screen_fixture(),
+        same_key_foreground_core_fixture(),
+        hair_lines_fixture(),
+        semi_transparent_glass_fixture(),
+        white_gray_black_composite_fixture(),
     ]
     if include_large:
         fixtures.append(large_synthetic_fixture())
+        fixtures.append(large_tile_gradient_runtime_fixture())
+    return fixtures
+
+
+def algorithm_upgrade_fixtures(include_large: bool = True) -> list[DiagnosticFixture]:
+    fixtures = [
+        blue_gradient_screen_fixture(),
+        green_gradient_screen_fixture(),
+        same_key_foreground_core_fixture(),
+        hair_lines_fixture(),
+        semi_transparent_glass_fixture(),
+        white_gray_black_composite_fixture(),
+    ]
+    if include_large:
+        fixtures.append(large_tile_gradient_runtime_fixture())
     return fixtures
 
 
@@ -239,6 +580,251 @@ def _solid_composite(rgba: np.ndarray, color: tuple[int, int, int]) -> np.ndarra
     alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
     bg = np.asarray(color, dtype=np.float32).reshape(1, 1, 3)
     return np.clip(rgb * alpha + bg * (1.0 - alpha), 0, 255).astype(np.uint8)
+
+
+def edge_key_residual(rgba: np.ndarray, key_color: tuple[int, int, int], edge_mask: np.ndarray) -> dict[str, int | float]:
+    mask = edge_mask.astype(bool, copy=False) & (rgba[:, :, 3] > 0)
+    if not np.any(mask):
+        return {"count": 0, "mean_positive_excess": 0.0, "p95_positive_excess": 0.0, "max_positive_excess": 0}
+    key_channel = int(np.argmax(np.asarray(key_color)))
+    other = [c for c in range(3) if c != key_channel]
+    rgb = rgba[:, :, :3].astype(np.int16)
+    excess = rgb[:, :, key_channel] - np.maximum(rgb[:, :, other[0]], rgb[:, :, other[1]])
+    positive = np.maximum(excess[mask], 0)
+    return {
+        "count": int(positive.size),
+        "mean_positive_excess": float(np.mean(positive)),
+        "p95_positive_excess": float(np.percentile(positive, 95)),
+        "max_positive_excess": int(np.max(positive)),
+    }
+
+
+def opaque_foreground_max_delta(
+    source_rgb: np.ndarray,
+    rgba: np.ndarray,
+    foreground_core_mask: np.ndarray,
+    expected_foreground_rgb: np.ndarray | tuple[int, int, int] | None = None,
+    min_alpha: int = 240,
+) -> dict[str, int | float]:
+    mask = foreground_core_mask.astype(bool, copy=False) & (rgba[:, :, 3] >= min_alpha)
+    if not np.any(mask):
+        return {"count": 0, "max_delta": 0, "mean_delta": 0.0}
+    if expected_foreground_rgb is None:
+        expected = source_rgb
+    elif isinstance(expected_foreground_rgb, tuple):
+        expected = np.broadcast_to(np.asarray(expected_foreground_rgb, dtype=np.uint8).reshape(1, 1, 3), source_rgb.shape)
+    else:
+        expected = expected_foreground_rgb
+    delta = np.abs(rgba[mask, :3].astype(np.int16) - expected[mask].astype(np.int16))
+    return {"count": int(delta.shape[0]), "max_delta": int(np.max(delta)), "mean_delta": float(np.mean(delta))}
+
+
+def alpha_soft_band_count(alpha: np.ndarray, low: int = 0, high: int = 255) -> int:
+    return int(np.count_nonzero((alpha > low) & (alpha < high)))
+
+
+def transparent_rgb_zero(rgba: np.ndarray) -> dict[str, int | bool]:
+    transparent = rgba[:, :, 3] == 0
+    if not np.any(transparent):
+        return {"ok": True, "transparent_pixel_count": 0, "max_rgb_when_transparent": 0}
+    max_rgb = int(rgba[transparent, :3].max())
+    return {
+        "ok": max_rgb == 0,
+        "transparent_pixel_count": int(np.count_nonzero(transparent)),
+        "max_rgb_when_transparent": max_rgb,
+    }
+
+
+def tiled_vs_full_max_diff(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    tile_size: int,
+    tile_overlap: int,
+) -> dict[str, int]:
+    tiled_settings = replace(settings, use_tiling=True, tile_size=tile_size, tile_overlap=tile_overlap)
+    full_settings = replace(tiled_settings, use_tiling=False)
+    tiled = process_key_image(rgb, tiled_settings)
+    full = process_key_image(rgb, full_settings)
+    diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
+    return {
+        "tile_size": int(tile_size),
+        "tile_overlap": int(tile_overlap),
+        "max_rgba_diff": int(diff.max()),
+        "max_alpha_diff": int(diff[:, :, 3].max()),
+    }
+
+
+def composite_black_white_gray_error(
+    rgba: np.ndarray,
+    expected_rgba: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> dict[str, dict[str, int | float]]:
+    if mask is None:
+        mask = np.ones(rgba.shape[:2], dtype=bool)
+    else:
+        mask = mask.astype(bool, copy=False)
+    if not np.any(mask):
+        return {
+            name: {"count": 0, "max_abs_error": 0, "mean_abs_error": 0.0}
+            for name in ("black", "white", "gray")
+        }
+    metrics: dict[str, dict[str, int | float]] = {}
+    for name, color in (("black", (0, 0, 0)), ("white", (255, 255, 255)), ("gray", (128, 128, 128))):
+        actual = _solid_composite(rgba, color)
+        expected = _solid_composite(expected_rgba, color)
+        delta = np.abs(actual[mask].astype(np.int16) - expected[mask].astype(np.int16))
+        metrics[name] = {
+            "count": int(delta.shape[0]),
+            "max_abs_error": int(delta.max()),
+            "mean_abs_error": float(np.mean(delta)),
+        }
+    return metrics
+
+
+def _baseline_metrics_for_fixture(fixture: DiagnosticFixture, result: KeyResult) -> dict[str, Any]:
+    known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+    expected_rgba = _expected_rgba_for_fixture(fixture)
+    edge_mask = soft_edge
+    if not np.any(edge_mask) and result.fringe_mask is not None:
+        edge_mask = result.fringe_mask > 0
+
+    metrics: dict[str, Any] = {
+        "diagnostic_only": bool(fixture.diagnostic_only),
+        "shape": list(fixture.rgb.shape),
+        "mask_counts": {
+            "known_background": int(np.count_nonzero(known_background)),
+            "foreground_core": int(np.count_nonzero(foreground_core)),
+            "soft_edge": int(np.count_nonzero(soft_edge)),
+        },
+        "edge_key_residual": edge_key_residual(result.rgba, fixture.settings.key_color, edge_mask),
+        "opaque_foreground_max_delta": opaque_foreground_max_delta(
+            fixture.rgb,
+            result.rgba,
+            foreground_core,
+            _expected_foreground_array(fixture),
+        ),
+        "alpha_soft_band_count": alpha_soft_band_count(result.alpha),
+        "transparent_rgb_zero": transparent_rgb_zero(result.rgba),
+        "tiled_vs_full_max_diff": None,
+        "composite_black_white_gray_error": None,
+    }
+
+    if expected_rgba is not None:
+        composite_mask = ~known_background | soft_edge
+        metrics["composite_black_white_gray_error"] = composite_black_white_gray_error(
+            result.rgba,
+            expected_rgba,
+            composite_mask,
+        )
+
+    if fixture.name == "large_tile_gradient_runtime":
+        metrics["tiled_vs_full_max_diff"] = {
+            "tile_257": tiled_vs_full_max_diff(fixture.rgb, fixture.settings, tile_size=257, tile_overlap=48),
+            "tile_384": tiled_vs_full_max_diff(fixture.rgb, fixture.settings, tile_size=384, tile_overlap=56),
+        }
+    return metrics
+
+
+def _write_composite_baseline_previews(fixture: DiagnosticFixture, result: KeyResult) -> None:
+    expected_rgba = _expected_rgba_for_fixture(fixture)
+    if expected_rgba is None:
+        return
+    _save_rgb(ALGORITHM_BASELINE_DIR / f"{fixture.name}_source.png", fixture.rgb)
+    _save_rgba(ALGORITHM_BASELINE_DIR / f"{fixture.name}_result.png", result.rgba)
+    Image.fromarray(result.alpha, mode="L").save(ALGORITHM_BASELINE_DIR / f"{fixture.name}_alpha.png")
+    backgrounds: dict[str, tuple[int, int, int] | None] = {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "gray": (128, 128, 128),
+        "checkerboard": None,
+    }
+    for name, color in backgrounds.items():
+        actual = checkerboard_composite(result.rgba) if color is None else _solid_composite(result.rgba, color)
+        expected = checkerboard_composite(expected_rgba) if color is None else _solid_composite(expected_rgba, color)
+        _save_rgb(ALGORITHM_BASELINE_DIR / f"{fixture.name}_actual_on_{name}.png", actual)
+        _save_rgb(ALGORITHM_BASELINE_DIR / f"{fixture.name}_expected_on_{name}.png", expected)
+        _save_rgb(ALGORITHM_BASELINE_DIR / f"{fixture.name}_compare_on_{name}.png", np.concatenate([expected, actual], axis=1))
+
+
+def write_algorithm_upgrade_baseline() -> None:
+    ALGORITHM_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    fixtures = algorithm_upgrade_fixtures(include_large=True)
+    all_metrics: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --write-algorithm-baseline",
+        "baseline_note": "Phase 1 v4 diagnostic baseline; hardest new fixture thresholds are intentionally not enforced yet.",
+        "fixtures": {},
+    }
+    summary_lines = [
+        "# ImgKey v5 classical algorithm baseline",
+        "",
+        "Generated by `python smoke_test.py --write-algorithm-baseline`.",
+        "Hardest v5 fixture checks are diagnostic-only in Phase 1; later phases compare against these hashes/metrics.",
+        "",
+        "| Fixture | Edge residual max | Core max delta | Soft band px | Transparent RGB zero | Tile/full max |",
+        "| --- | ---: | ---: | ---: | --- | ---: |",
+    ]
+
+    for fixture in fixtures:
+        print(f"baseline fixture {fixture.name}: {fixture.notes}")
+        result = process_key_image(fixture.rgb, fixture.settings)
+        known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+        expected_alpha_u8 = (
+            np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if fixture.expected_alpha is not None
+            else np.zeros(fixture.rgb.shape[:2], dtype=np.uint8)
+        )
+        metrics = _baseline_metrics_for_fixture(fixture, result)
+        hashes = {
+            "source_rgb_sha256": _array_sha256(fixture.rgb),
+            "rgba_sha256": _array_sha256(result.rgba),
+            "alpha_sha256": _array_sha256(result.alpha),
+            "known_background_mask_sha256": _array_sha256(known_background.astype(np.uint8)),
+            "foreground_core_mask_sha256": _array_sha256(foreground_core.astype(np.uint8)),
+            "soft_edge_mask_sha256": _array_sha256(soft_edge.astype(np.uint8)),
+        }
+        fixture_record = {
+            "notes": fixture.notes,
+            "settings": asdict(fixture.settings),
+            "metrics": metrics,
+            "hashes": hashes,
+            "artifact": f"{fixture.name}.npz",
+        }
+        all_metrics["fixtures"][fixture.name] = fixture_record
+
+        np.savez_compressed(
+            ALGORITHM_BASELINE_DIR / f"{fixture.name}.npz",
+            source_rgb=fixture.rgb,
+            rgba=result.rgba,
+            alpha=result.alpha,
+            known_background_mask=known_background.astype(np.uint8),
+            foreground_core_mask=foreground_core.astype(np.uint8),
+            soft_edge_mask=soft_edge.astype(np.uint8),
+            expected_alpha=expected_alpha_u8,
+            metrics_json=np.asarray(json.dumps(_json_ready(metrics), sort_keys=True)),
+            hashes_json=np.asarray(json.dumps(hashes, sort_keys=True)),
+        )
+
+        if fixture.name == "white_gray_black_composite":
+            _write_composite_baseline_previews(fixture, result)
+
+        tile_metrics = metrics.get("tiled_vs_full_max_diff") or {}
+        tile_max = 0
+        if isinstance(tile_metrics, dict):
+            tile_max = max((int(v.get("max_rgba_diff", 0)) for v in tile_metrics.values() if isinstance(v, dict)), default=0)
+        transparent = metrics["transparent_rgb_zero"]
+        summary_lines.append(
+            f"| {fixture.name} | {metrics['edge_key_residual']['max_positive_excess']} | "
+            f"{metrics['opaque_foreground_max_delta']['max_delta']} | {metrics['alpha_soft_band_count']} | "
+            f"{transparent['ok']} (max {transparent['max_rgb_when_transparent']}) | {tile_max} |"
+        )
+
+    metrics_path = ALGORITHM_BASELINE_DIR / "metrics.json"
+    metrics_path.write_text(json.dumps(_json_ready(all_metrics), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path = ALGORITHM_BASELINE_DIR / "summary.md"
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    print(f"wrote algorithm baseline metrics to {metrics_path}")
+    print(f"wrote algorithm baseline summary to {summary_path}")
 
 
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
@@ -581,11 +1167,12 @@ def run_import_compile_tests() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    allowed = {"--write-diagnostics", "--write-edge-repair-diagnostics"}
+    allowed = {"--write-diagnostics", "--write-edge-repair-diagnostics", "--write-algorithm-baseline"}
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
-            "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics]; "
+            "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
+            "[--write-algorithm-baseline]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -598,6 +1185,8 @@ def main(argv: list[str] | None = None) -> None:
         write_diagnostic_outputs()
     if "--write-edge-repair-diagnostics" in args:
         write_edge_repair_diagnostics()
+    if "--write-algorithm-baseline" in args:
+        write_algorithm_upgrade_baseline()
     print("smoke ok", rgba.shape)
 
 

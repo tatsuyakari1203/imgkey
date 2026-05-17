@@ -138,10 +138,10 @@ Isolation:
 - Own `smoke_test.py` fixtures/metrics and optional `.artifact/algorithm-upgrade-baseline/` diagnostics. Do not alter core engine behavior.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P1.1 - Add hard fixtures and diagnostic metrics
 - Add or extend synthetic fixtures:
@@ -179,10 +179,13 @@ Acceptance:
 - `python smoke_test.py` remains passing; baseline diagnostics, `metrics.json`, and per-fixture comparison artifacts/hashes are generated under `.artifact/algorithm-upgrade-baseline/`; no engine output changes yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-17: Added v5 diagnostic fixture set in `smoke_test.py` for blue/green gradient screens, same-key foreground core, hair-like thin lines, semi-transparent glass, large tile gradient runtime, and white/gray/black/checkerboard composite checks. Added metric helpers for edge residual, foreground delta, soft alpha band count, transparent RGB zero, tiled/full diff, and composite errors. Generated `.artifact/algorithm-upgrade-baseline/metrics.json`, per-fixture `.npz` artifacts, composite preview diagnostics, and `summary.md`; hardest new checks remain diagnostic-only for Phase 1.
 
 ---
 
@@ -204,7 +207,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P2.1 - Add sRGB/linear conversion helpers
 - Add helper functions near existing color helpers:
@@ -227,7 +230,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P2.2 - Move color reconstruction math to linear light
 - In `_process_color_tile()` convert `rgb_tile`, `screen_tile`/screen color, and nearest-inner RGB to linear before unmix/clamp/pull/luma protect.
