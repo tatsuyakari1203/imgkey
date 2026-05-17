@@ -465,10 +465,10 @@ Isolation:
 - Own nearest-inner fallback helpers and tiled color repair path in `keyer.py` plus tests.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P6.1 - Add tile-local nearest-inner pull when global labels are skipped
 - Keep existing global label map for images below cap.
@@ -487,10 +487,13 @@ Acceptance:
 - Large synthetic edge repair has better residual than no-pull fallback; boundary-band seam tests pass across at least two tile sizes; crop-only render with tile-local nearest-inner enabled matches full-render crop within Phase 5 diff threshold; no full-image float32 RGB allocation.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Added tile-local nearest-inner fallback for capped/absent global labels. The tiled color path now preserves the existing global label map below cap, but when labels are unavailable and `inner_color_pull > 0` it builds read-tile-local labels with `cv2.distanceTransformWithLabels`, using high-alpha/non-background/low-fringe/low-probability inner seeds, a minimum of 8 inner pixels, a per-read-tile label cap, and a radius bounded by the tile overlap/margin. Read overlap now accounts for local nearest-inner radius alongside screen/fringe/guided margins while still writing only tile cores, and single-tile/full-image reads fall back to unmix+clamp instead of bypassing the global cap. Smoke coverage force-skips the global cap path, verifies residual improvement over no-pull fallback (`max 36 -> 18`, `p95 32.0 -> 15.0`), two-tile-size seam metrics (`alpha=0`, opaque non-fringe `rgb=0`, checker `0`), crop/full parity (`max_rgba_diff=0`, `max_alpha_diff=0`), and uint8/no-full-float-debug-buffer invariants.
 
 ---
 
@@ -512,7 +515,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P7.1 - Decide whether to add local probability refinement
 - Evaluate whether gradient/custom fixtures still fail after Phases 2-6.

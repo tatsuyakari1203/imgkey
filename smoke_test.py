@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import importlib
@@ -12,16 +13,19 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
+import keyer as keyer_module
 from ai_assist import BiRefNetAlphaAssist, CorridorKeyPlugin, check_birefnet_availability, check_corridorkey_availability
 from keyer import (
     KeyResult,
     KeySettings,
     _MAX_INNER_LABEL_PIXELS,
     _build_nearest_inner_label_map,
+    _build_tile_local_nearest_inner_rgb,
     _estimate_screen_tile,
     _guided_filter_gray,
     _linear_f32_to_srgb_u8,
     _srgb_u8_to_linear_f32,
+    _tile_local_nearest_inner_radius,
     checkerboard_composite,
     process_chroma_key,
     process_key_image,
@@ -45,6 +49,16 @@ class DiagnosticFixture:
     expected_alpha: np.ndarray | None = None
     expected_foreground_rgb: np.ndarray | tuple[int, int, int] | None = None
     diagnostic_only: bool = True
+
+
+@contextmanager
+def _temporary_inner_label_cap(cap: int):
+    previous = keyer_module._MAX_INNER_LABEL_PIXELS
+    keyer_module._MAX_INNER_LABEL_PIXELS = int(cap)
+    try:
+        yield
+    finally:
+        keyer_module._MAX_INNER_LABEL_PIXELS = previous
 
 
 def _disc_alpha(h: int, w: int, radius: float, feather: float = 0.0) -> np.ndarray:
@@ -621,6 +635,46 @@ def tile_local_shadow_gradient_fixture() -> DiagnosticFixture:
 
 def phase4_tile_local_screen_fixtures() -> list[DiagnosticFixture]:
     return [tile_local_diagonal_gradient_fixture(), tile_local_shadow_gradient_fixture()]
+
+
+def tile_local_nearest_inner_fixture() -> DiagnosticFixture:
+    h, w = 720, 980
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = (30, 80, 235)
+    alpha = _disc_alpha(h, w, 205, feather=18.0)
+    foreground = (232, 178, 92)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="tile_local_nearest_inner",
+        rgb=_composite_rgb_linear(background, np.broadcast_to(np.asarray(foreground, dtype=np.uint8), background.shape), alpha),
+        settings=KeySettings(
+            key_color=(30, 80, 235),
+            auto_border_sample=False,
+            local_screen_model=False,
+            edge_refine_radius=8,
+            clip_background=0.78,
+            clip_foreground=0.14,
+            fringe_band_radius=4,
+            use_tiling=True,
+            tile_size=173,
+            tile_overlap=5,
+            despill=0.35,
+            decontaminate=1.0,
+            unmix_amount=0.35,
+            fringe_remove=0.45,
+            edge_color_repair=1.0,
+            inner_color_pull=1.0,
+            luminance_restore=0.0,
+            luminance_protect=0.0,
+        ),
+        notes="Phase 6 fixture: cap-forced tile-local nearest-inner repair on a large soft blue edge.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+        diagnostic_only=False,
+    )
 
 
 def large_synthetic_fixture() -> DiagnosticFixture:
@@ -1343,6 +1397,147 @@ def run_phase5_crop_render_tests() -> None:
     )
 
 
+def run_phase6_tile_local_nearest_inner_tests() -> None:
+    helper_settings = KeySettings(
+        key_color=(30, 80, 235),
+        auto_border_sample=False,
+        edge_color_repair=1.0,
+        inner_color_pull=1.0,
+        clip_foreground=0.14,
+    )
+    helper_rgb = np.zeros((12, 14, 3), dtype=np.uint8)
+    helper_rgb[:, :] = (30, 80, 235)
+    helper_rgb[2:4, 2:6] = (232, 178, 92)
+    helper_alpha = np.full((12, 14), 128, dtype=np.uint8)
+    helper_probability = np.full((12, 14), 100, dtype=np.uint8)
+    helper_background = np.zeros((12, 14), dtype=bool)
+    helper_fringe = np.full((12, 14), 160, dtype=np.uint8)
+    helper_alpha[2, 2:6] = 255
+    helper_alpha[3, 2:5] = 255
+    helper_probability[helper_alpha == 255] = 0
+    helper_fringe[helper_alpha == 255] = 0
+    too_few_nearest, too_few_valid = _build_tile_local_nearest_inner_rgb(
+        helper_rgb,
+        helper_alpha,
+        helper_background,
+        helper_probability,
+        helper_fringe,
+        helper_settings,
+        max_radius=8,
+    )
+    assert too_few_nearest is None and too_few_valid is None, "tile-local pull requires at least 8 clean inner pixels"
+    helper_alpha[3, 5] = 255
+    helper_probability[3, 5] = 0
+    helper_fringe[3, 5] = 0
+    nearest, valid = _build_tile_local_nearest_inner_rgb(
+        helper_rgb,
+        helper_alpha,
+        helper_background,
+        helper_probability,
+        helper_fringe,
+        helper_settings,
+        max_radius=9,
+    )
+    assert nearest is not None and valid is not None, "tile-local labels should build once the 8-pixel minimum is met"
+    assert nearest.shape == helper_rgb.shape and nearest.dtype == np.uint8, "tile-local nearest RGB must be uint8 read-tile shaped"
+    assert valid.shape == helper_alpha.shape and valid.dtype == bool, "tile-local valid mask must be bool read-tile shaped"
+    assert valid[9, 11], "fringe pixels inside the bounded local radius should receive a nearest-inner color"
+    assert tuple(nearest[9, 11]) == (232, 178, 92), "nearest RGB should come from a clean inner seed pixel"
+    _, tight_valid = _build_tile_local_nearest_inner_rgb(
+        helper_rgb,
+        helper_alpha,
+        helper_background,
+        helper_probability,
+        helper_fringe,
+        helper_settings,
+        max_radius=3,
+    )
+    assert tight_valid is not None and not tight_valid[9, 11], "pixels beyond the bounded radius must fall back to unmix+clamp"
+
+    fixture = tile_local_nearest_inner_fixture()
+    _, _, soft_edge = _fixture_masks(fixture)
+    settings = fixture.settings
+    assert _tile_local_nearest_inner_radius(settings) >= 8, "active tile-local pull must reserve read overlap"
+    with _temporary_inner_label_cap(1):
+        labels, label_to_flat = _build_nearest_inner_label_map(
+            np.full((3, 3), 255, dtype=np.uint8),
+            np.zeros((3, 3), dtype=bool),
+            np.zeros((3, 3), dtype=np.uint8),
+            np.pad(np.array([[255]], dtype=np.uint8), ((0, 2), (0, 2))),
+            settings,
+        )
+        assert labels is None and label_to_flat is None, "forced cap should skip the global nearest-inner label map"
+
+        no_pull = process_key_image(fixture.rgb, replace(settings, inner_color_pull=0.0))
+        dt_calls: list[tuple[int, int]] = []
+        original_distance_transform = keyer_module.cv2.distanceTransformWithLabels
+
+        def recording_distance_transform(src, *args, **kwargs):
+            dt_calls.append(tuple(int(v) for v in src.shape[:2]))
+            return original_distance_transform(src, *args, **kwargs)
+
+        try:
+            keyer_module.cv2.distanceTransformWithLabels = recording_distance_transform
+            local_pull = process_key_image(fixture.rgb, settings)
+            single_tile = process_key_image(
+                fixture.rgb,
+                replace(settings, use_tiling=False, tile_size=max(fixture.rgb.shape[:2]) + 1),
+            )
+        finally:
+            keyer_module.cv2.distanceTransformWithLabels = original_distance_transform
+
+        assert single_tile.rgba.shape == local_pull.rgba.shape, "single-tile fallback probe should still render normally"
+        assert dt_calls, "tiled cap-forced render should build tile-local distance labels"
+        assert fixture.rgb.shape[:2] not in dt_calls, "tile-local fallback must not run distance labels over the full image"
+        assert all(h * w <= keyer_module._MAX_TILE_LOCAL_INNER_LABEL_PIXELS for h, w in dt_calls), (
+            f"tile-local distance labels exceeded the per-read-tile cap: {dt_calls}"
+        )
+        no_pull_residual = edge_key_residual(no_pull.rgba, settings.key_color, soft_edge)
+        local_residual = edge_key_residual(local_pull.rgba, settings.key_color, soft_edge)
+        assert local_residual["max_positive_excess"] <= no_pull_residual["max_positive_excess"], (
+            f"tile-local pull should not worsen max edge residual: {no_pull_residual} -> {local_residual}"
+        )
+        assert local_residual["p95_positive_excess"] < no_pull_residual["p95_positive_excess"], (
+            f"tile-local pull should improve p95 edge residual: {no_pull_residual} -> {local_residual}"
+        )
+
+        seam = tile_boundary_band_metrics(fixture.rgb, settings, tile_sizes=(137, 199))
+        assert seam["opaque_nonfringe_pixels"] > 0, f"nearest-inner seam test should cover opaque non-fringe pixels: {seam}"
+        assert seam["max_alpha_diff"] <= 1, f"nearest-inner boundary alpha diff too high: {seam}"
+        assert seam["max_rgb_diff_opaque_nonfringe"] <= 2, f"nearest-inner opaque boundary RGB diff too high: {seam}"
+        assert seam["max_checker_diff_visible"] <= 2, f"nearest-inner visible checker seam diff too high: {seam}"
+
+        crop = (310, 210, 620, 450)
+        x0, y0, x1, y1 = crop
+        full = process_key_image(fixture.rgb, replace(settings, use_tiling=True, tile_size=157, tile_overlap=5, full_res_crop=None))
+        cropped = process_key_image(
+            fixture.rgb,
+            replace(settings, use_tiling=True, tile_size=157, tile_overlap=5, full_res_crop=crop, preview_scale=1.0),
+        )
+        crop_diff = np.abs(cropped.rgba.astype(np.int16) - full.rgba[y0:y1, x0:x1].astype(np.int16))
+        max_crop_rgba_diff = int(crop_diff.max())
+        max_crop_alpha_diff = int(crop_diff[:, :, 3].max())
+        assert max_crop_rgba_diff <= 1, f"tile-local crop render must match full crop, max RGBA diff={max_crop_rgba_diff}"
+        assert max_crop_alpha_diff == 0, f"tile-local crop alpha must exactly match full crop, max alpha diff={max_crop_alpha_diff}"
+        assert local_pull.rgba.dtype == np.uint8 and local_pull.foreground is not None and local_pull.foreground.dtype == np.uint8
+        assert local_pull.foreground_rgb is None and local_pull.repaired_edge is None, (
+            "nearest-inner fallback must not materialize full-image float32 RGB debug buffers"
+        )
+
+    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    imported = forbidden & set(sys.modules)
+    assert not imported, f"tile-local nearest-inner fallback must not import heavy optional modules: {sorted(imported)}"
+
+    print(
+        "Phase 6 tile-local nearest-inner checks: "
+        f"residual max {no_pull_residual['max_positive_excess']}->{local_residual['max_positive_excess']}; "
+        f"p95 {no_pull_residual['p95_positive_excess']}->{local_residual['p95_positive_excess']}; "
+        f"seam alpha={seam['max_alpha_diff']} rgb={seam['max_rgb_diff_opaque_nonfringe']} "
+        f"checker={seam['max_checker_diff_visible']}; "
+        f"crop max_rgba_diff={max_crop_rgba_diff} max_alpha_diff={max_crop_alpha_diff}"
+    )
+
+
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
     rgb, _, settings = _edge_fringe_fixture(key_color)
     before_settings = replace(
@@ -1702,6 +1897,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase3_guided_alpha_tests()
         run_phase4_tile_local_screen_tests()
         run_phase5_crop_render_tests()
+        run_phase6_tile_local_nearest_inner_tests()
     run_optional_ai_seam_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

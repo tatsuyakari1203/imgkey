@@ -13,6 +13,9 @@ ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
 
 _MAX_INNER_LABEL_PIXELS = 16_000_000
+_MIN_TILE_LOCAL_INNER_PIXELS = 8
+_MAX_TILE_LOCAL_INNER_LABEL_PIXELS = 8_000_000
+_MAX_TILE_LOCAL_NEAREST_INNER_RADIUS = 256
 
 
 @dataclass(slots=True)
@@ -1017,8 +1020,7 @@ def _build_nearest_inner_label_map(
     # can dominate memory; use the deterministic unmix+clamp fallback instead.
     if alpha_u8.size > _MAX_INNER_LABEL_PIXELS:
         return None, None
-    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
-    inner = (alpha_u8 >= 250) & (~background_mask) & (fringe_mask <= 24) & (probability <= prob_limit)
+    inner = _nearest_inner_seed_mask(alpha_u8, background_mask, probability, fringe_mask, settings)
     if np.count_nonzero(inner) == 0:
         return None, None
     try:
@@ -1027,17 +1029,37 @@ def _build_nearest_inner_label_map(
     except (cv2.error, MemoryError):
         return None, None
     labels = np.ascontiguousarray(labels.astype(np.int32, copy=False))
-    inner_flat = np.flatnonzero(inner.reshape(-1))
+    label_to_flat = _nearest_inner_label_to_flat(labels, inner)
+    if label_to_flat is None:
+        return None, None
+    return labels, label_to_flat
+
+
+def _nearest_inner_seed_mask(
+    alpha_u8: np.ndarray,
+    background_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    settings: KeySettings,
+) -> np.ndarray:
+    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
+    return (alpha_u8 >= 250) & (~background_mask) & (fringe_mask <= 24) & (probability <= prob_limit)
+
+
+def _nearest_inner_label_to_flat(labels: np.ndarray, inner_mask: np.ndarray) -> np.ndarray | None:
+    inner_flat = np.flatnonzero(inner_mask.reshape(-1))
+    if inner_flat.size == 0:
+        return None
     inner_labels = labels.reshape(-1)[inner_flat]
     valid = inner_labels > 0
     if not np.any(valid):
-        return None, None
+        return None
     inner_flat = inner_flat[valid]
     inner_labels = inner_labels[valid]
     max_label = int(inner_labels.max())
     label_to_flat = np.full(max_label + 1, -1, dtype=np.int64)
     label_to_flat[inner_labels] = inner_flat.astype(np.int64, copy=False)
-    return labels, label_to_flat
+    return label_to_flat
 
 
 def _nearest_inner_rgb_for_slice(
@@ -1060,6 +1082,49 @@ def _nearest_inner_rgb_for_slice(
         return None, None
     nearest = np.zeros((*label_tile.shape, 3), dtype=np.uint8)
     nearest[valid] = rgb.reshape(-1, 3)[flat_tile[valid]]
+    return nearest, valid
+
+
+def _build_tile_local_nearest_inner_rgb(
+    rgb_tile: np.ndarray,
+    alpha_u8: np.ndarray,
+    background_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    settings: KeySettings,
+    max_radius: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if _clip01(settings.inner_color_pull) <= 0 or _clip01(settings.edge_color_repair) <= 0:
+        return None, None
+    radius = int(max_radius)
+    if radius <= 0 or not np.any(fringe_mask > 0):
+        return None, None
+    if alpha_u8.size > _MAX_TILE_LOCAL_INNER_LABEL_PIXELS:
+        return None, None
+    inner = _nearest_inner_seed_mask(alpha_u8, background_mask, probability, fringe_mask, settings)
+    if np.count_nonzero(inner) < _MIN_TILE_LOCAL_INNER_PIXELS:
+        return None, None
+    try:
+        src = np.where(inner, 0, 255).astype(np.uint8)
+        distances, labels = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+    except (cv2.error, MemoryError):
+        return None, None
+
+    labels = np.ascontiguousarray(labels.astype(np.int32, copy=False))
+    label_to_flat = _nearest_inner_label_to_flat(labels, inner)
+    if label_to_flat is None:
+        return None, None
+
+    valid = (labels > 0) & (labels < len(label_to_flat)) & (distances <= float(radius))
+    if not np.any(valid):
+        return None, None
+    flat_tile = np.full(labels.shape, -1, dtype=np.int64)
+    flat_tile[valid] = label_to_flat[labels[valid]]
+    valid &= flat_tile >= 0
+    if not np.any(valid):
+        return None, None
+    nearest = np.zeros((*labels.shape, 3), dtype=np.uint8)
+    nearest[valid] = rgb_tile.reshape(-1, 3)[flat_tile[valid]]
     return nearest, valid
 
 
@@ -1087,7 +1152,8 @@ def _render_tiled_rgba(
     rgba[:, :, 3] = alpha_out
     despill_mask = np.zeros((out_h, out_w), dtype=np.uint8)
     screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
-    extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius)
+    local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
+    extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
     tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=extra_overlap))
     if crop is not None:
         tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
@@ -1110,26 +1176,49 @@ def _render_tiled_rgba(
         rel_x = slice(write_x0 - read_x.start, write_x1 - read_x.start)
         out_y = slice(write_y0 - out_y0, write_y1 - out_y0)
         out_x = slice(write_x0 - out_x0, write_x1 - out_x0)
+        rgb_read = rgb[read_y, read_x]
         if matte.screen_map is not None:
             screen_tile = matte.screen_map[read_y, read_x]
         elif settings.local_screen_model:
             screen_tile = _estimate_screen_tile(
-                rgb[read_y, read_x],
+                rgb_read,
                 matte.background_mask[read_y, read_x],
                 matte.screen_color,
                 screen_radius,
             )
         else:
             screen_tile = None
-        nearest_inner_rgb, nearest_inner_valid = _nearest_inner_rgb_for_slice(
-            rgb,
-            matte.inner_labels,
-            matte.inner_label_to_flat,
-            read_y,
-            read_x,
-        )
+        if matte.inner_labels is not None and matte.inner_label_to_flat is not None:
+            nearest_inner_rgb, nearest_inner_valid = _nearest_inner_rgb_for_slice(
+                rgb,
+                matte.inner_labels,
+                matte.inner_label_to_flat,
+                read_y,
+                read_x,
+            )
+        else:
+            bounded_local_radius = _bounded_tile_local_nearest_inner_radius(
+                local_nearest_radius,
+                read_y,
+                read_x,
+                core_y,
+                core_x,
+                (h, w),
+            )
+            if _can_build_tile_local_nearest_inner(read_y, read_x, core_y, core_x, (h, w)):
+                nearest_inner_rgb, nearest_inner_valid = _build_tile_local_nearest_inner_rgb(
+                    rgb_read,
+                    matte.alpha[read_y, read_x],
+                    matte.background_mask[read_y, read_x],
+                    matte.screen_probability[read_y, read_x],
+                    matte.fringe_mask[read_y, read_x],
+                    settings,
+                    bounded_local_radius,
+                )
+            else:
+                nearest_inner_rgb, nearest_inner_valid = None, None
         rgb_tile, spill_tile = _process_color_tile(
-            rgb[read_y, read_x],
+            rgb_read,
             matte.alpha[read_y, read_x],
             matte.edge_mask[read_y, read_x],
             matte.screen_probability[read_y, read_x],
@@ -1152,22 +1241,78 @@ def _tile_intersects_crop(core_y: slice, core_x: slice, crop: tuple[int, int, in
     return core_y.start < y1 and core_y.stop > y0 and core_x.start < x1 and core_x.stop > x0
 
 
-def _tile_extra_overlap(settings: KeySettings, shape: tuple[int, int], screen_radius: int | None = None) -> int:
+def _tile_extra_overlap(
+    settings: KeySettings,
+    shape: tuple[int, int],
+    screen_radius: int | None = None,
+    local_nearest_radius: int | None = None,
+) -> int:
     if screen_radius is None:
         screen_radius = _screen_model_radius_for_shape(shape) if settings.local_screen_model else 0
+    if local_nearest_radius is None:
+        local_nearest_radius = _tile_local_nearest_inner_radius(settings)
     guided_radius = max(0, int(settings.guided_radius)) * 2 + 2 if _clip01(settings.guided_alpha_refine) > 0 else 0
     return max(
         int(screen_radius),
         max(0, int(settings.fringe_band_radius)),
         guided_radius,
-        _tile_local_nearest_inner_radius(settings),
+        int(local_nearest_radius),
     )
 
 
 def _tile_local_nearest_inner_radius(settings: KeySettings) -> int:
-    # Phase 6 wires tile-local nearest-inner labels here. Until then global labels
-    # or deterministic no-pull fallback need no additional read-region margin.
-    return 0
+    if _clip01(settings.inner_color_pull) <= 0 or _clip01(settings.edge_color_repair) <= 0:
+        return 0
+    edge_radius = _effective_edge_radius(settings)
+    fringe_radius = max(0, int(settings.fringe_band_radius))
+    radius = max(_MIN_TILE_LOCAL_INNER_PIXELS, edge_radius * 4, edge_radius + fringe_radius)
+    return int(min(radius, _MAX_TILE_LOCAL_NEAREST_INNER_RADIUS))
+
+
+def _bounded_tile_local_nearest_inner_radius(
+    radius: int,
+    read_y: slice,
+    read_x: slice,
+    core_y: slice,
+    core_x: slice,
+    shape: tuple[int, int],
+) -> int:
+    base = int(radius)
+    if base <= 0:
+        return 0
+    h, w = shape
+    margins: list[int] = []
+    if core_y.start > 0:
+        margins.append(core_y.start - read_y.start)
+    if core_y.stop < h:
+        margins.append(read_y.stop - core_y.stop)
+    if core_x.start > 0:
+        margins.append(core_x.start - read_x.start)
+    if core_x.stop < w:
+        margins.append(read_x.stop - core_x.stop)
+    positive = [int(margin) for margin in margins if margin > 0]
+    if not positive:
+        return base
+    return max(0, min(base, min(positive)))
+
+
+def _can_build_tile_local_nearest_inner(
+    read_y: slice,
+    read_x: slice,
+    core_y: slice,
+    core_x: slice,
+    shape: tuple[int, int],
+) -> bool:
+    read_h = int(read_y.stop - read_y.start)
+    read_w = int(read_x.stop - read_x.start)
+    if read_h <= 0 or read_w <= 0:
+        return False
+    if read_h * read_w > _MAX_TILE_LOCAL_INNER_LABEL_PIXELS:
+        return False
+    h, w = shape
+    whole_read = read_y.start <= 0 and read_x.start <= 0 and read_y.stop >= h and read_x.stop >= w
+    whole_core = core_y.start <= 0 and core_x.start <= 0 and core_y.stop >= h and core_x.stop >= w
+    return not (whole_read and whole_core)
 
 
 def _process_color_tile(
