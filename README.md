@@ -82,6 +82,7 @@ if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 ## Release workflow
 
 The repository includes a GitHub Actions release workflow at `.github/workflows/release.yml`.
+See `RELEASE.md` for the full release process and `CHANGELOG.md` for release notes.
 
 Create a public release by pushing a version tag:
 
