@@ -512,10 +512,10 @@ Isolation:
 - Investigation/prototype only unless metrics clearly justify implementation. Do not change tuned default probability behavior without review.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P7.1 - Decide whether to add local probability refinement
 - Evaluate whether gradient/custom fixtures still fail after Phases 2-6.
@@ -533,10 +533,13 @@ Acceptance:
 - Either a measured, off-by-default improvement is proposed with tests, or the phase records that no probability change is recommended.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Decision gate completed after Phases 2-6. Gradient/shadow residuals improved, boundary seam checks passed, crop/full parity passed, and large-image tile-local fallback checks passed under the existing probability model. No matte probability model change is recommended now; keep probability refinement deferred/off unless future real images show failures.
 
 ---
 
@@ -558,7 +561,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P8.1 - Update docs/context and run full verification
 - Update `README.md`, `AGENTS.md`, and `CHANGELOG.md` with:
