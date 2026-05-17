@@ -1,0 +1,43 @@
+# Local agent/test artifacts
+.artifact/
+
+# Python caches and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+
+# Generated image/output artifacts
+output.png
+*_keyed.png
+*_diagnostic.png
+*_alpha.png
+*_result.png
+diagnostics/
+
+# Optional model/download caches; AI support must stay opt-in
+models/
+model-cache/
+model_cache/
+.model_cache/
+.cache/
+*.onnx
+*.pt
+*.pth
+*.safetensors
