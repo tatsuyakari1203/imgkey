@@ -276,10 +276,10 @@ Isolation:
 - Own alpha-refine helpers/settings in `keyer.py` and tests in `smoke_test.py`. UI exposure is optional and deferred unless needed for verification.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P3.1 - Add optional guided alpha settings and helper
 - Add compatible `KeySettings` fields:
@@ -300,10 +300,10 @@ Acceptance:
 - Existing tests pass unchanged with default `guided_alpha_refine=0.0`; no new dependencies.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P3.2 - Apply guided refinement only in edge/unknown band
 - Add `_refine_alpha_guided()` after initial trimap alpha is built, preferably in `_build_global_matte` to avoid invasive `_build_alpha_from_trimap()` signature changes.
@@ -325,10 +325,13 @@ Acceptance:
 - With guided off, outputs unchanged. With guided on in tests, soft-edge smoothness improves/increases without changing known BG/FG; tiled-vs-full alpha diff `<= 1` or exact for covered paths.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Added off-by-default guided alpha settings (`guided_alpha_refine`, `guided_radius`, `guided_eps`, `guided_max_pixels`), a grayscale `cv2.boxFilter` guided filter, and edge-band ROI capped `_refine_alpha_guided()` after trimap/mask application. Guided refinement uses linear luma only, blends into non-exact edge alpha, clamps exact BG/FG/core decisions after refinement, and deterministically skips unchanged when the expanded ROI exceeds the pixel cap. Smoke coverage now verifies default/off exact output, cap fallback exact output, known BG/FG clamping, guided roughness improvement `18.290 -> 6.688`, soft pixel preservation `10830 -> 10830`, and guided tiled/full diff `0`.
 
 ---
 
@@ -350,7 +353,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P4.1 - Add tile-local screen estimate fallback
 - Reuse existing `local_screen_model` if already present and semantically equivalent; otherwise add `tile_local_screen_model: bool = True` with clear docs. Do not create duplicate/conflicting UI semantics.

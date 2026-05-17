@@ -18,6 +18,7 @@ from keyer import (
     KeySettings,
     _MAX_INNER_LABEL_PIXELS,
     _build_nearest_inner_label_map,
+    _guided_filter_gray,
     _linear_f32_to_srgb_u8,
     _srgb_u8_to_linear_f32,
     checkerboard_composite,
@@ -279,6 +280,39 @@ def antialiased_edge_fixture() -> DiagnosticFixture:
         rgb=rgb,
         settings=KeySettings(key_color=(0, 220, 50)),
         notes="Future v2 diagnostic: semi-transparent/anti-aliased edge should retain soft alpha.",
+    )
+
+
+def guided_alpha_refine_fixture() -> DiagnosticFixture:
+    h, w = 360, 500
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = (30, 80, 235)
+    alpha = _disc_alpha(h, w, 108, feather=18.0)
+    foreground = (224, 170, 118)
+    rgb = _composite_rgb(background, foreground, alpha)
+
+    yy, xx = np.indices((h, w))
+    soft_edge = (alpha > 0.02) & (alpha < 0.98)
+    blue_dither = np.where(((xx // 3 + yy // 2) & 1) == 0, 30, -30)
+    rgb[:, :, 2] = np.clip(rgb[:, :, 2].astype(np.int16) + blue_dither.astype(np.int16) * soft_edge, 0, 255).astype(np.uint8)
+    known_background, foreground_core, _ = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="guided_alpha_refine",
+        rgb=rgb,
+        settings=KeySettings(
+            key_color=(30, 80, 235),
+            auto_border_sample=False,
+            local_screen_model=False,
+            edge_refine_radius=7,
+            edge_softness=0.18,
+            fringe_band_radius=3,
+        ),
+        notes="Phase 3 fixture: blue-channel edge dither should be smoothed by guided alpha refinement.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
     )
 
 
@@ -625,6 +659,21 @@ def alpha_soft_band_count(alpha: np.ndarray, low: int = 0, high: int = 255) -> i
     return int(np.count_nonzero((alpha > low) & (alpha < high)))
 
 
+def alpha_edge_roughness(alpha: np.ndarray, mask: np.ndarray) -> float:
+    alpha_f = alpha.astype(np.float32)
+    mask_b = mask.astype(bool, copy=False)
+    dx_mask = mask_b[:, 1:] & mask_b[:, :-1]
+    dy_mask = mask_b[1:, :] & mask_b[:-1, :]
+    values: list[np.ndarray] = []
+    if np.any(dx_mask):
+        values.append(np.abs(alpha_f[:, 1:] - alpha_f[:, :-1])[dx_mask])
+    if np.any(dy_mask):
+        values.append(np.abs(alpha_f[1:, :] - alpha_f[:-1, :])[dy_mask])
+    if not values:
+        return 0.0
+    return float(np.mean(np.concatenate(values)))
+
+
 def transparent_rgb_zero(rgba: np.ndarray) -> dict[str, int | bool]:
     transparent = rgba[:, :, 3] == 0
     if not np.any(transparent):
@@ -937,6 +986,81 @@ def run_phase2_linear_color_tests() -> None:
     print("Phase 2 linear-light checks vs v4 baseline:")
     for line in summaries:
         print(f"  {line}")
+
+
+def _assert_guided_filter_helper() -> None:
+    guide = np.tile(np.linspace(0.0, 1.0, 33, dtype=np.float32), (21, 1))
+    src = guide.copy()
+    filtered = _guided_filter_gray(guide, src, radius=3, eps=1e-3)
+    assert filtered.shape == src.shape, "guided filter should preserve 2D shape"
+    assert filtered.dtype == np.float32, "guided filter should return float32"
+    assert float(filtered.min()) >= 0.0 and float(filtered.max()) <= 1.0, "guided filter output should stay clamped"
+    max_delta = float(np.max(np.abs(filtered - src)))
+    assert max_delta <= 0.035, f"guided filter should preserve a self-guided ramp closely, max_delta={max_delta:.4f}"
+
+
+def run_phase3_guided_alpha_tests() -> None:
+    _assert_guided_filter_helper()
+    fixture = guided_alpha_refine_fixture()
+    known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+
+    default_off = process_key_image(fixture.rgb, fixture.settings)
+    explicit_off = process_key_image(
+        fixture.rgb,
+        replace(fixture.settings, guided_alpha_refine=0.0, guided_radius=5, guided_eps=1e-3),
+    )
+    assert np.array_equal(default_off.alpha, explicit_off.alpha), "guided default/off alpha output must be exact"
+    assert np.array_equal(default_off.rgba, explicit_off.rgba), "guided default/off RGBA output must be exact"
+
+    skipped = process_key_image(
+        fixture.rgb,
+        replace(fixture.settings, guided_alpha_refine=1.0, guided_radius=5, guided_max_pixels=1),
+    )
+    assert np.array_equal(default_off.alpha, skipped.alpha), "guided cap fallback should skip deterministically unchanged"
+    assert np.array_equal(default_off.rgba, skipped.rgba), "guided cap fallback should leave RGBA unchanged"
+
+    guided_settings = replace(
+        fixture.settings,
+        guided_alpha_refine=0.85,
+        guided_radius=5,
+        guided_eps=1e-3,
+        guided_max_pixels=500_000,
+    )
+    guided = process_key_image(fixture.rgb, guided_settings)
+    assert int(guided.alpha[known_background].max()) == 0, "guided refinement must keep known background alpha 0"
+    assert int(guided.alpha[foreground_core].min()) == 255, "guided refinement must keep known foreground/core alpha 255"
+
+    off_roughness = alpha_edge_roughness(default_off.alpha, soft_edge)
+    guided_roughness = alpha_edge_roughness(guided.alpha, soft_edge)
+    off_soft = alpha_soft_band_count(default_off.alpha)
+    guided_soft = alpha_soft_band_count(guided.alpha)
+    edge_changed = int(np.count_nonzero(default_off.alpha[soft_edge] != guided.alpha[soft_edge]))
+    assert edge_changed > 0, "guided refinement should change the soft edge on the guided fixture"
+    assert guided_roughness <= off_roughness * 0.92, (
+        f"guided refinement should reduce edge alpha roughness, {off_roughness:.3f} -> {guided_roughness:.3f}"
+    )
+    assert guided_soft >= int(off_soft * 0.98), (
+        f"guided refinement should preserve/increase soft alpha coverage, off={off_soft} guided={guided_soft}"
+    )
+
+    tiled = process_key_image(fixture.rgb, replace(guided_settings, use_tiling=True, tile_size=101, tile_overlap=20))
+    full = process_key_image(fixture.rgb, replace(guided_settings, use_tiling=False))
+    diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
+    max_alpha_diff = int(diff[:, :, 3].max())
+    max_rgba_diff = int(diff.max())
+    assert max_alpha_diff <= 1, f"guided tiled/full alpha diff should be <=1, got {max_alpha_diff}"
+    assert max_rgba_diff <= 1, f"guided tiled/full RGBA diff should be <=1, got {max_rgba_diff}"
+
+    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    imported = forbidden & set(sys.modules)
+    assert not imported, f"guided alpha refinement must not import heavy optional modules: {sorted(imported)}"
+
+    print(
+        "Phase 3 guided alpha checks: "
+        f"roughness {off_roughness:.3f}->{guided_roughness:.3f}; "
+        f"soft_px {off_soft}->{guided_soft}; edge_changed={edge_changed}; "
+        f"tile_alpha_diff={max_alpha_diff}; tile_rgba_diff={max_rgba_diff}"
+    )
 
 
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
@@ -1295,6 +1419,7 @@ def main(argv: list[str] | None = None) -> None:
     run_v4_edge_repair_tests()
     if not writing_algorithm_baseline:
         run_phase2_linear_color_tests()
+        run_phase3_guided_alpha_tests()
     run_optional_ai_seam_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

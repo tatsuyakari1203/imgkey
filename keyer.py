@@ -85,6 +85,13 @@ class KeySettings:
     fringe_band_radius: int = 3
     luminance_protect: float | None = None
 
+    # Optional v5 guided alpha refinement, appended to preserve existing
+    # positional compatibility for earlier settings fields.
+    guided_alpha_refine: float = 0.0
+    guided_radius: int = 8
+    guided_eps: float = 1e-3
+    guided_max_pixels: int = 2_000_000
+
 
 @dataclass(slots=True)
 class KeyResult:
@@ -397,6 +404,8 @@ def _build_global_matte(
         remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
         alpha[remove_effective] = 0
         background[remove_effective] = True
+
+    alpha = _refine_alpha_guided(rgb, alpha, edge_mask, background, probability, fg_threshold, bg_threshold, settings)
 
     alpha = _apply_original_alpha(alpha, original_alpha)
     screen_map = _estimate_screen_map(rgb, probability >= bg_threshold, screen_color, settings)
@@ -733,6 +742,103 @@ def _build_alpha_from_trimap(
     alpha_f[alpha_f < 0.004] = 0.0
     alpha_f[alpha_f > 0.996] = 1.0
     return edge_mask, np.rint(np.clip(alpha_f, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _guided_filter_gray(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    guide_f = np.asarray(guide, dtype=np.float32)
+    src_f = np.asarray(src, dtype=np.float32)
+    if guide_f.ndim != 2 or src_f.ndim != 2 or guide_f.shape != src_f.shape:
+        raise ValueError("guided filter expects matching 2D guide/src arrays")
+    radius = max(0, int(radius))
+    if radius <= 0 or guide_f.size == 0:
+        return np.clip(src_f, 0.0, 1.0).astype(np.float32, copy=False)
+
+    eps = max(1e-8, float(eps))
+    ksize = (radius * 2 + 1, radius * 2 + 1)
+    guide_f = np.nan_to_num(guide_f, nan=0.0, posinf=1.0, neginf=0.0)
+    src_f = np.nan_to_num(src_f, nan=0.0, posinf=1.0, neginf=0.0)
+
+    mean_i = cv2.boxFilter(guide_f, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    mean_p = cv2.boxFilter(src_f, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    corr_i = cv2.boxFilter(guide_f * guide_f, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    corr_ip = cv2.boxFilter(guide_f * src_f, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    var_i = corr_i - mean_i * mean_i
+    cov_ip = corr_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    refined = mean_a * guide_f + mean_b
+    return np.clip(refined, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _refine_alpha_guided(
+    rgb: np.ndarray,
+    alpha_u8: np.ndarray,
+    edge_mask: np.ndarray,
+    background: np.ndarray,
+    probability: np.ndarray,
+    fg_threshold: int,
+    bg_threshold: int,
+    settings: KeySettings,
+) -> np.ndarray:
+    strength = _clip01(settings.guided_alpha_refine)
+    if strength <= 0.0:
+        return alpha_u8
+
+    radius = max(1, int(settings.guided_radius))
+    max_pixels = max(0, int(settings.guided_max_pixels))
+    refine_mask = edge_mask.astype(bool, copy=False) & (alpha_u8 > 0) & (alpha_u8 < 255)
+    if max_pixels <= 0 or not np.any(refine_mask):
+        return alpha_u8
+
+    y0, y1, x0, x1 = _expanded_mask_bounds(refine_mask, margin=radius * 2 + 2, shape=alpha_u8.shape)
+    if (y1 - y0) * (x1 - x0) > max_pixels:
+        return alpha_u8
+
+    roi_y = slice(y0, y1)
+    roi_x = slice(x0, x1)
+    guide = _linear_luma_from_rgb_u8(rgb[roi_y, roi_x])
+    src = alpha_u8[roi_y, roi_x].astype(np.float32) / 255.0
+    refined = _guided_filter_gray(guide, src, radius, settings.guided_eps)
+    blended = src * (1.0 - strength) + refined * strength
+
+    out = alpha_u8.copy()
+    target = refine_mask[roi_y, roi_x]
+    out_roi = out[roi_y, roi_x]
+    out_roi[target] = np.rint(np.clip(blended[target], 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    # Reassert exact trimap decisions after edge-only smoothing. Pixels that
+    # were exact 0/255 before guided filtering stay exact, and non-edge known
+    # connected-background/foreground core regions remain authoritative.
+    out[alpha_u8 <= 0] = 0
+    out[alpha_u8 >= 255] = 255
+    out[background & ~edge_mask] = 0
+    out[(~background) & ~edge_mask] = 255
+    out[(probability >= bg_threshold) & background & ~edge_mask] = 0
+    out[(probability <= fg_threshold) & (~background) & ~edge_mask] = 255
+    return out
+
+
+def _expanded_mask_bounds(mask: np.ndarray, margin: int, shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return 0, 0, 0, 0
+    h, w = shape
+    pad = max(0, int(margin))
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(h, int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(w, int(xs.max()) + pad + 1)
+    return y0, y1, x0, x1
+
+
+def _linear_luma_from_rgb_u8(rgb: np.ndarray) -> np.ndarray:
+    arr = np.asarray(rgb, dtype=np.uint8)
+    luma = _srgb_to_linear_f32(arr[:, :, 0].astype(np.float32) / 255.0) * 0.2126
+    luma += _srgb_to_linear_f32(arr[:, :, 1].astype(np.float32) / 255.0) * 0.7152
+    luma += _srgb_to_linear_f32(arr[:, :, 2].astype(np.float32) / 255.0) * 0.0722
+    return np.clip(luma, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def _apply_original_alpha(alpha_u8: np.ndarray, original_alpha: np.ndarray | None) -> np.ndarray:
