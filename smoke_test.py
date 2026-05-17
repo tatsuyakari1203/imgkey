@@ -2241,6 +2241,300 @@ def run_app_birefnet_ui_tests() -> None:
     assert after_probe == before, f"BiRefNet UI probe must not import heavy runtimes: {after_probe - before}"
 
 
+def _cyanish_screen_fixture() -> DiagnosticFixture:
+    h, w = 360, 520
+    x_grad = np.linspace(-18, 20, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-10, 12, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(6 + y_grad * 0.10, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(184 + x_grad * 0.55 + y_grad * 0.28, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(204 + x_grad * 0.65 - y_grad * 0.18, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 112, feather=9.0)
+    foreground = (226, 166, 108)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="cyanish_gradient_screen",
+        rgb=_composite_rgb(background, foreground, alpha),
+        settings=KeySettings(key_color=(0, 190, 210), auto_border_sample=True, edge_refine_radius=5, fringe_band_radius=3),
+        notes="v6 diagnostic: cyan-ish key screen with mild uneven lighting.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def _hard_disc_masks(shape: tuple[int, int], radius: float, bg_radius: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h, w = shape
+    foreground = _disc_alpha(h, w, radius).astype(bool)
+    core = _disc_alpha(h, w, max(1.0, radius * 0.70)).astype(bool)
+    background = ~_disc_alpha(h, w, bg_radius if bg_radius is not None else radius + 28).astype(bool)
+    alpha_u8 = foreground.astype(np.uint8) * 255
+    return alpha_u8, background, core
+
+
+def run_v6_screen_analysis_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    screen_analysis = importlib.import_module("screen_analysis")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing screen_analysis must not import heavy runtimes: {after_import - before}"
+
+    cases: list[tuple[DiagnosticFixture, np.ndarray, np.ndarray, np.ndarray, str]] = []
+    green = green_flat_fixture()
+    alpha_u8, bg_mask, fg_mask = _hard_disc_masks(green.rgb.shape[:2], 180, 220)
+    cases.append((green, alpha_u8, bg_mask, fg_mask, "green"))
+
+    blue = blue_flat_fixture()
+    alpha_u8, bg_mask, fg_mask = _hard_disc_masks(blue.rgb.shape[:2], 150, 190)
+    cases.append((blue, alpha_u8, bg_mask, fg_mask, "blue"))
+
+    cyan = _cyanish_screen_fixture()
+    cases.append((
+        cyan,
+        np.rint(cyan.expected_alpha * 255.0).astype(np.uint8),
+        cyan.known_background_mask.astype(bool),
+        cyan.foreground_core_mask.astype(bool),
+        "cyan",
+    ))
+
+    uneven = uneven_gradient_fixture()
+    alpha_u8, bg_mask, fg_mask = _hard_disc_masks(uneven.rgb.shape[:2], 175, 215)
+    cases.append((uneven, alpha_u8, bg_mask, fg_mask, "green"))
+
+    for fixture, alpha_u8, bg_mask, fg_mask, family in cases:
+        analysis = screen_analysis.analyze_screen(
+            fixture.rgb,
+            alpha_u8,
+            background_mask=bg_mask,
+            settings=fixture.settings,
+            max_full_res_screen_plate_pixels=0,
+            low_res_max_side=96,
+        )
+        h, w = fixture.rgb.shape[:2]
+        for name in (
+            "screen_probability",
+            "screen_distance",
+            "spill_probability",
+            "classical_confidence",
+            "edge_mask",
+            "fringe_mask",
+        ):
+            arr = getattr(analysis, name)
+            assert arr.shape == (h, w), f"{fixture.name}: {name} shape mismatch"
+            assert arr.dtype == np.uint8, f"{fixture.name}: {name} must be uint8"
+        screen = analysis.screen_color_rgb
+        if family == "green":
+            assert screen[1] > screen[0] + 90 and screen[1] > screen[2] + 90, f"{fixture.name}: expected green screen, got {screen}"
+        elif family == "blue":
+            assert screen[2] > screen[0] + 90 and screen[2] > screen[1] + 90, f"{fixture.name}: expected blue screen, got {screen}"
+        else:
+            assert screen[1] > 130 and screen[2] > 145 and screen[0] < 60, f"{fixture.name}: expected cyan-ish screen, got {screen}"
+
+        bg_prob = float(np.median(analysis.screen_probability[bg_mask]))
+        fg_prob = float(np.median(analysis.screen_probability[fg_mask]))
+        bg_dist = float(np.median(analysis.screen_distance[bg_mask]))
+        fg_dist = float(np.median(analysis.screen_distance[fg_mask]))
+        assert bg_prob >= 205.0, f"{fixture.name}: background screen probability too low: {bg_prob:.1f}"
+        assert fg_prob <= 120.0, f"{fixture.name}: foreground screen probability too high: {fg_prob:.1f}"
+        assert bg_dist <= 85.0, f"{fixture.name}: background screen distance too high: {bg_dist:.1f}"
+        assert fg_dist >= 120.0, f"{fixture.name}: foreground screen distance too low: {fg_dist:.1f}"
+        assert analysis.classical_confidence[bg_mask].mean() >= 220.0, f"{fixture.name}: confident background should stay high confidence"
+        assert np.count_nonzero(analysis.edge_mask) > 0, f"{fixture.name}: edge mask should not be empty"
+        if np.any((alpha_u8 > 2) & (alpha_u8 < 253)):
+            assert np.count_nonzero(analysis.fringe_mask) > 0, f"{fixture.name}: soft-alpha fringe mask should not be empty"
+
+        plate = analysis.screen_plate_rgb
+        assert not plate.is_full_res_retained, f"{fixture.name}: cap=0 must avoid full-resolution plate retention"
+        assert plate.low_res_rgb is not None and plate.low_res_rgb.dtype == np.uint8, f"{fixture.name}: low-res plate must be uint8"
+        tile = plate.resolve((0, 0, min(32, w), min(32, h)))
+        assert tile.shape == (min(32, h), min(32, w), 3) and tile.dtype == np.uint8, f"{fixture.name}: plate resolver tile mismatch"
+        debug = analysis.debug_images()
+        for key in ("screen_color", "screen_probability", "screen_distance", "screen_plate", "spill_probability", "edge_mask", "fringe_mask"):
+            assert key in debug, f"{fixture.name}: missing debug image {key}"
+
+    uneven_analysis = screen_analysis.analyze_screen(
+        uneven.rgb,
+        cases[-1][1],
+        background_mask=cases[-1][2],
+        settings=uneven.settings,
+        max_full_res_screen_plate_pixels=0,
+        low_res_max_side=96,
+    )
+    h, w = uneven.rgb.shape[:2]
+    left = uneven_analysis.screen_plate_rgb.resolve((0, 0, 64, h))[:, :, 1]
+    right = uneven_analysis.screen_plate_rgb.resolve((w - 64, 0, w, h))[:, :, 1]
+    assert float(np.median(right)) - float(np.median(left)) >= 18.0, "screen plate resolver should preserve uneven green lighting"
+
+    large_rgb = np.zeros((900, 1300, 3), dtype=np.uint8)
+    large_rgb[:, :] = (0, 220, 45)
+    large_candidates = np.ones(large_rgb.shape[:2], dtype=bool)
+    large_plate = screen_analysis.build_screen_plate_rgb(
+        large_rgb,
+        large_candidates,
+        (0, 220, 45),
+        max_full_res_pixels=0,
+        low_res_max_side=64,
+    )
+    assert large_plate.full_res_rgb is None, "large/cap-zero screen plate must not retain full HxWx3 RGB"
+    assert large_plate.low_res_rgb is not None and max(large_plate.low_res_rgb.shape[:2]) <= 64, "large screen plate must stay low-res bounded"
+
+    # New maps are standalone in Phase 6. The existing export/low-memory result
+    # must not grow retained debug-map fields before hybrid mode is wired later.
+    low_memory = process_key_image(green.rgb, green.settings, include_debug=False)
+    for name in ("screen_distance", "spill_probability", "classical_confidence", "screen_plate_rgb"):
+        assert not hasattr(low_memory, name), f"low-memory export result should not retain {name} in Phase 6"
+
+    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_tests == before, f"screen analysis tests must not import heavy runtimes: {after_tests - before}"
+
+
+def run_v6_hybrid_trimap_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    hybrid_trimap = importlib.import_module("hybrid_trimap")
+    screen_analysis = importlib.import_module("screen_analysis")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing hybrid trimap helpers must not import heavy runtimes: {after_import - before}"
+
+    h, w = 56, 56
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    screen_prob = np.full((h, w), 255, dtype=np.uint8)
+    screen_dist = np.zeros((h, w), dtype=np.uint8)
+    spill_prob = np.zeros((h, w), dtype=np.uint8)
+    confidence = np.full((h, w), 255, dtype=np.uint8)
+    biref = np.zeros((h, w), dtype=np.uint8)
+    background = np.zeros((h, w), dtype=np.uint8)
+    edge = np.zeros((h, w), dtype=np.uint8)
+    fringe = np.zeros((h, w), dtype=np.uint8)
+    keep = np.zeros((h, w), dtype=np.uint8)
+    remove = np.zeros((h, w), dtype=np.uint8)
+
+    bg_pt = (3, 3)
+    fg_pt = (10, 10)
+    biref_fg_pt = (10, 40)
+    conflict_pt = (26, 26)
+    keep_conflict_pt = (42, 10)
+    remove_pt = (42, 42)
+    edge_pt = (18, 8)
+    fringe_pt = (8, 28)
+    spill_pt = (28, 8)
+    keep_spill_pt = (8, 48)
+
+    alpha[fg_pt] = 255
+    screen_prob[fg_pt] = 10
+    alpha[biref_fg_pt] = 24
+    biref[biref_fg_pt] = 232
+    screen_prob[biref_fg_pt] = 20
+
+    alpha[conflict_pt] = 255
+    biref[conflict_pt] = 128
+    screen_prob[conflict_pt] = 250
+
+    alpha[keep_conflict_pt] = 128
+    biref[keep_conflict_pt] = 160
+    screen_prob[keep_conflict_pt] = 250
+    keep[keep_conflict_pt] = 255
+    remove[keep_conflict_pt] = 255
+
+    alpha[remove_pt] = 255
+    biref[remove_pt] = 255
+    screen_prob[remove_pt] = 20
+    remove[remove_pt] = 255
+
+    alpha[edge_pt] = 255
+    screen_prob[edge_pt] = 20
+    edge[edge_pt] = 255
+
+    alpha[fringe_pt] = 120
+    screen_prob[fringe_pt] = 80
+    fringe[fringe_pt] = 255
+
+    alpha[spill_pt] = 128
+    screen_prob[spill_pt] = 60
+    spill_prob[spill_pt] = 180
+
+    alpha[keep_spill_pt] = 128
+    screen_prob[keep_spill_pt] = 60
+    spill_prob[keep_spill_pt] = 220
+    keep[keep_spill_pt] = 255
+
+    plate = screen_analysis.ScreenPlateRGB(source_shape=(h, w), fallback_rgb=(0, 220, 50), low_res_rgb=np.full((4, 4, 3), (0, 220, 50), dtype=np.uint8))
+    result = hybrid_trimap.build_hybrid_trimap(
+        alpha,
+        screen_prob,
+        screen_dist,
+        spill_prob,
+        confidence,
+        background,
+        edge,
+        fringe,
+        plate,
+        biref,
+        keep,
+        remove,
+        spill_threshold=96,
+    )
+
+    assert result.known_bg[bg_pt], "high-confidence screen/low-alpha pixel should be known background"
+    assert result.safe_bg[bg_pt], "known screen background should be safe_bg"
+    assert result.known_fg[fg_pt], "classical opaque non-screen pixel should be known foreground"
+    assert result.known_fg[biref_fg_pt], "BiRefNet opaque non-screen pixel should be known foreground"
+    assert result.protected_fg[fg_pt] and result.protected_fg[biref_fg_pt], "clean known foreground should be protected"
+
+    assert result.conflict[conflict_pt], "screen/BiRefNet disagreement should be a conflict"
+    assert result.unknown[conflict_pt] and result.hard_unknown[conflict_pt], "conflict should become hard unknown"
+    assert not result.known_fg[conflict_pt], "conflict must override automatic known foreground"
+    assert not result.known_bg[conflict_pt], "conflict should not become known background"
+
+    assert result.known_fg[keep_conflict_pt], "manual keep should be the foreground override that wins over conflict"
+    assert not result.known_bg[keep_conflict_pt] and not result.unknown[keep_conflict_pt], "manual keep should be exclusive"
+    assert result.manual_keep_core[keep_conflict_pt], "manual keep core should be returned"
+    assert not result.manual_remove_effective[keep_conflict_pt], "keep must override remove"
+
+    assert result.known_bg[remove_pt], "manual remove should force background where keep is absent"
+    assert not result.known_fg[remove_pt] and not result.unknown[remove_pt], "manual remove should be exclusive"
+    assert result.manual_remove_effective[remove_pt], "manual remove effective mask should be returned"
+
+    assert result.unknown[edge_pt] and result.hard_unknown[edge_pt], "strong edge band should become hard unknown"
+    assert result.soft_unknown[fringe_pt], "fringe mask should expand soft unknown"
+    assert result.unmix_region[fringe_pt], "soft detail region should be available for unmix"
+    assert result.spill_region[spill_pt], "mid-alpha high-spill pixel should be spill region"
+    assert result.despill_region[spill_pt], "spill region should be despill candidate away from keep/background"
+    assert result.unmix_region[spill_pt], "mid-alpha spill pixel should be unmix candidate"
+    assert result.spill_region[keep_spill_pt], "manual keep does not hide spill diagnostics"
+    assert not result.despill_region[keep_spill_pt], "manual keep must protect from aggressive despill"
+
+    assert not np.any(result.known_bg & result.known_fg), "known_bg/known_fg must be mutually exclusive"
+    assert not np.any(result.known_bg & result.unknown), "known_bg/unknown must be mutually exclusive"
+    assert not np.any(result.known_fg & result.unknown), "known_fg/unknown must be mutually exclusive"
+    assert result.spill_threshold == 96, "spill threshold should be explicit on the result"
+    assert result.candidate_alpha.dtype == np.uint8 and np.array_equal(result.candidate_alpha, alpha), "candidate alpha should default to classical alpha"
+    assert "has_screen_plate" in result.debug_masks, "screen plate reference should be represented for Phase 8 diagnostics"
+
+    explicit_core = np.zeros((h, w), dtype=np.uint8)
+    explicit_core[keep_spill_pt] = 255
+    explicit_core_result = hybrid_trimap.build_hybrid_trimap(
+        alpha,
+        screen_prob,
+        screen_dist,
+        spill_prob,
+        confidence,
+        background,
+        edge,
+        fringe,
+        plate,
+        biref,
+        keep,
+        remove,
+        manual_keep_core=explicit_core,
+    )
+    assert explicit_core_result.known_fg[keep_conflict_pt], "raw keep must still win over remove when manual_keep_core is supplied"
+    assert not explicit_core_result.manual_remove_effective[keep_conflict_pt], "manual_keep_core must not let remove bypass raw keep"
+
+    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_tests == before, f"hybrid trimap tests must not import heavy runtimes: {after_tests - before}"
+
+
 def run_import_compile_tests() -> None:
     for source in (
         "app.py",
@@ -2249,6 +2543,8 @@ def run_import_compile_tests() -> None:
         "ai_assist.py",
         "gpu_runtime.py",
         "ai_worker.py",
+        "screen_analysis.py",
+        "hybrid_trimap.py",
         "ai_backends/__init__.py",
         "ai_backends/birefnet_adapter.py",
     ):
@@ -2285,6 +2581,8 @@ def main(argv: list[str] | None = None) -> None:
     run_ai_worker_contract_tests()
     run_gpu_runtime_probe_tests()
     run_app_birefnet_ui_tests()
+    run_v6_screen_analysis_tests()
+    run_v6_hybrid_trimap_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()

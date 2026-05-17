@@ -438,10 +438,17 @@ Isolation:
 - Own `screen_analysis.py`, `hybrid_trimap.py`, and tests. No RGB cleanup changes yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 6 implemented standalone classical screen analysis maps and the BiRefNet/classical hybrid trimap helper without wiring a new keyer mode, RGB cleanup path, torch/model runtime, or default-startup heavy imports.
+
+Verification:
+- 2026-05-18: Added smoke coverage for green, blue, cyan-ish, and uneven-lit screen analysis fixtures; hybrid trimap known-bg/known-fg/conflict/unknown/manual override/detail region behavior; import fences; and low-memory export non-retention of new Phase 6 maps.
+- 2026-05-18: Passed `python smoke_test.py`, required `py_compile`, `import app, keyer`, extended default dependency fence, and AI import fence including `screen_analysis`/`hybrid_trimap`.
 
 
 
@@ -471,10 +478,13 @@ Acceptance:
 - Export with `include_debug=False` must not retain these debug maps.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added `screen_analysis.py` with robust screen-color estimation, uint8 screen probability/distance/spill/confidence maps, edge/fringe masks, and capped/low-res `ScreenPlateRGB` resolver storage for uneven lighting.
 
 
 
@@ -545,10 +555,13 @@ Acceptance:
 - Manual remove regions are eligible for hard background cleanup where not overridden by keep.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-18: Added `hybrid_trimap.py` with explicit thresholds/inputs, mutually exclusive durable trimap classes, conflict/hard-unknown precedence over automatic foreground, keep-over-remove priority, and candidate spill/unmix/despill/protected/safe regions for later phases.
 
 
 ---
@@ -571,7 +584,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -611,7 +624,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 #### P7.2 - Unknown-only alpha refinement
@@ -1048,4 +1061,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Execute Phase 6/P6.0 next: add classical screen analysis maps while preserving the default no-torch startup fence and without consuming generated BiRefNet hints in classical preview/export.
+Execute Phase 7/P7.1 next: add the `HybridBiRefNet` alpha mode using the Phase 6 screen analysis and hybrid trimap helpers while preserving existing classical modes and source-alpha/manual-mask ordering.
