@@ -1,7 +1,7 @@
 # 04 - ImgKey v5 Classical Algorithm Upgrade
 
 Date: 2026-05-17
-Status: Planned
+Status: In progress
 Owner: ImgKey Engine
 Scope: Improve ImgKey's classical still-image chroma-key pipeline without AI, model runtimes, or new dependencies.
 
@@ -86,10 +86,10 @@ Isolation:
 - Own repo safety only: git branch, `.artifact/` baseline outputs, plan status. Do not change algorithm yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P0.1 - Create implementation branch and backup
 - Handle this plan file before enforcing clean git: either commit `.plan/imgkey-v5-classical-algorithm-upgrade.md` to `main` before execution, or create the feature branch and include it in the first planning/safety commit. The only acceptable pre-clean exception is this known plan file before it is intentionally tracked.
@@ -113,10 +113,13 @@ Acceptance:
 - Clean feature branch and backup exist; baseline verification passes before algorithm changes. If git is unavailable, backup-only mode is recorded and phase commits are skipped until a real checkout is restored.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-17: Confirmed `feature/classical-algorithm-upgrade` checkout with `origin`; created `.artifact/source-backup-algo-v5-20260517-173938`; baseline `smoke_test.py`, `py_compile`, and import checks passed.
 
 ---
 
@@ -138,7 +141,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P1.1 - Add hard fixtures and diagnostic metrics
 - Add or extend synthetic fixtures:
@@ -179,7 +182,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 ---
 
