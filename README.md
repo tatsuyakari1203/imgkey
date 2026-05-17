@@ -1,6 +1,6 @@
 # ImgKey
 
-ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The current v4 workflow is a classical NumPy/OpenCV/PySide6 path with edge color reconstruction: no AI runtime, no PyTorch/CUDA, and no bundled model weights.
+ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The current v5 workflow is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks: no AI runtime, no PyTorch/CUDA, no bundled model weights, and no new default dependencies.
 
 ## Quick start
 
@@ -30,8 +30,10 @@ python app.py
 
 - Key/color sampling, connected-background decisions, trimap construction, manual masks, and AI alpha hints are resolved globally before tiled export.
 - Full-resolution color unmix/despill/edge repair runs in overlap tiles and writes only each tile core, preventing tile seams while avoiding a full-image float32 RGB working copy.
-- Source pixels remain `uint8`; masks are `uint8`; nearest-inner repair labels are `int32` only when under the memory cap; float work is limited to tiles/edge bands.
-- Fringe masks and nearest-inner foreground references are computed from the global matte before export so tile repair decisions stay deterministic. If the label map would exceed the memory cap, export falls back to unmix/channel-clamp repair without allocating a full-resolution foreground RGB image.
+- Source pixels remain `uint8`; masks are `uint8`; nearest-inner repair labels are bounded `int32` only when under the memory cap; float work is limited to tiles, crop regions, and edge-band ROIs.
+- The local screen model builds a full-image `uint8` screen map only below its cap. Large tiled renders fall back to tile-local screen estimates from connected/background-safe pixels inside each read tile.
+- Nearest-inner foreground references use the global label map when it is within the cap. If the label map is skipped, v5 builds tile-local nearest-inner labels inside the overlapped read tile and falls back to unmix/channel-clamp repair when too few/too-far inner pixels are available.
+- **Full Crop** preview renders only the requested full-resolution crop plus required read overlap; result/debug arrays are crop-shaped and aligned while source-size UI metadata is preserved.
 - Default settings target still images around 8K+ on normal RAM. If memory is tight, reduce preview scale or tile size before export.
 
 ## Classical keying notes
@@ -39,7 +41,8 @@ python app.py
 - The default **Connected Background** policy removes only screen-colored regions connected to the image border, preserving foreground islands that happen to match the key color.
 - **Aggressive Interior Removal** can remove disconnected high-confidence key-colored islands, but should be used deliberately.
 - Edge-only alpha refinement keeps hard background at alpha 0 and foreground core at alpha 255 while preserving soft anti-aliased edges.
-- v4 **Edge Color Reconstruction** repairs contaminated soft-edge RGB after alpha generation. It builds an alpha/spill-gated **Fringe Mask**, unmixes screen color, applies a Vlahos-style channel clamp, optionally pulls color from the nearest clean opaque foreground pixel, and preserves perceived luminance via **Luminance Restore**.
+- v5 adds optional guided alpha refinement settings for API/test use: `guided_alpha_refine`, `guided_radius`, `guided_eps`, and `guided_max_pixels`. The default strength is `0.0` (off), and capped edge-band ROI filtering skips deterministically when the memory cap would be exceeded.
+- v5 **Edge Color Reconstruction** repairs contaminated soft-edge RGB after alpha generation in linear light. It builds an alpha/spill-gated **Fringe Mask**, unmixes screen color, applies a Vlahos-style channel clamp, optionally pulls color from the nearest clean opaque foreground pixel, and preserves linear-luminance detail via **Luminance Restore**.
 - **Fringe Remove** controls channel/spill removal strength, **Edge Color Repair** blends reconstructed RGB into the edge, **Inner Color Pull** controls nearest-foreground color pull, and **Fringe Band** widens the soft-edge repair area. Repair is color-only; it does not change alpha.
 - Exported PNGs are straight-alpha; fully transparent RGB is zeroed.
 
@@ -55,15 +58,16 @@ ImgKey currently **does not bundle, download, or install** PyTorch/CUDA, `onnxru
 
 ```powershell
 python smoke_test.py
+python smoke_test.py --write-edge-repair-diagnostics
 python -m py_compile app.py keyer.py smoke_test.py ai_assist.py
 python -c "import app, keyer; print('import ok')"
+python -c "import sys, app, keyer; blocked={'torch','torchvision','transformers','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported: {loaded}'; print('dependency fence ok')"
 ```
 
 Optional diagnostics are written under `.artifact/` only:
 
 ```powershell
 python smoke_test.py --write-diagnostics
-python smoke_test.py --write-edge-repair-diagnostics
 ```
 
 Edge repair diagnostics include before/after PNGs and black/white/gray/checkerboard composites under `.artifact/edge-repair-verification/`.
@@ -84,13 +88,13 @@ if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 The repository includes a GitHub Actions release workflow at `.github/workflows/release.yml`.
 See `RELEASE.md` for the full release process and `CHANGELOG.md` for release notes.
 
-Create a public release by pushing a version tag:
+Create a public release by pushing an approved version tag:
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 The workflow runs on `windows-latest`, installs the default non-AI dependencies, runs the smoke/import checks, builds with `ImgKey.spec`, and uploads `ImgKey-<version>-windows-x64.exe` to the GitHub Release.
 
-You can also run **Release** manually from the GitHub Actions tab with a `version` input such as `v1.0.0`.
+You can also run **Release** manually from the GitHub Actions tab with a `version` input such as `v1.1.0`.

@@ -2,6 +2,27 @@
 
 All notable changes to ImgKey are documented here.
 
+## Unreleased - v5 classical algorithm upgrade
+
+### Added
+
+- Linear-light edge color reconstruction for unmixing, Vlahos-style channel clamp, nearest-inner color pull, and luminance protection while keeping repair RGB-only and alpha-gated.
+- Optional guided alpha refinement settings (`guided_alpha_refine`, `guided_radius`, `guided_eps`, `guided_max_pixels`) with the default state off and a deterministic cap/fallback path for large edge-band ROIs.
+- Tile-local screen model fallback for large tiled renders when the full-image screen map is skipped by the memory cap.
+- Crop-only full-resolution preview rendering that renders the selected crop plus required overlap instead of rendering full-image RGBA and cropping afterward.
+- Tile-local nearest-inner fallback for large-image edge repair when global nearest-inner labels are skipped by the memory cap.
+
+### Changed
+
+- Large-image tiled render overlap now accounts for active local algorithms: edge/fringe repair, guided radius, tile-local screen estimation, and tile-local nearest-inner pull.
+- Crop preview results now keep `KeyResult` image/debug arrays crop-shaped and aligned while preserving source-coordinate metadata for the UI.
+- Smoke coverage now includes v5 linear-light repair, guided alpha, tile-local screen, crop render parity, tile-local nearest-inner fallback, seam metrics, transparent RGB zeroing, and dependency-fence checks.
+
+### Notes
+
+- Default release remains classical/non-AI and does not add dependencies beyond NumPy, OpenCV, Pillow, PySide6, and the Python standard library.
+- No PyTorch, CUDA, ONNX Runtime, PyMatting, SciPy, numba, CorridorKey runtime, model weights, or noncommercial AI assets are bundled or imported by default.
+
 ## v1.0.0 - 2026-05-17
 
 Initial public release.

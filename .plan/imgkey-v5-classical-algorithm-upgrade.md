@@ -1,7 +1,7 @@
 # 04 - ImgKey v5 Classical Algorithm Upgrade
 
 Date: 2026-05-17
-Status: In progress
+Status: Completed
 Owner: ImgKey Engine
 Scope: Improve ImgKey's classical still-image chroma-key pipeline without AI, model runtimes, or new dependencies.
 
@@ -558,10 +558,10 @@ Isolation:
 - Own docs, final verification artifacts, packaging check, and release notes. Do not add new algorithm scope except fixing regressions.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P8.1 - Update docs/context and run full verification
 - Update `README.md`, `AGENTS.md`, and `CHANGELOG.md` with:
@@ -592,10 +592,13 @@ Acceptance:
 - Full verification passes, docs describe the final pipeline, dependency fence remains unchanged, and `git status` contains only intended source/docs changes.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Updated `README.md`, `AGENTS.md`, and `CHANGELOG.md` with v5 linear-light repair, guided alpha default/cap behavior, tile-local screen and nearest-inner fallbacks, crop-only full-resolution preview rendering, and the no-AI/no-new-dependency rule. Final verification passed: `python smoke_test.py`, `python smoke_test.py --write-edge-repair-diagnostics`, `python -m py_compile app.py keyer.py smoke_test.py ai_assist.py`, `python -c "import app, keyer; print('import ok')"`, the dependency-fence import check, and `.artifact\ui-v3-verification\phase4_final_ui_probe.py`. Local PyInstaller validation passed with `dist\ImgKey.exe` built successfully and startup-probed without leaving a process running. No release tag was created or pushed.
 
 ---
 
@@ -649,4 +652,4 @@ python -m PyInstaller --noconfirm --clean ImgKey.spec
 
 ## 8) Immediate next step
 
-Start Phase 0 with `worker`, then Phase 1 with `worker`, then route Phases 2-6 to `deep-worker` one phase at a time. The first quality-impacting phase is **Phase 2: Linear-light edge color repair**.
+Completed. No current task. Await merge/push/release approval.
