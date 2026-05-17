@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import py_compile
 import subprocess
@@ -2057,11 +2058,51 @@ def run_ai_worker_contract_tests() -> None:
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert completed.returncode == 1, f"CLI worker failure should exit 1, got {completed.returncode}: {completed.stderr}"
     cli_response = json.loads(completed.stdout)
     assert cli_response["ok"] is False
     assert cli_response["error"]["code"] == "unsupported_backend"
+
+    with tempfile.TemporaryDirectory(prefix="imgkey-ai-worker-subprocess-") as tmp_dir:
+        tmp = Path(tmp_dir)
+        input_path = tmp / "source.png"
+        Image.fromarray(np.zeros((7, 11, 3), dtype=np.uint8), mode="RGB").save(input_path)
+        cli_missing_model_request = json.dumps(
+            {
+                "backend": "birefnet",
+                "input_image_path": str(input_path),
+                "model_path": str(tmp / "missing-birefnet-model"),
+                "device": "cpu",
+                "mode": "global_plus_roi",
+                "max_side": 64,
+                "tile_size": 64,
+                "tile_overlap": 8,
+                "precision": "fp32",
+                "output_dir": str(tmp / "out"),
+                "temp_dir": str(tmp / "temp"),
+            }
+        )
+        completed = subprocess.run(
+            [sys.executable, "ai_worker.py", "--request", cli_missing_model_request, "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 1, f"CLI missing-model failure should exit 1, got {completed.returncode}: {completed.stderr}"
+        cli_response = json.loads(completed.stdout)
+        assert cli_response["ok"] is False
+        assert cli_response["error"]["code"] == "model_validation_failed"
+        assert cli_response["alpha_hint_path"] is None
+        assert cli_response["diagnostics_path"] and Path(cli_response["diagnostics_path"]).is_file()
+        diagnostics = json.loads(Path(cli_response["diagnostics_path"]).read_text(encoding="utf-8"))
+        cleanup = diagnostics["diagnostics"].get("temp_cleanup")
+        assert cleanup and cleanup["removed"] is True, "CLI worker subprocess must clean staging temp directories"
+        temp_parent = tmp / "temp"
+        leftovers = [path for path in temp_parent.glob("imgkey-ai-worker-*") if path.exists()] if temp_parent.exists() else []
+        assert not leftovers, f"CLI worker subprocess left staging directories behind: {leftovers}"
 
     after_tests = {name for name in heavy_modules if name in sys.modules}
     assert after_tests == before, f"AI worker contract tests must not import heavy runtimes: {after_tests - before}"
@@ -2132,6 +2173,74 @@ def run_gpu_runtime_probe_tests() -> None:
     assert after_probe == before, f"fake gpu probe tests must not import heavy runtimes: {after_probe - before}"
 
 
+def run_app_birefnet_ui_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app_module = importlib.import_module("app")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing app for UI probe must not import heavy runtimes: {after_import - before}"
+    assert "BiRefNet Alpha" in app_module.VIEW_MODES, "BiRefNet Alpha view mode must be registered"
+
+    from PySide6.QtCore import QProcess
+    from PySide6.QtWidgets import QApplication
+
+    created_app = QApplication.instance() is None
+    qt_app = QApplication.instance() or QApplication(["imgkey-ui-probe"])
+    window = app_module.MainWindow()
+    try:
+        assert window.generate_biref_action.text() == "Generate BiRefNet Hint"
+        assert window.cancel_ai_action.text() == "Cancel AI"
+        assert window.gpu_status_action.text() == "GPU Status"
+        assert window.generate_birefnet_btn.text() == "Generate BiRefNet Hint"
+        assert window.cancel_ai_btn.text() == "Cancel AI"
+        assert window.gpu_status_btn.text() == "GPU Status"
+        assert window.view_combo.findText("BiRefNet Alpha") >= 0
+        assert window.biref_alpha_mask is None
+        assert window.alpha_hint_mask is None
+
+        window.biref_alpha_mask = np.full((6, 8), 127, dtype=np.uint8)
+        window._sync_birefnet_status("done")
+        assert "not final hybrid output" in window.birefnet_status.text()
+        assert window.current_settings().mode == "GraphicExact", "generated BiRefNet hint must not switch classical mode"
+
+        manual_hint = np.full((6, 8), 255, dtype=np.uint8)
+        window.alpha_hint_mask = manual_hint
+        window._sync_ai_hint_status("manual.png")
+        assert window.current_settings().mode == "AIHint", "manual alpha hint import path must still drive AIHint mode"
+        assert window.biref_alpha_mask is not window.alpha_hint_mask, "BiRefNet alpha must stay separate from manual alpha_hint_mask"
+
+        with tempfile.TemporaryDirectory(prefix="imgkey-ui-ai-process-") as tmp_dir:
+            tmp = Path(tmp_dir)
+            request_path = tmp / "request.json"
+            cancel_path = tmp / "cancel.flag"
+            temp_input_path = tmp / "source.png"
+            request_path.write_text("{}", encoding="utf-8")
+            temp_input_path.write_text("temp", encoding="utf-8")
+            worker = QProcess(window)
+            worker.start(sys.executable, ["-c", "import time; time.sleep(30)"])
+            assert worker.waitForStarted(3000), f"dummy AI process did not start: {worker.errorString()}"
+            window.ai_worker_process = worker
+            window.ai_worker_request_path = request_path
+            window.ai_worker_cancel_path = cancel_path
+            window.ai_worker_temp_input_path = temp_input_path
+            window.cancel_ai()
+            assert cancel_path.exists(), "Cancel AI should write a cancel flag for the worker"
+            window.close()
+            assert worker.state() == QProcess.NotRunning, "closeEvent must terminate the AI subprocess"
+            assert window.ai_worker_process is None, "closeEvent must clear the AI process reference"
+            assert not request_path.exists(), "closeEvent must clean the worker request file"
+            assert not temp_input_path.exists(), "closeEvent must clean temp UI input files"
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+        if created_app:
+            qt_app.quit()
+
+    after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_probe == before, f"BiRefNet UI probe must not import heavy runtimes: {after_probe - before}"
+
+
 def run_import_compile_tests() -> None:
     for source in (
         "app.py",
@@ -2175,6 +2284,7 @@ def main(argv: list[str] | None = None) -> None:
     run_birefnet_adapter_manifest_tests()
     run_ai_worker_contract_tests()
     run_gpu_runtime_probe_tests()
+    run_app_birefnet_ui_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()

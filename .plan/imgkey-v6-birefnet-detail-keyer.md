@@ -376,10 +376,16 @@ Isolation:
 - Own `app.py` UI wiring and debug view additions. Do not change core alpha merge yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 5 implemented and verified. Added UI controls/actions for Generate BiRefNet Hint, Cancel AI, GPU Status, and BiRefNet Alpha view; BiRefNet worker/probe subprocesses run asynchronously and generated alpha is stored only as separate `biref_alpha_mask` state for display, not classical preview/export.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py`, required `py_compile`, `import app, keyer`, default dependency fence, AI import fence, and headless UI probe confirming controls/view mode exist without heavy AI imports.
 
 
 
@@ -403,10 +409,16 @@ Acceptance:
 - Mode-isolation test proves generated BiRefNet hints do not change classical preview/export in this phase.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: `app.py` now launches `ai_worker.py` through `QProcess`, writes cancel flags and terminates/kills stuck AI subprocesses, loads worker output into distinct `biref_alpha_mask`, and reports model ready/running/done/failed/cancelled states with explicit alpha-hint-only wording. Manual `alpha_hint_mask` import remains separate and still controls the existing `AIHint` classical mode.
+
+Verification:
+- 2026-05-18: Smoke coverage extended with worker subprocess failure/temp-cleanup checks and a headless MainWindow UI/isolation/cancel-cleanup probe; generated BiRefNet state does not change `current_settings().mode` while manual alpha hints still do.
 
 
 ---
@@ -429,7 +441,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -462,7 +474,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -1036,4 +1048,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Run plan gates, then execute Phase 1 first. Do not add torch/model dependencies until Phase 1 memory/lag fixes pass and commit cleanly.
+Execute Phase 6/P6.0 next: add classical screen analysis maps while preserving the default no-torch startup fence and without consuming generated BiRefNet hints in classical preview/export.
