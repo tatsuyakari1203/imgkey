@@ -2535,6 +2535,172 @@ def run_v6_hybrid_trimap_tests() -> None:
     assert after_tests == before, f"hybrid trimap tests must not import heavy runtimes: {after_tests - before}"
 
 
+def run_v6_hybrid_alpha_mode_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    hybrid_trimap = importlib.import_module("hybrid_trimap")
+
+    fixture = hair_lines_fixture()
+    biref_alpha = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    classical = process_key_image(fixture.rgb, fixture.settings)
+    hybrid_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
+    hybrid = process_key_image(fixture.rgb, hybrid_settings, biref_alpha=biref_alpha)
+
+    detail_mask = (fixture.expected_alpha > 0.05) & (fixture.expected_alpha < 0.90)
+    classical_detail_mean = float(np.mean(classical.alpha[detail_mask]))
+    hybrid_detail_mean = float(np.mean(hybrid.alpha[detail_mask]))
+    assert hybrid_detail_mean >= classical_detail_mean + 8.0, (
+        f"HybridBiRefNet should retain more thin detail alpha, {classical_detail_mean:.2f}->{hybrid_detail_mean:.2f}"
+    )
+    border = np.zeros(fixture.rgb.shape[:2], dtype=bool)
+    border[:20, :] = True
+    border[-20:, :] = True
+    border[:, :20] = True
+    border[:, -20:] = True
+    assert int(hybrid.alpha[border].max()) == 0, "hybrid known/background border must stay fully transparent"
+    assert int(hybrid.rgba[hybrid.alpha == 0, :3].max()) == 0, "HybridBiRefNet must keep alpha==0 RGB exactly zero"
+    assert not np.array_equal(hybrid.alpha, biref_alpha), "HybridBiRefNet must not use BiRefNet alpha directly as final alpha"
+
+    try:
+        process_key_image(fixture.rgb, hybrid_settings, alpha_hint=biref_alpha)
+    except ValueError as exc:
+        assert "biref_alpha" in str(exc), "missing distinct BiRefNet alpha error should name biref_alpha"
+    else:
+        raise AssertionError("HybridBiRefNet must not silently consume manual alpha_hint as BiRefNet input")
+
+    noisy_biref = np.full(fixture.rgb.shape[:2], 255, dtype=np.uint8)
+    for mode in ("GraphicExact", "ProChroma", "AIHint"):
+        settings = replace(fixture.settings, mode=mode)
+        manual_hint = biref_alpha if mode == "AIHint" else None
+        base = process_key_image(fixture.rgb, settings, alpha_hint=manual_hint)
+        with_biref = process_key_image(fixture.rgb, settings, alpha_hint=manual_hint, biref_alpha=noisy_biref)
+        assert np.array_equal(base.rgba, with_biref.rgba), f"{mode} output must ignore unrelated biref_alpha input"
+        assert np.array_equal(base.alpha, with_biref.alpha), f"{mode} alpha must stay unchanged"
+
+    h, w = 8, 8
+    classical_alpha = np.full((h, w), 100, dtype=np.uint8)
+    biref = np.full((h, w), 100, dtype=np.uint8)
+    screen_prob = np.zeros((h, w), dtype=np.uint8)
+    screen_dist = np.zeros((h, w), dtype=np.uint8)
+    spill_prob = np.zeros((h, w), dtype=np.uint8)
+    background = np.zeros((h, w), dtype=bool)
+    edge = np.zeros((h, w), dtype=np.uint8)
+    keep = np.zeros((h, w), dtype=np.uint8)
+    remove = np.zeros((h, w), dtype=np.uint8)
+
+    bg_pt = (0, 0)
+    fg_pt = (0, 1)
+    conflict_pt = (0, 2)
+    keep_remove_pt = (0, 3)
+    remove_pt = (0, 4)
+    unknown_pt = (0, 5)
+
+    screen_prob[bg_pt] = 255
+    classical_alpha[bg_pt] = 0
+    biref[bg_pt] = 0
+    classical_alpha[fg_pt] = 20
+    biref[fg_pt] = 230
+    screen_prob[fg_pt] = 0
+    classical_alpha[conflict_pt] = 255
+    biref[conflict_pt] = 128
+    screen_prob[conflict_pt] = 255
+    classical_alpha[keep_remove_pt] = 20
+    biref[keep_remove_pt] = 160
+    screen_prob[keep_remove_pt] = 255
+    keep[keep_remove_pt] = 255
+    remove[keep_remove_pt] = 255
+    classical_alpha[remove_pt] = 255
+    biref[remove_pt] = 255
+    remove[remove_pt] = 255
+    classical_alpha[unknown_pt] = 32
+    biref[unknown_pt] = 160
+
+    trimap = hybrid_trimap.build_hybrid_trimap(
+        classical_alpha,
+        screen_prob,
+        screen_dist,
+        spill_prob,
+        None,
+        background,
+        edge,
+        None,
+        None,
+        biref,
+        keep,
+        remove,
+    )
+    original_alpha = np.ones((h, w), dtype=np.float32)
+    original_alpha[fg_pt] = 0.5
+    original_alpha[keep_remove_pt] = 0.25
+    merged = keyer_module._merge_hybrid_alpha(
+        np.zeros((h, w, 3), dtype=np.uint8),
+        classical_alpha,
+        biref,
+        trimap,
+        KeySettings(guided_alpha_refine=0.0),
+        original_alpha,
+        keep > 127,
+        remove > 127,
+    )
+
+    expected_conflict_w = (128.0 - 64.0) / (220.0 - 64.0)
+    expected_conflict_w = expected_conflict_w * expected_conflict_w * (3.0 - 2.0 * expected_conflict_w)
+    expected_conflict = int(round(255.0 * (1.0 - expected_conflict_w) + 128.0 * expected_conflict_w))
+    expected_unknown_w = (160.0 - 64.0) / (220.0 - 64.0)
+    expected_unknown_w = expected_unknown_w * expected_unknown_w * (3.0 - 2.0 * expected_unknown_w)
+    expected_unknown = int(round(32.0 * (1.0 - expected_unknown_w) + 160.0 * expected_unknown_w))
+
+    assert int(merged[bg_pt]) == 0, "known_bg must clamp final alpha to 0"
+    assert int(merged[fg_pt]) == 115, "source alpha must cap automatic known-fg max(classical,biref) alpha"
+    assert trimap.conflict[conflict_pt] and trimap.unknown[conflict_pt], "conflict must stay unknown before manual overrides"
+    assert int(merged[conflict_pt]) == expected_conflict, "conflict/hard-unknown should use unknown blend, not foreground clamp"
+    assert int(merged[keep_remove_pt]) == 64, "manual keep must beat remove then remain capped by original source alpha"
+    assert int(merged[remove_pt]) == 0, "manual remove must force background where keep is absent"
+    assert int(merged[unknown_pt]) == expected_unknown, "unknown blend must use smoothstep(64, 220, biref_alpha)"
+
+    tiled_settings = replace(hybrid_settings, use_tiling=True, tile_size=97, tile_overlap=18, local_screen_model=True)
+    tiled = process_key_image(fixture.rgb, tiled_settings, biref_alpha=biref_alpha)
+    full = process_key_image(fixture.rgb, replace(tiled_settings, use_tiling=False), biref_alpha=biref_alpha)
+    tile_diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
+    assert int(tile_diff[:, :, 3].max()) == 0, f"HybridBiRefNet tiled/full alpha diff must be exact, got {int(tile_diff[:, :, 3].max())}"
+    assert int(tile_diff.max()) <= 1, f"HybridBiRefNet tiled/full RGBA seam diff too high: {int(tile_diff.max())}"
+
+    crop = (170, 90, 390, 310)
+    x0, y0, x1, y1 = crop
+    cropped = process_key_image(fixture.rgb, replace(tiled_settings, full_res_crop=crop), biref_alpha=biref_alpha)
+    crop_diff = np.abs(cropped.rgba.astype(np.int16) - full.rgba[y0:y1, x0:x1].astype(np.int16))
+    assert int(crop_diff[:, :, 3].max()) == 0, "HybridBiRefNet crop alpha must match full-render crop exactly"
+    assert int(crop_diff.max()) <= 1, f"HybridBiRefNet crop RGBA diff too high: {int(crop_diff.max())}"
+
+    skipped = process_key_image(
+        fixture.rgb,
+        replace(hybrid_settings, guided_alpha_refine=1.0, guided_radius=5, guided_max_pixels=1),
+        biref_alpha=biref_alpha,
+    )
+    assert np.array_equal(hybrid.alpha, skipped.alpha), "HybridBiRefNet guided cap fallback must skip deterministically unchanged"
+    assert np.array_equal(hybrid.rgba, skipped.rgba), "HybridBiRefNet guided cap fallback must preserve RGBA"
+
+    refined = process_key_image(
+        fixture.rgb,
+        replace(hybrid_settings, guided_alpha_refine=0.85, guided_radius=5, guided_eps=1e-3, guided_max_pixels=1_000_000),
+        biref_alpha=biref_alpha,
+    )
+    refine_mask = (hybrid.alpha > 0) & (hybrid.alpha < 255)
+    rough_before = alpha_edge_roughness(hybrid.alpha, refine_mask)
+    rough_after = alpha_edge_roughness(refined.alpha, refine_mask)
+    assert rough_after <= rough_before * 0.75, f"unknown-only hybrid refinement should reduce jagged alpha, {rough_before:.3f}->{rough_after:.3f}"
+    assert float(np.mean(refined.alpha[detail_mask])) >= hybrid_detail_mean, "guided hybrid refinement must preserve BiRefNet-retained thin detail"
+    assert int(refined.alpha[border].max()) == 0, "guided hybrid refinement must not expand confident background leak"
+
+    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_tests == before, f"HybridBiRefNet alpha tests must not import heavy runtimes: {after_tests - before}"
+    print(
+        "Phase 7 HybridBiRefNet alpha checks: "
+        f"detail_mean {classical_detail_mean:.2f}->{hybrid_detail_mean:.2f}; "
+        f"tile_rgba_diff={int(tile_diff.max())}; crop_rgba_diff={int(crop_diff.max())}; "
+        f"roughness {rough_before:.2f}->{rough_after:.2f}"
+    )
+
+
 def run_import_compile_tests() -> None:
     for source in (
         "app.py",
@@ -2583,6 +2749,7 @@ def main(argv: list[str] | None = None) -> None:
     run_app_birefnet_ui_tests()
     run_v6_screen_analysis_tests()
     run_v6_hybrid_trimap_tests()
+    run_v6_hybrid_alpha_mode_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()

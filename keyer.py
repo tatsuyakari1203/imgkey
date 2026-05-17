@@ -207,6 +207,7 @@ def process_chroma_key(
     keep_mask: np.ndarray | None = None,
     remove_mask: np.ndarray | None = None,
     alpha_hint: np.ndarray | None = None,
+    biref_alpha: np.ndarray | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
 ) -> np.ndarray:
@@ -219,6 +220,7 @@ def process_chroma_key(
         keep_mask=keep_mask,
         remove_mask=remove_mask,
         alpha_hint=alpha_hint,
+        biref_alpha=biref_alpha,
         progress_callback=progress_callback,
         cancel_callback=cancel_callback,
         include_debug=False,
@@ -233,6 +235,7 @@ def process_key_image(
     keep_mask: np.ndarray | None = None,
     remove_mask: np.ndarray | None = None,
     alpha_hint: np.ndarray | None = None,
+    biref_alpha: np.ndarray | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
     include_debug: bool = True,
@@ -254,12 +257,15 @@ def process_key_image(
     keep = _mask_to_bool(keep_mask, (h, w), "keep_mask")
     remove = _mask_to_bool(remove_mask, (h, w), "remove_mask")
     hint = _mask_to_u8(alpha_hint, (h, w), "alpha_hint")
+    biref = _mask_to_u8(biref_alpha, (h, w), "biref_alpha")
 
-    if settings.mode not in {"GraphicExact", "ProChroma", "AIHint"}:
+    if settings.mode not in {"GraphicExact", "ProChroma", "AIHint", "HybridBiRefNet"}:
         raise ValueError(f"Unsupported keying mode: {settings.mode}")
+    if settings.mode == "HybridBiRefNet" and biref is None:
+        raise ValueError("HybridBiRefNet mode requires a distinct biref_alpha input")
 
     _raise_if_cancelled(cancel_callback)
-    global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, progress_callback, cancel_callback)
+    global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, biref, progress_callback, cancel_callback)
     _report(progress_callback, 0.18, "global matte")
     _raise_if_cancelled(cancel_callback)
 
@@ -365,10 +371,12 @@ def _build_global_matte(
     keep_mask: np.ndarray | None,
     remove_mask: np.ndarray | None,
     alpha_hint: np.ndarray | None,
+    biref_alpha: np.ndarray | None,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
 ) -> _GlobalMatte:
     h, w = rgb.shape[:2]
+    is_hybrid = settings.mode == "HybridBiRefNet"
     screen_color = _sample_screen_color(rgb, settings)
     _report(progress_callback, 0.02, "sample screen")
     _raise_if_cancelled(cancel_callback)
@@ -396,19 +404,8 @@ def _build_global_matte(
             aggressive = _remove_small_components(aggressive, int(settings.aggressive_min_area), protect_border=False)
         background |= aggressive
 
-    hint_foreground = _alpha_hint_foreground_mask(alpha_hint, settings)
-    if hint_foreground is not None:
-        background &= ~hint_foreground
-    if keep_mask is not None:
-        background &= ~keep_mask
-    if remove_mask is not None:
-        remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
-        background |= remove_effective
-
-    min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
-    if min_area > 0:
-        background = _remove_small_components(background, min_area, protect_border=True)
-        background = _fill_small_holes(background, min_area)
+    hint_foreground = None if is_hybrid else _alpha_hint_foreground_mask(alpha_hint, settings)
+    if not is_hybrid:
         if hint_foreground is not None:
             background &= ~hint_foreground
         if keep_mask is not None:
@@ -417,9 +414,40 @@ def _build_global_matte(
             remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
             background |= remove_effective
 
+    min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
+    if min_area > 0:
+        background = _remove_small_components(background, min_area, protect_border=True)
+        background = _fill_small_holes(background, min_area)
+        if not is_hybrid:
+            if hint_foreground is not None:
+                background &= ~hint_foreground
+            if keep_mask is not None:
+                background &= ~keep_mask
+            if remove_mask is not None:
+                remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+                background |= remove_effective
+
     edge_mask, alpha = _build_alpha_from_trimap(background, probability, fg_threshold, bg_threshold, settings)
     _report(progress_callback, 0.15, "trimap")
     _raise_if_cancelled(cancel_callback)
+    if is_hybrid:
+        if biref_alpha is None:
+            raise ValueError("HybridBiRefNet mode requires a distinct biref_alpha input")
+        return _build_hybrid_global_matte(
+            rgb,
+            settings,
+            original_alpha,
+            keep_mask,
+            remove_mask,
+            biref_alpha,
+            screen_color,
+            probability,
+            background,
+            edge_mask,
+            alpha,
+            progress_callback,
+            cancel_callback,
+        )
     if keep_mask is not None:
         alpha[keep_mask] = 255
         edge_mask[keep_mask] = False
@@ -494,6 +522,213 @@ def _apply_alpha_hint(
     core = allowed & (alpha_hint >= int(np.clip(int(settings.alpha_hint_foreground_threshold), 1, 255)))
     alpha[core] = np.maximum(alpha[core], alpha_hint[core])
     edge_mask[core & (alpha >= 248)] = False
+
+
+def _build_hybrid_global_matte(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    original_alpha: np.ndarray | None,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    biref_alpha: np.ndarray,
+    screen_color: tuple[int, int, int],
+    screen_probability: np.ndarray,
+    classical_background: np.ndarray,
+    classical_edge_mask: np.ndarray,
+    classical_alpha: np.ndarray,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+) -> _GlobalMatte:
+    """Build final alpha for HybridBiRefNet without changing classical modes."""
+
+    from hybrid_trimap import build_hybrid_trimap
+    from screen_analysis import analyze_screen
+
+    _report(progress_callback, 0.155, "hybrid screen analysis")
+    analysis = analyze_screen(
+        rgb,
+        classical_alpha,
+        background_mask=classical_background,
+        settings=settings,
+        picked_screen_color=screen_color,
+        keep_mask=keep_mask,
+        remove_mask=remove_mask,
+    )
+    _raise_if_cancelled(cancel_callback)
+
+    trimap = build_hybrid_trimap(
+        classical_alpha,
+        screen_probability,
+        analysis.screen_distance,
+        analysis.spill_probability,
+        analysis.classical_confidence,
+        classical_background,
+        analysis.edge_mask,
+        analysis.fringe_mask,
+        analysis.screen_plate_rgb,
+        biref_alpha,
+        keep_mask,
+        remove_mask,
+    )
+    _report(progress_callback, 0.162, "hybrid trimap")
+    _raise_if_cancelled(cancel_callback)
+
+    alpha = _merge_hybrid_alpha(
+        rgb,
+        classical_alpha,
+        biref_alpha,
+        trimap,
+        settings,
+        original_alpha,
+        keep_mask,
+        remove_mask,
+    )
+    _report(progress_callback, 0.168, "hybrid alpha")
+    _raise_if_cancelled(cancel_callback)
+
+    background = (trimap.known_bg | trimap.manual_remove_effective | (alpha <= 0)).astype(bool, copy=True)
+    if keep_mask is not None:
+        background &= ~(keep_mask & (alpha > 0))
+    background[alpha <= 0] = True
+    hybrid_edge = (
+        trimap.unknown
+        | trimap.soft_unknown
+        | (classical_edge_mask.astype(bool, copy=False) & (alpha > 0))
+        | ((alpha > 0) & (alpha < 255))
+    )
+    hybrid_edge &= ~background
+    screen_map = _estimate_screen_map(rgb, background, screen_color, settings)
+    _report(progress_callback, 0.17, "screen model")
+    _raise_if_cancelled(cancel_callback)
+
+    fringe_mask = _build_fringe_mask(rgb, alpha, hybrid_edge, screen_probability, screen_color, settings, progress_callback, cancel_callback)
+    _report(progress_callback, 0.175, "fringe map")
+    _raise_if_cancelled(cancel_callback)
+    inner_labels, inner_label_to_flat = _build_nearest_inner_label_map(alpha, background, screen_probability, fringe_mask, settings)
+    _report(progress_callback, 0.18, "inner color map")
+    return _GlobalMatte(
+        screen_color=screen_color,
+        screen_probability=screen_probability,
+        screen_map=screen_map,
+        background_mask=background,
+        edge_mask=hybrid_edge.astype(bool, copy=False),
+        alpha=alpha,
+        alpha_hint=None,
+        fringe_mask=fringe_mask,
+        inner_labels=inner_labels,
+        inner_label_to_flat=inner_label_to_flat,
+    )
+
+
+def _merge_hybrid_alpha(
+    rgb: np.ndarray,
+    classical_alpha: np.ndarray,
+    biref_alpha: np.ndarray,
+    trimap: object,
+    settings: KeySettings,
+    original_alpha: np.ndarray | None,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+) -> np.ndarray:
+    classical = _mask_to_u8(classical_alpha, classical_alpha.shape, "classical_alpha")
+    biref = _mask_to_u8(biref_alpha, classical.shape, "biref_alpha")
+    known_bg = np.asarray(getattr(trimap, "known_bg"), dtype=bool)
+    known_fg = np.asarray(getattr(trimap, "known_fg"), dtype=bool)
+    unknown = np.asarray(getattr(trimap, "unknown"), dtype=bool) & ~(known_bg | known_fg)
+
+    alpha = classical.copy()
+    alpha[known_bg] = 0
+    fg = known_fg & ~known_bg
+    if np.any(fg):
+        alpha[fg] = np.maximum(classical, biref)[fg]
+    if np.any(unknown):
+        w = _smoothstep(64.0, 220.0, biref.astype(np.float32))
+        blended = classical.astype(np.float32) * (1.0 - w) + biref.astype(np.float32) * w
+        alpha[unknown] = np.rint(np.clip(blended[unknown], 0.0, 255.0)).astype(np.uint8)
+    _apply_hybrid_automatic_clamps(alpha, classical, biref, trimap)
+
+    alpha = _refine_hybrid_alpha_unknown_only(rgb, alpha, classical, biref, trimap, settings)
+    _apply_hybrid_automatic_clamps(alpha, classical, biref, trimap)
+
+    keep = _bool_mask_for_shape(keep_mask, classical.shape, "keep_mask")
+    remove = _bool_mask_for_shape(remove_mask, classical.shape, "remove_mask")
+    if remove is not None:
+        alpha[remove] = 0
+    if keep is not None:
+        alpha[keep] = 255
+    return _apply_original_alpha(alpha, original_alpha)
+
+
+def _bool_mask_for_shape(mask: np.ndarray | None, shape: tuple[int, int], name: str) -> np.ndarray | None:
+    if mask is None:
+        return None
+    arr = np.asarray(mask)
+    if arr.dtype == bool and arr.shape == shape:
+        return arr
+    return _mask_to_bool(mask, shape, name)
+
+
+def _apply_hybrid_automatic_clamps(
+    alpha: np.ndarray,
+    classical_alpha: np.ndarray,
+    biref_alpha: np.ndarray,
+    trimap: object,
+) -> None:
+    known_bg = np.asarray(getattr(trimap, "known_bg"), dtype=bool)
+    known_fg = np.asarray(getattr(trimap, "known_fg"), dtype=bool) & ~known_bg
+    alpha[known_bg] = 0
+    if np.any(known_fg):
+        alpha[known_fg] = np.maximum(classical_alpha, biref_alpha)[known_fg]
+
+
+def _refine_hybrid_alpha_unknown_only(
+    rgb: np.ndarray,
+    alpha_u8: np.ndarray,
+    classical_alpha: np.ndarray,
+    biref_alpha: np.ndarray,
+    trimap: object,
+    settings: KeySettings,
+) -> np.ndarray:
+    strength = _clip01(settings.guided_alpha_refine)
+    if strength <= 0.0:
+        return alpha_u8
+
+    radius = max(1, int(settings.guided_radius))
+    max_pixels = max(0, int(settings.guided_max_pixels))
+    known = np.asarray(getattr(trimap, "known_bg"), dtype=bool) | np.asarray(getattr(trimap, "known_fg"), dtype=bool)
+    refine_region = (
+        (np.asarray(getattr(trimap, "unknown"), dtype=bool) | np.asarray(getattr(trimap, "soft_unknown"), dtype=bool))
+        & ~known
+        & (alpha_u8 > 0)
+        & (alpha_u8 < 255)
+    )
+    if max_pixels <= 0 or not np.any(refine_region):
+        return alpha_u8
+
+    y0, y1, x0, x1 = _expanded_mask_bounds(refine_region, margin=radius * 2 + 2, shape=alpha_u8.shape)
+    if (y1 - y0) * (x1 - x0) > max_pixels:
+        return alpha_u8
+
+    roi_y = slice(y0, y1)
+    roi_x = slice(x0, x1)
+    guide = _linear_luma_from_rgb_u8(rgb[roi_y, roi_x])
+    src = alpha_u8[roi_y, roi_x].astype(np.float32) / 255.0
+    refined = _guided_filter_gray(guide, src, radius, settings.guided_eps)
+    blended = src * (1.0 - strength) + refined * strength
+
+    target = refine_region[roi_y, roi_x]
+    if not np.any(target):
+        return alpha_u8
+
+    # Where BiRefNet raised thin detail above the classical matte, filtering may
+    # smooth surrounding unknown alpha but must not erode the retained detail.
+    detail_prior = (biref_alpha[roi_y, roi_x] > classical_alpha[roi_y, roi_x]) & (biref_alpha[roi_y, roi_x] >= 96)
+    blended = np.where(detail_prior, np.maximum(blended, src), blended)
+
+    out = alpha_u8.copy()
+    out_roi = out[roi_y, roi_x]
+    out_roi[target] = np.rint(np.clip(blended[target], 0.0, 1.0) * 255.0).astype(np.uint8)
+    return out
 
 
 def _sample_screen_color(rgb: np.ndarray, settings: KeySettings) -> tuple[int, int, int]:

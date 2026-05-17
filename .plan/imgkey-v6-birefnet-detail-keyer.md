@@ -581,10 +581,16 @@ Isolation:
 - Own `keyer.py`, `smoke_test.py`. Preserve existing classical modes.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 7 completed `HybridBiRefNet` alpha mode and unknown-only alpha refinement with explicit BiRefNet/classical/manual/source-alpha ordering.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py` including new Phase 7 HybridBiRefNet alpha tests.
 
 
 
@@ -621,10 +627,13 @@ Acceptance:
 - Unknown-only guided refine skips deterministically when ROI/pixel cap such as `guided_max_pixels` would be exceeded.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added `HybridBiRefNet` as a keyer mode requiring explicit `biref_alpha`; BiRefNet alpha is blended with classical alpha through `hybrid_trimap.py` instead of being used directly, known-bg/known-fg clamps are reapplied, manual keep wins over remove, and original source alpha caps final alpha last.
 
 
 #### P7.2 - Unknown-only alpha refinement
@@ -662,10 +671,13 @@ Acceptance:
 - Does not erase thin BiRefNet-retained hair/detail.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-18: Added optional unknown/soft-unknown-only guided alpha refinement using existing OpenCV/NumPy guided-filter helpers, ROI pixel-cap deterministic skip behavior, known-region clamps, and BiRefNet detail-prior preservation.
 
 
 ---
@@ -688,7 +700,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -718,7 +730,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 #### P8.1a - Build local screen/clean plate
@@ -1061,4 +1073,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Execute Phase 7/P7.1 next: add the `HybridBiRefNet` alpha mode using the Phase 6 screen analysis and hybrid trimap helpers while preserving existing classical modes and source-alpha/manual-mask ordering.
+Execute Phase 8/P8.1 next: apply classical screen/clean-plate RGB cleanup to the final hybrid alpha while preserving Phase 7 alpha ordering and classical-mode behavior.
