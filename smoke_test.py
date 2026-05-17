@@ -38,6 +38,7 @@ from keyer import (
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
+BIREFNET_DIAGNOSTIC_DIR = Path(".artifact") / "birefnet-diagnostics"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -828,6 +829,312 @@ def opaque_foreground_max_delta(
         expected = expected_foreground_rgb
     delta = np.abs(rgba[mask, :3].astype(np.int16) - expected[mask].astype(np.int16))
     return {"count": int(delta.shape[0]), "max_delta": int(np.max(delta)), "mean_delta": float(np.mean(delta))}
+
+
+def _mask_image(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> np.ndarray:
+    if mask is None:
+        if shape is None:
+            raise ValueError("shape is required for an empty diagnostic mask")
+        return np.zeros(shape, dtype=np.uint8)
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, 3] if arr.shape[2] == 4 else arr[:, :, 0]
+    if arr.dtype == bool:
+        return arr.astype(np.uint8) * 255
+    if np.issubdtype(arr.dtype, np.floating):
+        scale = 255.0 if arr.size and float(np.nanmax(arr)) <= 1.0 else 1.0
+        arr = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0) * scale
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+def _save_mask(path: Path, mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> None:
+    Image.fromarray(_mask_image(mask, shape), mode="L").save(path)
+
+
+def _mock_birefnet_alpha_for_fixture(fixture: DiagnosticFixture) -> np.ndarray:
+    """Deterministic synthetic BiRefNet alpha used when no real model is bundled."""
+
+    if fixture.expected_alpha is not None:
+        return np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    classical = process_key_image(fixture.rgb, fixture.settings)
+    return classical.alpha.copy()
+
+
+def _channel_excess_stats(rgb: np.ndarray, channel: int, mask: np.ndarray) -> dict[str, int | float]:
+    mask_b = mask.astype(bool, copy=False)
+    if not np.any(mask_b):
+        return {"count": 0, "mean_positive_excess": 0.0, "p95_positive_excess": 0.0, "max_positive_excess": 0}
+    other = [c for c in range(3) if c != channel]
+    rgb_i = rgb[:, :, :3].astype(np.int16)
+    excess = rgb_i[:, :, channel] - np.maximum(rgb_i[:, :, other[0]], rgb_i[:, :, other[1]])
+    positive = np.maximum(excess[mask_b], 0)
+    return {
+        "count": int(positive.size),
+        "mean_positive_excess": float(np.mean(positive)),
+        "p95_positive_excess": float(np.percentile(positive, 95)),
+        "max_positive_excess": int(np.max(positive)),
+    }
+
+
+def _core_rgb_delta_between(before_rgb: np.ndarray, after_rgb: np.ndarray, core_mask: np.ndarray) -> dict[str, int | float]:
+    mask = core_mask.astype(bool, copy=False)
+    if not np.any(mask):
+        return {"count": 0, "max_delta": 0, "mean_delta": 0.0}
+    delta = np.abs(after_rgb[mask].astype(np.int16) - before_rgb[mask].astype(np.int16))
+    return {"count": int(delta.shape[0]), "max_delta": int(np.max(delta)), "mean_delta": float(np.mean(delta))}
+
+
+def _alpha_edge_overlay(rgb: np.ndarray, alpha: np.ndarray, edge_mask: np.ndarray, conflict: np.ndarray | None = None) -> np.ndarray:
+    overlay = rgb.copy()
+    alpha_edge = edge_mask.astype(bool, copy=False) | ((alpha > 0) & (alpha < 255))
+    if np.any(alpha_edge):
+        red = np.zeros_like(overlay)
+        red[:, :, 0] = 255
+        overlay[alpha_edge] = np.clip(overlay[alpha_edge].astype(np.float32) * 0.45 + red[alpha_edge].astype(np.float32) * 0.55, 0, 255).astype(np.uint8)
+    if conflict is not None and np.any(conflict):
+        cyan = np.zeros_like(overlay)
+        cyan[:, :, 1:] = 255
+        conflict_b = conflict.astype(bool, copy=False)
+        overlay[conflict_b] = np.clip(overlay[conflict_b].astype(np.float32) * 0.35 + cyan[conflict_b].astype(np.float32) * 0.65, 0, 255).astype(np.uint8)
+    return overlay
+
+
+def _birefnet_diagnostic_payload() -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Build Phase 9 BiRefNet diagnostics from a synthetic/mock alpha hint."""
+
+    before_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    screen_analysis = importlib.import_module("screen_analysis")
+    hybrid_trimap = importlib.import_module("hybrid_trimap")
+    after_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_imports == before_imports, f"BiRefNet diagnostics must not import heavy runtimes: {after_imports - before_imports}"
+
+    fixture = hair_lines_fixture()
+    biref_alpha = _mock_birefnet_alpha_for_fixture(fixture)
+    classical_settings = replace(fixture.settings, mode="GraphicExact", guided_alpha_refine=0.0)
+    hybrid_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
+    cleanup_off_settings = replace(
+        hybrid_settings,
+        edge_color_repair=0.0,
+        unmix_amount=0.0,
+        despill=0.0,
+        fringe_remove=0.0,
+    )
+    unmix_only_settings = replace(hybrid_settings, despill=0.0, fringe_remove=0.0)
+
+    classical = process_key_image(fixture.rgb, classical_settings)
+    before = process_key_image(fixture.rgb, cleanup_off_settings, biref_alpha=biref_alpha)
+    after_unmix = process_key_image(fixture.rgb, unmix_only_settings, biref_alpha=biref_alpha)
+    after = process_key_image(fixture.rgb, hybrid_settings, biref_alpha=biref_alpha)
+
+    assert np.array_equal(before.alpha, after.alpha), "P8 RGB cleanup must not alter HybridBiRefNet alpha"
+    assert np.array_equal(after_unmix.alpha, after.alpha), "unmix-only diagnostic must preserve HybridBiRefNet alpha"
+    assert int(after.rgba[after.alpha == 0, :3].max()) == 0, "alpha==0 diagnostic pixels must have exact RGB zero"
+
+    background_mask = classical.background_mask if classical.background_mask is not None else classical.alpha <= 8
+    screen_probability = classical.screen_probability if classical.screen_probability is not None else np.zeros(classical.alpha.shape, dtype=np.uint8)
+    analysis = screen_analysis.analyze_screen(
+        fixture.rgb,
+        classical.alpha,
+        background_mask=background_mask,
+        settings=fixture.settings,
+        picked_screen_color=classical.screen_color or fixture.settings.key_color,
+    )
+    trimap = hybrid_trimap.build_hybrid_trimap(
+        classical.alpha,
+        screen_probability,
+        analysis.screen_distance,
+        analysis.spill_probability,
+        analysis.classical_confidence,
+        background_mask,
+        analysis.edge_mask,
+        analysis.fringe_mask,
+        analysis.screen_plate_rgb,
+        biref_alpha,
+    )
+
+    final_background = after.background_mask if after.background_mask is not None else (trimap.known_bg | (after.alpha <= 0))
+    final_edge = after.edge_mask if after.edge_mask is not None else (trimap.unknown | ((after.alpha > 0) & (after.alpha < 255)))
+    final_fringe = after.fringe_mask if after.fringe_mask is not None else analysis.fringe_mask
+    unmix_region, despill_region, _protected_fg, _safe_bg, _manual_keep = keyer_module._build_final_hybrid_cleanup_regions(
+        after.alpha,
+        final_background,
+        final_edge,
+        final_fringe,
+        screen_probability,
+        analysis.spill_probability,
+        trimap,
+    )
+
+    edge_mask = fixture.soft_edge_mask.astype(bool, copy=False) & (after.alpha > 0)
+    detail_mask = (fixture.expected_alpha > 0.05) & (fixture.expected_alpha < 0.90)
+    foreground_core = fixture.foreground_core_mask.astype(bool, copy=False)
+
+    classical_detail_mean = float(np.mean(classical.alpha[detail_mask])) if np.any(detail_mask) else 0.0
+    hybrid_detail_mean = float(np.mean(after.alpha[detail_mask])) if np.any(detail_mask) else 0.0
+    mock_detail_mean = float(np.mean(biref_alpha[detail_mask])) if np.any(detail_mask) else 0.0
+    background_alpha = after.alpha[trimap.known_bg]
+    background_leak_area = int(np.count_nonzero(background_alpha > 8))
+    core_delta = opaque_foreground_max_delta(fixture.rgb, after.rgba, foreground_core, fixture.expected_foreground_rgb)
+
+    composite_residuals: dict[str, dict[str, Any]] = {}
+    composite_images: dict[str, np.ndarray] = {}
+    for name, color in {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "gray": (128, 128, 128),
+        "checker": None,
+    }.items():
+        before_rgb = checkerboard_composite(before.rgba) if color is None else _solid_composite(before.rgba, color)
+        after_rgb = checkerboard_composite(after.rgba) if color is None else _solid_composite(after.rgba, color)
+        before_residual = rgb_key_residual(before_rgb, fixture.settings.key_color, edge_mask)
+        after_residual = rgb_key_residual(after_rgb, fixture.settings.key_color, edge_mask)
+        composite_residuals[name] = {"before": before_residual, "after": after_residual}
+        composite_images[f"{name}_composite_before_cleanup"] = before_rgb
+        composite_images[f"{name}_composite"] = after_rgb
+        composite_images[f"{name}_composite_compare"] = np.concatenate([before_rgb, after_rgb], axis=1)
+        assert after_residual["mean_positive_excess"] < before_residual["mean_positive_excess"] * 0.70, (
+            f"BiRefNet diagnostics should show lower {name} composite halo mean: {before_residual} -> {after_residual}"
+        )
+        assert after_residual["p95_positive_excess"] <= before_residual["p95_positive_excess"], (
+            f"BiRefNet diagnostics should not worsen {name} composite p95 halo: {before_residual} -> {after_residual}"
+        )
+
+    tiled_settings = replace(hybrid_settings, use_tiling=True, tile_size=97, tile_overlap=18, local_screen_model=True)
+    tiled = process_key_image(fixture.rgb, tiled_settings, biref_alpha=biref_alpha)
+    full = process_key_image(fixture.rgb, replace(tiled_settings, use_tiling=False), biref_alpha=biref_alpha)
+    tile_diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
+    tile_seam_diff = {
+        "tile_size": 97,
+        "tile_overlap": 18,
+        "max_rgba_diff": int(tile_diff.max()),
+        "max_alpha_diff": int(tile_diff[:, :, 3].max()),
+    }
+    assert tile_seam_diff["max_alpha_diff"] == 0, f"Hybrid diagnostics alpha tile seam diff too high: {tile_seam_diff}"
+    assert tile_seam_diff["max_rgba_diff"] <= 1, f"Hybrid diagnostics RGBA tile seam diff too high: {tile_seam_diff}"
+
+    green_stats = _channel_excess_stats(after.rgba[:, :, :3], 1, edge_mask)
+    blue_stats = _channel_excess_stats(after.rgba[:, :, :3], 2, edge_mask)
+    low_alpha = edge_mask & (after.alpha > 0) & (after.alpha < 38)
+    low_alpha_green = _channel_excess_stats(after.rgba[:, :, :3], 1, low_alpha)
+    low_alpha_blue = _channel_excess_stats(after.rgba[:, :, :3], 2, low_alpha)
+    low_alpha_noise_score = float(max(low_alpha_green["p95_positive_excess"], low_alpha_blue["p95_positive_excess"]))
+    low_alpha_noise_max = int(max(low_alpha_green["max_positive_excess"], low_alpha_blue["max_positive_excess"]))
+    despill_core_delta = _core_rgb_delta_between(after_unmix.rgba[:, :, :3], after.rgba[:, :, :3], foreground_core)
+    known_bg_false_positive = trimap.known_bg & (fixture.expected_alpha > 0.05)
+    if np.any(foreground_core):
+        core_biref = np.maximum(biref_alpha[foreground_core].astype(np.float32), 1.0)
+        known_fg_preservation_score = float(np.mean(np.minimum(after.alpha[foreground_core].astype(np.float32) / core_biref, 1.0)))
+    else:
+        known_fg_preservation_score = 1.0
+
+    direct_residuals = {
+        "before_cleanup": edge_key_residual(before.rgba, fixture.settings.key_color, edge_mask),
+        "after_unmix": edge_key_residual(after_unmix.rgba, fixture.settings.key_color, edge_mask),
+        "after_despill": edge_key_residual(after.rgba, fixture.settings.key_color, edge_mask),
+    }
+    transparent_max = int(after.rgba[after.alpha == 0, :3].max()) if np.any(after.alpha == 0) else 0
+    metrics: dict[str, Any] = {
+        "fixture": fixture.name,
+        "birefnet_alpha_source": "synthetic_mock_expected_alpha_no_model_required",
+        "detail_retention": {
+            "classical_detail_alpha_mean": classical_detail_mean,
+            "hybrid_detail_alpha_mean": hybrid_detail_mean,
+            "mock_birefnet_detail_alpha_mean": mock_detail_mean,
+            "hybrid_minus_classical": hybrid_detail_mean - classical_detail_mean,
+        },
+        "background_leak": {
+            "known_bg_pixels": int(background_alpha.size),
+            "alpha_gt_8_area": background_leak_area,
+            "alpha_gt_8_fraction": float(background_leak_area / max(1, background_alpha.size)),
+            "max_alpha": int(background_alpha.max()) if background_alpha.size else 0,
+        },
+        "edge_key_color_residual": {
+            **direct_residuals,
+            "composites": composite_residuals,
+        },
+        "foreground_core_rgb_delta": core_delta,
+        "tile_seam_diff": tile_seam_diff,
+        "transparent_rgb_residual_max": transparent_max,
+        "edge_green_residual_mean": green_stats["mean_positive_excess"],
+        "edge_blue_residual_mean": blue_stats["mean_positive_excess"],
+        "low_alpha_noise_score": low_alpha_noise_score,
+        "low_alpha_noise": {"green": low_alpha_green, "blue": low_alpha_blue, "max_positive_excess": low_alpha_noise_max},
+        "despill_core_color_delta": despill_core_delta,
+        "known_bg_false_positive_area": int(np.count_nonzero(known_bg_false_positive)),
+        "known_fg_preservation_score": known_fg_preservation_score,
+    }
+
+    assert hybrid_detail_mean >= classical_detail_mean + 8.0, f"detail retention too low: {metrics['detail_retention']}"
+    assert background_leak_area == 0, f"mock BiRefNet diagnostics leaked confident background: {metrics['background_leak']}"
+    assert direct_residuals["after_despill"]["mean_positive_excess"] < direct_residuals["before_cleanup"]["mean_positive_excess"], (
+        f"P8 cleanup should reduce direct edge residual: {direct_residuals}"
+    )
+    assert core_delta["max_delta"] <= 32, f"foreground core RGB delta outside tolerance: {core_delta}"
+    assert transparent_max == 0, f"transparent RGB residual must be zero, got {transparent_max}"
+    assert low_alpha_noise_score <= 80.0 and low_alpha_noise_max <= 96, f"low-alpha saturated key noise too high: {metrics['low_alpha_noise']}"
+    assert despill_core_delta["max_delta"] <= 32, f"despill changed protected core too much: {despill_core_delta}"
+    assert known_fg_preservation_score >= 0.95, f"known foreground preservation too low: {known_fg_preservation_score:.3f}"
+
+    images: dict[str, np.ndarray] = {
+        "source": fixture.rgb,
+        "classical_alpha": classical.alpha,
+        "birefnet_alpha": biref_alpha,
+        "screen_probability": screen_probability,
+        "screen_distance": analysis.screen_distance,
+        "screen_plate": analysis.screen_plate_rgb.resolve(),
+        "spill_probability": analysis.spill_probability,
+        "fringe_mask": _mask_image(final_fringe, after.alpha.shape),
+        "hybrid_known_bg": _mask_image(trimap.known_bg),
+        "hybrid_known_fg": _mask_image(trimap.known_fg),
+        "hybrid_unknown": _mask_image(trimap.unknown),
+        "hybrid_conflict": _mask_image(trimap.conflict),
+        "unmix_region": _mask_image(unmix_region),
+        "despill_region": _mask_image(despill_region),
+        "hybrid_alpha": after.alpha,
+        "rgb_before_cleanup": before.rgba[:, :, :3],
+        "rgb_after_unmix": after_unmix.rgba[:, :, :3],
+        "rgb_after_despill": after.rgba[:, :, :3],
+        "alpha_edge_overlay": _alpha_edge_overlay(fixture.rgb, after.alpha, edge_mask, trimap.conflict),
+        "result": after.rgba,
+        **composite_images,
+    }
+    return images, metrics
+
+
+def run_v6_birefnet_diagnostics_tests() -> None:
+    _images, metrics = _birefnet_diagnostic_payload()
+    print(
+        "Phase 9 BiRefNet diagnostics checks: "
+        f"detail_gain={metrics['detail_retention']['hybrid_minus_classical']:.2f}; "
+        f"transparent_rgb_max={metrics['transparent_rgb_residual_max']}; "
+        f"low_alpha_noise={metrics['low_alpha_noise_score']:.1f}; "
+        f"tile_rgba_diff={metrics['tile_seam_diff']['max_rgba_diff']}"
+    )
+
+
+def write_birefnet_diagnostics() -> None:
+    BIREFNET_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"writing BiRefNet diagnostics to {BIREFNET_DIAGNOSTIC_DIR}")
+    images, metrics = _birefnet_diagnostic_payload()
+    for name, image in images.items():
+        path = BIREFNET_DIAGNOSTIC_DIR / f"{name}.png"
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            _save_mask(path, arr)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            _save_rgba(path, arr.astype(np.uint8, copy=False))
+        else:
+            _save_rgb(path, arr.astype(np.uint8, copy=False))
+    (BIREFNET_DIAGNOSTIC_DIR / "metrics.json").write_text(
+        json.dumps(_json_ready(metrics), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "BiRefNet diagnostics metrics: "
+        f"detail_gain={metrics['detail_retention']['hybrid_minus_classical']:.2f}; "
+        f"background_leak_area={metrics['background_leak']['alpha_gt_8_area']}; "
+        f"low_alpha_noise={metrics['low_alpha_noise_score']:.1f}"
+    )
 
 
 def alpha_soft_band_count(alpha: np.ndarray, low: int = 0, high: int = 255) -> int:
@@ -2851,12 +3158,17 @@ def run_import_compile_tests() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    allowed = {"--write-diagnostics", "--write-edge-repair-diagnostics", "--write-algorithm-baseline"}
+    allowed = {
+        "--write-diagnostics",
+        "--write-edge-repair-diagnostics",
+        "--write-algorithm-baseline",
+        "--write-birefnet-diagnostics",
+    }
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline]; "
+            "[--write-algorithm-baseline] [--write-birefnet-diagnostics]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -2880,6 +3192,7 @@ def main(argv: list[str] | None = None) -> None:
     run_v6_hybrid_trimap_tests()
     run_v6_hybrid_alpha_mode_tests()
     run_v6_hybrid_rgb_cleanup_tests()
+    run_v6_birefnet_diagnostics_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()
@@ -2887,6 +3200,8 @@ def main(argv: list[str] | None = None) -> None:
         write_edge_repair_diagnostics()
     if "--write-algorithm-baseline" in args:
         write_algorithm_upgrade_baseline()
+    if "--write-birefnet-diagnostics" in args:
+        write_birefnet_diagnostics()
     print("smoke ok", rgba.shape)
 
 

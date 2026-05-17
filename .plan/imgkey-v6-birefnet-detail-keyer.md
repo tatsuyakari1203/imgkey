@@ -872,10 +872,16 @@ Isolation:
 - Own `smoke_test.py` diagnostics and `.artifact/` output. No algorithm changes unless fixing test bugs.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 9 completed BiRefNet diagnostics in `smoke_test.py`; `--write-birefnet-diagnostics` writes a synthetic/mock BiRefNet artifact set under `.artifact/birefnet-diagnostics/` without requiring a real model or importing heavy AI runtimes.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py`, `python smoke_test.py --write-birefnet-diagnostics`, required `py_compile`, `import app, keyer`, extended default dependency fence, and AI import fence.
 
 
 
@@ -931,10 +937,13 @@ Acceptance:
 - Low-alpha pixels do not contain saturated green/blue noise.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added diagnostics artifacts for source/classical alpha/mock BiRefNet alpha/screen maps/hybrid trimap masks/final cleanup regions/RGB cleanup stages/result/composites plus `metrics.json`. Acceptance assertions cover synthetic/mock execution, composite residual reduction, transparent RGB zeroing, core color tolerance, and low-alpha noise limits.
 
 
 ---
@@ -957,7 +966,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -982,7 +991,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 ---
@@ -1079,4 +1088,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Execute Phase 9/P9.1 next: add the BiRefNet diagnostics command and artifact output without changing the Phase 8 algorithm unless fixing diagnostics test bugs.
+Execute Phase 10/P10.1 next: keep the three packaging flavors separated, verify BiRefNet-only licensing/asset boundaries before bundling weights, and preserve the classical non-AI dependency fence.
