@@ -78,3 +78,18 @@ $p = Start-Process -FilePath ".\dist\ImgKey.exe" -PassThru
 Start-Sleep -Seconds 6
 if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 ```
+
+## Release workflow
+
+The repository includes a GitHub Actions release workflow at `.github/workflows/release.yml`.
+
+Create a public release by pushing a version tag:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow runs on `windows-latest`, installs the default non-AI dependencies, runs the smoke/import checks, builds with `ImgKey.spec`, and uploads `ImgKey-<version>-windows-x64.exe` to the GitHub Release.
+
+You can also run **Release** manually from the GitHub Actions tab with a `version` input such as `v1.0.0`.
