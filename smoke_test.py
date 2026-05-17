@@ -7,6 +7,7 @@ import importlib
 import json
 from pathlib import Path
 import py_compile
+import subprocess
 import sys
 import tempfile
 from typing import Any
@@ -1988,6 +1989,84 @@ def run_birefnet_adapter_manifest_tests() -> None:
     assert after_validation == before, f"BiRefNet manifest/validation tests must not import heavy runtimes: {after_validation - before}"
 
 
+def run_ai_worker_contract_tests() -> None:
+    heavy_modules = HEAVY_OPTIONAL_MODULES
+    before = {name for name in heavy_modules if name in sys.modules}
+
+    ai_worker = importlib.import_module("ai_worker")
+    after_import = {name for name in heavy_modules if name in sys.modules}
+    assert after_import == before, f"importing ai_worker must not import heavy runtimes: {after_import - before}"
+
+    unsupported = ai_worker.run_worker_request({"backend": "not-birefnet"})
+    assert unsupported["ok"] is False
+    assert unsupported["error"]["code"] == "unsupported_backend"
+    assert unsupported["alpha_hint_path"] is None
+    assert "supported" in unsupported["message"].lower()
+
+    with tempfile.TemporaryDirectory(prefix="imgkey-ai-worker-contract-") as tmp_dir:
+        tmp = Path(tmp_dir)
+        input_path = tmp / "source.png"
+        Image.fromarray(np.zeros((8, 9, 3), dtype=np.uint8), mode="RGB").save(input_path)
+
+        base_request = {
+            "backend": "birefnet",
+            "input_image_path": str(input_path),
+            "model_path": str(tmp / "missing-birefnet-model"),
+            "device": "cpu",
+            "mode": "global_plus_roi",
+            "max_side": 64,
+            "tile_size": 64,
+            "tile_overlap": 8,
+            "precision": "fp32",
+            "output_dir": str(tmp / "out"),
+            "temp_dir": str(tmp / "temp"),
+        }
+        invalid_model = ai_worker.run_worker_request(base_request)
+        assert invalid_model["ok"] is False
+        assert invalid_model["error"]["code"] == "model_validation_failed"
+        assert "does not exist" in invalid_model["message"].lower()
+        assert invalid_model["alpha_hint_path"] is None
+        assert invalid_model["diagnostics_path"] and Path(invalid_model["diagnostics_path"]).is_file()
+        invalid_diagnostics = json.loads(Path(invalid_model["diagnostics_path"]).read_text(encoding="utf-8"))
+        cleanup = invalid_diagnostics["diagnostics"].get("temp_cleanup")
+        assert cleanup and cleanup["removed"] is True, "worker staging temp directory should be removed on validation failure"
+
+        cancel_file = tmp / "cancel-ai-worker"
+        cancel_file.write_text("cancel\n", encoding="utf-8")
+        cancelled_request = dict(base_request)
+        cancelled_request["cancel_file_path"] = str(cancel_file)
+        cancelled_request["output_dir"] = str(tmp / "cancelled-out")
+        cancelled = ai_worker.run_worker_request(cancelled_request)
+        assert cancelled["ok"] is False
+        assert cancelled["error"]["code"] == "cancelled"
+        assert "cancel" in cancelled["message"].lower()
+        assert cancelled["diagnostics_path"] and Path(cancelled["diagnostics_path"]).is_file()
+
+        missing_input_request = dict(base_request)
+        missing_input_request["input_image_path"] = str(tmp / "missing-source.png")
+        missing_input_request["output_dir"] = str(tmp / "missing-input-out")
+        missing_input = ai_worker.run_worker_request(missing_input_request)
+        assert missing_input["ok"] is False
+        assert missing_input["error"]["code"] == "missing_input"
+        assert "does not exist" in missing_input["message"].lower()
+        assert missing_input["diagnostics_path"] and Path(missing_input["diagnostics_path"]).is_file()
+
+    cli_request = json.dumps({"backend": "not-birefnet"})
+    completed = subprocess.run(
+        [sys.executable, "ai_worker.py", "--request", cli_request, "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 1, f"CLI worker failure should exit 1, got {completed.returncode}: {completed.stderr}"
+    cli_response = json.loads(completed.stdout)
+    assert cli_response["ok"] is False
+    assert cli_response["error"]["code"] == "unsupported_backend"
+
+    after_tests = {name for name in heavy_modules if name in sys.modules}
+    assert after_tests == before, f"AI worker contract tests must not import heavy runtimes: {after_tests - before}"
+
+
 def run_gpu_runtime_probe_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert "torch" not in sys.modules, "smoke test start should not have torch imported"
@@ -2060,6 +2139,7 @@ def run_import_compile_tests() -> None:
         "smoke_test.py",
         "ai_assist.py",
         "gpu_runtime.py",
+        "ai_worker.py",
         "ai_backends/__init__.py",
         "ai_backends/birefnet_adapter.py",
     ):
@@ -2093,6 +2173,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase6_tile_local_nearest_inner_tests()
     run_optional_ai_seam_tests()
     run_birefnet_adapter_manifest_tests()
+    run_ai_worker_contract_tests()
     run_gpu_runtime_probe_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

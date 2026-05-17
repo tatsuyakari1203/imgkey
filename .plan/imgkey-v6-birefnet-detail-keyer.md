@@ -300,11 +300,16 @@ Isolation:
 - Own `ai_worker.py` and worker tests. UI integration waits until Phase 5.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
+Progress:
+- 2026-05-18: Phase 4 implemented and verified. Added isolated BiRefNet-only `ai_worker.py` JSON worker/CLI with safe output and temp handling under `.artifact/` or explicit dirs, cancellation-file support, structured failure responses, diagnostics JSON, and smoke coverage that does not require torch/model weights.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py`, required `py_compile`, `import app, keyer`, default dependency fence, AI import fence including `ai_worker`, and CLI missing-input JSON failure test.
 
 
 #### P4.1 - Add BiRefNet worker process
@@ -345,10 +350,13 @@ Acceptance:
 - Worker can run probe/self-test without UI.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: `ai_worker.py` supports `python ai_worker.py --request <json-or-file-or-stdin> [--json]`, validates the BiRefNet-only contract, rejects unsupported backends/local path errors/missing inputs before model runtime import, maps dependency/CUDA/OOM/cancel failures to structured JSON errors, writes alpha PNG plus diagnostics on success, and cleans staging temp directories on failure.
 
 
 ---
@@ -371,7 +379,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -398,7 +406,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 ---
