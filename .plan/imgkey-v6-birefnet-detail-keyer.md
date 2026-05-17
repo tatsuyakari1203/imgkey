@@ -1,7 +1,7 @@
 # 05 - ImgKey v6 BiRefNet Detail Keyer
 
 Date: 2026-05-18
-Status: Planned
+Status: In progress
 Owner: ImgKey AI/GPU Detail Keyer
 Scope: Integrate BiRefNet as the only AI model path for detail-preserving alpha hints, then merge it with the classical chroma keyer and keep classical RGB cleanup.
 
@@ -69,10 +69,14 @@ Isolation:
 - Own `app.py`, `keyer.py`, `smoke_test.py`; no torch/model dependency yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 1 implemented and verified; app remains default classical/non-AI with no torch/model imports.
+
 
 
 #### P1.1 - Cancel stale previews and reduce UI churn
@@ -88,10 +92,14 @@ Acceptance:
 - `python smoke_test.py`, compile/import checks pass.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Preview jobs now cancel via `PreviewThread.request_cancel()` and `process_key_image(cancel_callback=...)`; scheduling invalidates generations immediately, stale results/progress are ignored, background-only changes avoid pixmap re-upload except Split Compare, and missing mask/hint debug views use direct QImage blanks/grayscale instead of large RGB temporary arrays.
+
 
 
 #### P1.2 - Low-memory export result mode
@@ -105,12 +113,17 @@ Acceptance:
 - `process_chroma_key()` remains compatible.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
 
+Progress:
+- 2026-05-18: Added `include_debug` to `process_key_image()`; export and `process_chroma_key()` use low-memory result mode, skipping foreground RGB copies and retained debug masks while preserving RGBA output. Representative 2048×1536 synthetic fixture retained result field bytes dropped from 39.0 MiB to 15.0 MiB with identical RGBA; unique export result storage is the RGBA array plus an alpha view.
+
+
 ---
+
 ### Phase 2 - GPU probe
 
 Category:
@@ -129,7 +142,8 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
 
 
 #### P2.1 - Add scriptable CUDA probe
@@ -158,9 +172,11 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
 
 ---
+
 ### Phase 3 - BiRefNet adapter
 
 Category:
@@ -182,6 +198,7 @@ Current:
 - No
 
 
+
 #### P3.0 - Record BiRefNet model snapshot and offline manifest
 - Before real inference, choose the exact BiRefNet variant and local snapshot.
 - Record source/repo, commit or revision, expected directory layout, license/notice files, SHA256 manifest for code/config/weights, and expected local/bundled path.
@@ -197,6 +214,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P3.1 - Implement BiRefNet-only adapter API
@@ -246,7 +264,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 4 - AI worker subprocess
 
 Category:
@@ -266,6 +286,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P4.1 - Add BiRefNet worker process
@@ -311,7 +332,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 5 - UI BiRefNet controls
 
 Category:
@@ -331,6 +354,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P5.1 - Add BiRefNet UI flow
@@ -358,7 +382,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 6 - Classical screen analysis and hybrid trimap
 
 Category:
@@ -378,6 +404,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P6.0 - Add classical screen analysis maps
@@ -410,6 +437,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P6.1 - Add BiRefNet/classical trimap merge helper
@@ -484,7 +512,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 7 - Hybrid alpha mode
 
 Category:
@@ -504,6 +534,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P7.1 - Add `HybridBiRefNet` mode
@@ -543,6 +574,7 @@ Status:
 
 Current:
 - No
+
 
 #### P7.2 - Unknown-only alpha refinement
 - Implement optional classical alpha refinement after `HybridBiRefNet` merge.
@@ -584,7 +616,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 8 - RGB cleanup with final hybrid alpha
 
 Category:
@@ -604,6 +638,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P8.1 - Apply classical screen/clean-plate cleanup to hybrid alpha
@@ -634,6 +669,7 @@ Status:
 Current:
 - No
 
+
 #### P8.1a - Build local screen/clean plate
 - Use `known_bg` and `safe_bg` to estimate local background color `B`.
 - Start from `screen_plate_rgb` from Phase 6.
@@ -650,6 +686,7 @@ Status:
 
 Current:
 - No
+
 
 #### P8.1b - Alpha-aware foreground unmix
 - Apply unmix only in `unmix_region`.
@@ -682,6 +719,7 @@ Status:
 Current:
 - No
 
+
 #### P8.1c - Edge-only despill after unmix
 - Despill must run after unmix, not before.
 - For green screen: `spill = max(0, G - max(R, B)); G_new = G - spill * strength`.
@@ -702,6 +740,7 @@ Status:
 
 Current:
 - No
+
 
 #### P8.1d - Final RGBA invariants
 - After all cleanup:
@@ -724,6 +763,7 @@ Status:
 Current:
 - No
 
+
 #### P8.2 - Wire hybrid mode into UI preview/export
 - Update `app.py` so generated BiRefNet hints can drive `HybridBiRefNet` preview/export after Phases 7/8.
 - Preserve manual alpha-hint import behavior and existing classical modes.
@@ -745,7 +785,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 9 - BiRefNet diagnostics
 
 Category:
@@ -765,6 +807,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P9.1 - Add diagnostics command
@@ -824,7 +867,9 @@ Status:
 Current:
 - No
 
+
 ---
+
 ### Phase 10 - Packaging flavors
 
 Category:
@@ -844,6 +889,7 @@ Status:
 
 Current:
 - No
+
 
 
 #### P10.1 - Keep three build flavors
@@ -868,6 +914,7 @@ Status:
 
 Current:
 - No
+
 
 ---
 

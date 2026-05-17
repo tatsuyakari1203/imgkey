@@ -221,6 +221,7 @@ def process_chroma_key(
         alpha_hint=alpha_hint,
         progress_callback=progress_callback,
         cancel_callback=cancel_callback,
+        include_debug=False,
     ).rgba
 
 
@@ -234,6 +235,7 @@ def process_key_image(
     alpha_hint: np.ndarray | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
+    include_debug: bool = True,
 ) -> KeyResult:
     """Run the v2 classical keying engine and return debug outputs.
 
@@ -241,6 +243,9 @@ def process_key_image(
     trimap/alpha generation happen once for the whole image. Full-resolution
     color unmix/despill then runs in overlapped tiles and writes only tile cores,
     avoiding a full-image float32 RGB working copy in the export path.
+    Set ``include_debug=False`` for export/write-only callers to return only the
+    RGBA output plus an alpha view and scalar metadata, without retaining debug
+    masks or a foreground RGB copy.
     """
 
     settings = settings or KeySettings()
@@ -266,23 +271,33 @@ def process_key_image(
         progress_callback,
         cancel_callback,
         render_crop=crop,
+        include_debug=include_debug,
     )
-    foreground = rgba[:, :, :3].copy()
-    if crop is not None:
-        x0, y0, x1, y1 = crop
-        alpha = global_matte.alpha[y0:y1, x0:x1].copy()
-        background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-        edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-        fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
-        probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
-        hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
+    if include_debug:
+        foreground = rgba[:, :, :3].copy()
+        if crop is not None:
+            x0, y0, x1, y1 = crop
+            alpha = global_matte.alpha[y0:y1, x0:x1].copy()
+            background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+            edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+            fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
+            probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
+            hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
+        else:
+            alpha = global_matte.alpha
+            background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
+            edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
+            fringe_mask = global_matte.fringe_mask
+            probability = global_matte.screen_probability
+            hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint.copy()
     else:
-        alpha = global_matte.alpha
-        background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
-        edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
-        fringe_mask = global_matte.fringe_mask
-        probability = global_matte.screen_probability
-        hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint.copy()
+        foreground = None
+        alpha = rgba[:, :, 3]
+        background_mask = None
+        edge_mask = None
+        fringe_mask = None
+        probability = None
+        hint_out = None
     return KeyResult(
         rgba=rgba,
         alpha=alpha,
@@ -1136,7 +1151,8 @@ def _render_tiled_rgba(
     cancel_callback: CancelCallback | None,
     *,
     render_crop: tuple[int, int, int, int] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    include_debug: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
     h, w = rgb.shape[:2]
     crop = _normalized_crop(render_crop, w, h)
     if crop is None:
@@ -1150,7 +1166,7 @@ def _render_tiled_rgba(
 
     rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
     rgba[:, :, 3] = alpha_out
-    despill_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+    despill_mask = np.zeros((out_h, out_w), dtype=np.uint8) if include_debug else None
     screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
     local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
     extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
@@ -1230,7 +1246,8 @@ def _render_tiled_rgba(
             settings,
         )
         rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
-        despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
+        if despill_mask is not None:
+            despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
         _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
     rgba[alpha_out <= 0, :3] = 0
     return rgba, despill_mask

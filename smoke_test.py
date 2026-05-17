@@ -1811,6 +1811,15 @@ def run_v4_edge_repair_tests() -> None:
     assert compat.dtype == np.uint8, "process_chroma_key compatibility output must stay uint8"
     assert compat[compat[:, :, 3] == 0, :3].max() == 0, "compat wrapper must zero transparent RGB"
 
+    debug_result = process_key_image(rgb, settings)
+    low_memory = process_key_image(rgb, settings, include_debug=False)
+    assert np.array_equal(low_memory.rgba, debug_result.rgba), "low-memory result mode must preserve RGBA output"
+    assert np.array_equal(compat, low_memory.rgba), "process_chroma_key must keep RGBA compatibility in low-memory mode"
+    assert np.shares_memory(low_memory.alpha, low_memory.rgba), "low-memory alpha should be a view of output RGBA alpha"
+    assert low_memory.foreground is None and low_memory.despill_mask is None, "low-memory mode should not retain RGB/mask debug arrays"
+    for name in ("background_mask", "edge_mask", "screen_probability", "alpha_hint", "fringe_mask"):
+        assert getattr(low_memory, name) is None, f"low-memory mode should not retain {name}"
+
     control_key = (0, 220, 50)
     control_rgb, _, control_settings = _edge_fringe_fixture(control_key)
     low_cleanup = process_key_image(control_rgb, replace(control_settings, decontaminate=0.0, despill=0.0))

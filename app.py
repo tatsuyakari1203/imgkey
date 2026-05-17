@@ -175,9 +175,17 @@ class ImageCanvas(QGraphicsView):
     def set_background_mode(self, mode: str) -> None:
         if mode not in BACKGROUND_MODES:
             return
+        if mode == self.background_mode:
+            return
         self.background_mode = mode
         self._apply_background()
-        self._refresh_pixmap(reset_view=False)
+        if self._display_depends_on_background():
+            self._refresh_pixmap(reset_view=False)
+        else:
+            self.viewport().update()
+
+    def _display_depends_on_background(self) -> bool:
+        return self.view_mode == "Split Compare"
 
     def set_picker_enabled(self, enabled: bool) -> None:
         self.persistent_tool = "Pick" if enabled else "Pan"
@@ -282,19 +290,17 @@ class ImageCanvas(QGraphicsView):
         if mode == "Result":
             return rgba_to_qimage(result.rgba)
         if mode == "Alpha":
-            return rgb_to_qimage(mask_to_rgb(result.alpha))
+            return mask_to_qimage(result.alpha, self.source_rgb.shape[:2])
         if mode == "AI Hint":
-            if result.alpha_hint is None:
-                return rgb_to_qimage(np.zeros_like(self.source_rgb))
-            return rgb_to_qimage(mask_to_rgb(result.alpha_hint))
+            return mask_to_qimage(result.alpha_hint, self.source_rgb.shape[:2])
         if mode == "Background Mask":
-            return rgb_to_qimage(mask_to_rgb(result.background_mask))
+            return mask_to_qimage(result.background_mask, self.source_rgb.shape[:2])
         if mode == "Edge Mask":
-            return rgb_to_qimage(mask_to_rgb(result.edge_mask, self.source_rgb.shape[:2]))
+            return mask_to_qimage(result.edge_mask, self.source_rgb.shape[:2])
         if mode == "Fringe Mask":
-            return rgb_to_qimage(mask_to_rgb(result.fringe_mask, self.source_rgb.shape[:2]))
+            return mask_to_qimage(result.fringe_mask, self.source_rgb.shape[:2])
         if mode == "Despill Mask":
-            return rgb_to_qimage(mask_to_rgb(result.despill_mask, self.source_rgb.shape[:2]))
+            return mask_to_qimage(result.despill_mask, self.source_rgb.shape[:2])
         if mode == "Foreground RGB":
             foreground_rgb = result.foreground_rgb
             if foreground_rgb is None:
@@ -554,6 +560,13 @@ class PreviewThread(QThread):
         super().__init__()
         self.generation = generation
         self.job = job
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel_requested
 
     def run(self) -> None:
         try:
@@ -564,10 +577,17 @@ class PreviewThread(QThread):
                 keep_mask=self.job.keep_mask,
                 remove_mask=self.job.remove_mask,
                 alpha_hint=self.job.alpha_hint,
-                progress_callback=lambda value, stage: self.progress.emit(self.generation, value, stage),
+                progress_callback=lambda value, stage: None
+                if self._cancel_requested
+                else self.progress.emit(self.generation, value, stage),
+                cancel_callback=self._is_cancelled,
             )
+            if self._cancel_requested:
+                return
             self.done.emit(self.generation, result)
         except Exception as exc:  # pragma: no cover - UI boundary
+            if self._cancel_requested and "cancel" in str(exc).lower():
+                return
             self.failed.emit(self.generation, str(exc))
 
 
@@ -610,6 +630,7 @@ class ExportThread(QThread):
                 alpha_hint=self.alpha_hint,
                 progress_callback=lambda value, stage: self.progress.emit(value, stage),
                 cancel_callback=lambda: self._cancel_requested,
+                include_debug=False,
             )
             if self._cancel_requested:
                 raise RuntimeError("Processing cancelled")
@@ -1281,8 +1302,16 @@ class MainWindow(QMainWindow):
         if self.full_rgb is None:
             return
         self.settings = self.current_settings()
+        self._preview_generation += 1
+        self._preview_jobs.clear()
+        self._cancel_preview_threads()
         self.statusBar().showMessage("Preview queued…")
         self._preview_timer.start(150)
+
+    def _cancel_preview_threads(self) -> None:
+        for thread in list(self._preview_threads):
+            if thread.isRunning():
+                thread.request_cancel()
 
     def _on_preview_quality_changed(self, mode: str) -> None:
         self._full_crop_rect = self._current_full_crop() if mode == "Full Crop" and self.full_rgb is not None else None
@@ -1301,7 +1330,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.on_failed(f"Preview setup failed: {exc}")
             return
-        self._preview_generation += 1
         generation = self._preview_generation
         self._preview_jobs[generation] = job
         self._preview_pending = False
@@ -1782,6 +1810,7 @@ class MainWindow(QMainWindow):
             self.export_thread.request_cancel()
             self.export_thread.wait(3000)
         for thread in list(self._preview_threads):
+            thread.request_cancel()
             thread.wait(3000)
         super().closeEvent(event)
 
@@ -1831,6 +1860,27 @@ def mask_to_rgb(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -
     if shape is not None and arr.shape != shape:
         arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return np.repeat(arr[:, :, None], 3, axis=2)
+
+
+def blank_rgb_qimage(shape: tuple[int, int] | None = None) -> QImage:
+    h, w = shape or (1, 1)
+    image = QImage(max(1, int(w)), max(1, int(h)), QImage.Format_RGB888)
+    image.fill(QColor(0, 0, 0))
+    return image
+
+
+def mask_to_qimage(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> QImage:
+    if mask is None:
+        return blank_rgb_qimage(shape)
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if shape is not None and arr.shape != shape:
+        arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    arr = np.ascontiguousarray(arr)
+    h, w = arr.shape[:2]
+    return QImage(arr.data, w, h, w, QImage.Format_Grayscale8).copy()
 
 
 def debug_rgb_to_rgb(image: np.ndarray | None, shape: tuple[int, int] | None = None) -> np.ndarray:
