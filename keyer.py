@@ -979,14 +979,14 @@ def _process_color_tile(
     screen_color: tuple[int, int, int],
     settings: KeySettings,
 ) -> tuple[np.ndarray, np.ndarray]:
-    rgb_f = rgb_tile.astype(np.float32) / 255.0
+    rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
     alpha = alpha_u8.astype(np.float32) / 255.0
     if screen_tile is None:
-        screen = np.asarray(screen_color, dtype=np.float32).reshape(1, 1, 3) / 255.0
+        screen = _srgb_u8_to_linear_f32(np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3))
     else:
-        screen = screen_tile.astype(np.float32) / 255.0
+        screen = _srgb_u8_to_linear_f32(screen_tile)
 
-    out = rgb_f.copy()
+    out = rgb_linear.copy()
     edge_strength = np.clip(alpha * (1.0 - alpha) * 4.0, 0.0, 1.0)
     edge_strength = np.maximum(edge_strength, edge_mask.astype(np.float32) * 0.35)
     live = alpha > 0.001
@@ -1003,26 +1003,31 @@ def _process_color_tile(
     unmix_amount = _clip01(settings.unmix_amount) * edge_repair * decontaminate
     if unmix_amount > 0 and np.any(repair_signal > 0):
         safe_alpha = np.maximum(alpha[:, :, None], 0.06)
-        unmixed = (rgb_f - (1.0 - alpha[:, :, None]) * screen) / safe_alpha
+        unmixed = (rgb_linear - (1.0 - alpha[:, :, None]) * screen) / safe_alpha
         unmixed = np.clip(unmixed, 0.0, 1.0)
         blend = (repair_signal * unmix_amount)[:, :, None]
         out = out * (1.0 - blend) + unmixed * blend
 
     clamp_signal = np.maximum(repair_signal * despill_amount, legacy_spill * 0.40) * fringe_remove
-    out = _apply_vlahos_clamp(out, screen_color, clamp_signal)
+    out = _apply_vlahos_clamp(out, screen, clamp_signal)
 
     pull_amount = _clip01(settings.inner_color_pull) * edge_repair * decontaminate
     if pull_amount > 0 and nearest_inner_rgb is not None and nearest_inner_valid is not None:
         pull = repair_signal * pull_amount
         pull = np.where(nearest_inner_valid, pull, 0.0)
         if np.any(pull > 0):
-            nearest = nearest_inner_rgb.astype(np.float32) / 255.0
+            nearest = _srgb_u8_to_linear_f32(nearest_inner_rgb)
             out = out * (1.0 - pull[:, :, None]) + nearest * pull[:, :, None]
 
     spill_mask = np.maximum(legacy_spill, repair_signal * max(despill_amount, edge_repair * decontaminate))
-    out = _protect_luminance(out, rgb_f, spill_mask, settings)
+    out = _protect_luminance(out, rgb_linear, spill_mask, settings)
     out[~live] = 0.0
-    rgb_out = np.clip(np.rint(out * 255.0), 0, 255).astype(np.uint8)
+    rgb_out = rgb_tile.copy()
+    changed = live & (spill_mask > 0.0)
+    if np.any(changed):
+        repaired = _linear_f32_to_srgb_u8(out)
+        rgb_out[changed] = repaired[changed]
+    rgb_out[~live] = 0
     return rgb_out, np.rint(np.clip(spill_mask, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
@@ -1042,12 +1047,35 @@ def _compute_despill_mask(
     return np.clip(mask, 0.0, 1.0).astype(np.float32)
 
 
-def _apply_vlahos_clamp(rgb: np.ndarray, screen_color: tuple[int, int, int], clamp_mask: np.ndarray) -> np.ndarray:
+def _srgb_to_linear_f32(srgb: np.ndarray) -> np.ndarray:
+    srgb_f = np.clip(np.asarray(srgb, dtype=np.float32), 0.0, 1.0)
+    return np.where(srgb_f <= 0.04045, srgb_f / 12.92, np.power((srgb_f + 0.055) / 1.055, 2.4)).astype(np.float32)
+
+
+def _linear_to_srgb_f32(linear: np.ndarray) -> np.ndarray:
+    linear_f = np.clip(np.asarray(linear, dtype=np.float32), 0.0, 1.0)
+    return np.where(
+        linear_f <= 0.0031308,
+        linear_f * 12.92,
+        1.055 * np.power(linear_f, 1.0 / 2.4) - 0.055,
+    ).astype(np.float32)
+
+
+def _srgb_u8_to_linear_f32(srgb: np.ndarray) -> np.ndarray:
+    return _srgb_to_linear_f32(np.asarray(srgb, dtype=np.float32) / 255.0)
+
+
+def _linear_f32_to_srgb_u8(linear: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(_linear_to_srgb_f32(linear) * 255.0), 0, 255).astype(np.uint8)
+
+
+def _apply_vlahos_clamp(rgb: np.ndarray, screen_linear: np.ndarray, clamp_mask: np.ndarray) -> np.ndarray:
     if not np.any(clamp_mask > 0):
         return rgb
     out = rgb.copy()
-    weight = np.clip(clamp_mask.astype(np.float32), 0.0, 1.0)
-    key = np.asarray(screen_color, dtype=np.float32) / 255.0
+    weight = np.clip(clamp_mask.astype(np.float32) * 1.50, 0.0, 1.0)
+    key_map = np.clip(np.asarray(screen_linear, dtype=np.float32), 0.0, 1.0)
+    key = np.mean(key_map.reshape(-1, 3), axis=0) if key_map.size else np.zeros(3, dtype=np.float32)
     key_channel = int(np.argmax(key))
     other = [c for c in range(3) if c != key_channel]
     key_dom = float(key[key_channel] - max(key[other[0]], key[other[1]]))
@@ -1057,15 +1085,16 @@ def _apply_vlahos_clamp(rgb: np.ndarray, screen_color: tuple[int, int, int], cla
         out[:, :, key_channel] -= excess * weight
     else:
         luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-        key_luma = float(key @ luma_weights)
-        key_vec = key - key_luma
-        norm = float(np.linalg.norm(key_vec))
-        if norm >= 1e-4:
-            key_vec /= norm
+        key_luma = np.sum(key_map * luma_weights.reshape(1, 1, 3), axis=2)
+        key_vec = key_map - key_luma[:, :, None]
+        norm = np.linalg.norm(key_vec, axis=2)
+        valid = norm >= 1e-4
+        if np.any(valid):
+            key_vec = np.divide(key_vec, np.maximum(norm[:, :, None], 1e-4), out=np.zeros_like(key_vec), where=valid[:, :, None])
             out_luma = np.sum(out * luma_weights.reshape(1, 1, 3), axis=2)
             residual = out - out_luma[:, :, None]
-            excess = np.maximum(np.sum(residual * key_vec.reshape(1, 1, 3), axis=2), 0.0)
-            out -= key_vec.reshape(1, 1, 3) * (excess * weight)[:, :, None] * 0.70
+            excess = np.maximum(np.sum(residual * key_vec, axis=2), 0.0)
+            out -= key_vec * (excess * weight)[:, :, None] * 0.70
     return np.clip(out, 0.0, 1.0)
 
 

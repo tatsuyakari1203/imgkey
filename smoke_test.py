@@ -18,6 +18,8 @@ from keyer import (
     KeySettings,
     _MAX_INNER_LABEL_PIXELS,
     _build_nearest_inner_label_map,
+    _linear_f32_to_srgb_u8,
+    _srgb_u8_to_linear_f32,
     checkerboard_composite,
     process_chroma_key,
     process_key_image,
@@ -827,6 +829,116 @@ def write_algorithm_upgrade_baseline() -> None:
     print(f"wrote algorithm baseline summary to {summary_path}")
 
 
+def _load_algorithm_baseline_metrics() -> dict[str, Any]:
+    metrics_path = ALGORITHM_BASELINE_DIR / "metrics.json"
+    if not metrics_path.exists():
+        raise AssertionError(
+            f"missing Phase 1 algorithm baseline metrics at {metrics_path}; "
+            "run `python smoke_test.py --write-algorithm-baseline` before Phase 2+ checks"
+        )
+    return json.loads(metrics_path.read_text(encoding="utf-8"))
+
+
+def _load_algorithm_baseline_artifact(fixture_name: str) -> dict[str, np.ndarray]:
+    artifact_path = ALGORITHM_BASELINE_DIR / f"{fixture_name}.npz"
+    if not artifact_path.exists():
+        raise AssertionError(
+            f"missing Phase 1 algorithm baseline artifact at {artifact_path}; "
+            "run `python smoke_test.py --write-algorithm-baseline` before Phase 2+ checks"
+        )
+    with np.load(artifact_path) as artifact:
+        return {
+            "source_rgb": artifact["source_rgb"].copy(),
+            "rgba": artifact["rgba"].copy(),
+            "alpha": artifact["alpha"].copy(),
+            "known_background_mask": artifact["known_background_mask"].copy(),
+            "foreground_core_mask": artifact["foreground_core_mask"].copy(),
+            "soft_edge_mask": artifact["soft_edge_mask"].copy(),
+        }
+
+
+def _assert_phase2_linear_helper_round_trip() -> None:
+    ramp = np.arange(256, dtype=np.uint8).reshape(256, 1, 1)
+    ramp_rgb = np.repeat(ramp, 3, axis=2)
+    round_trip = _linear_f32_to_srgb_u8(_srgb_u8_to_linear_f32(ramp_rgb))
+    max_delta = int(np.abs(round_trip.astype(np.int16) - ramp_rgb.astype(np.int16)).max())
+    assert max_delta <= 1, f"sRGB/linear helpers should round-trip uint8 ramp within 1 level, max={max_delta}"
+
+
+def run_phase2_linear_color_tests() -> None:
+    _assert_phase2_linear_helper_round_trip()
+    baseline = _load_algorithm_baseline_metrics()
+    fixture_records = baseline.get("fixtures", {})
+    summaries: list[str] = []
+
+    for fixture in algorithm_upgrade_fixtures(include_large=True):
+        if fixture.name not in fixture_records:
+            raise AssertionError(f"{fixture.name}: missing record in Phase 1 baseline metrics")
+        record = fixture_records[fixture.name]
+        artifact = _load_algorithm_baseline_artifact(fixture.name)
+        source_hash = record.get("hashes", {}).get("source_rgb_sha256")
+        assert source_hash == _array_sha256(fixture.rgb), f"{fixture.name}: source fixture changed since Phase 1 baseline"
+
+        result = process_key_image(fixture.rgb, fixture.settings)
+        alpha_diff = int(np.abs(result.alpha.astype(np.int16) - artifact["alpha"].astype(np.int16)).max())
+        assert alpha_diff == 0, f"{fixture.name}: Phase 2 must be color-only; alpha max diff vs v4 baseline={alpha_diff}"
+
+        transparent = transparent_rgb_zero(result.rgba)
+        assert transparent["ok"], (
+            f"{fixture.name}: transparent RGB must stay zero, max={transparent['max_rgb_when_transparent']}"
+        )
+
+        soft_edge = artifact["soft_edge_mask"].astype(bool)
+        edge_mask = soft_edge if np.any(soft_edge) else (result.fringe_mask > 0 if result.fringe_mask is not None else soft_edge)
+        current_residual = edge_key_residual(result.rgba, fixture.settings.key_color, edge_mask)
+        baseline_residual = record["metrics"]["edge_key_residual"]
+        assert current_residual["max_positive_excess"] <= baseline_residual["max_positive_excess"], (
+            f"{fixture.name}: fringe key-channel max excess regressed vs v4 baseline, "
+            f"{current_residual['max_positive_excess']} > {baseline_residual['max_positive_excess']}"
+        )
+        assert current_residual["p95_positive_excess"] <= baseline_residual["p95_positive_excess"], (
+            f"{fixture.name}: fringe key-channel p95 excess regressed vs v4 baseline, "
+            f"{current_residual['p95_positive_excess']} > {baseline_residual['p95_positive_excess']}"
+        )
+
+        unchanged_mask = (result.alpha > 0) & (result.despill_mask == 0)
+        unchanged_delta = (
+            int(np.abs(result.rgba[unchanged_mask, :3].astype(np.int16) - fixture.rgb[unchanged_mask].astype(np.int16)).max())
+            if np.any(unchanged_mask)
+            else 0
+        )
+        assert unchanged_delta == 0, f"{fixture.name}: live pixels outside color-repair masks drifted by {unchanged_delta}"
+
+        core_mask = artifact["foreground_core_mask"].astype(bool) & (result.alpha >= 250)
+        if np.any(core_mask):
+            core_delta = int(
+                np.abs(result.rgba[core_mask, :3].astype(np.int16) - artifact["rgba"][core_mask, :3].astype(np.int16)).max()
+            )
+        else:
+            core_delta = 0
+        assert core_delta <= 5, f"{fixture.name}: opaque core RGB drift vs v4 baseline should be <=5, got {core_delta}"
+
+        if fixture.name == "large_tile_gradient_runtime":
+            for tile_size, tile_overlap in ((257, 48), (384, 56)):
+                tile_diff = tiled_vs_full_max_diff(fixture.rgb, fixture.settings, tile_size=tile_size, tile_overlap=tile_overlap)
+                assert tile_diff["max_alpha_diff"] == 0, (
+                    f"{fixture.name}: tiled/reference alpha diff must be 0 for tile {tile_size}, got {tile_diff['max_alpha_diff']}"
+                )
+                assert tile_diff["max_rgba_diff"] <= 1, (
+                    f"{fixture.name}: tiled/reference max RGBA diff must be <=1 for tile {tile_size}, got {tile_diff['max_rgba_diff']}"
+                )
+
+        summaries.append(
+            f"{fixture.name}: alpha_diff={alpha_diff} fringe_max={current_residual['max_positive_excess']}"
+            f"<=v4:{baseline_residual['max_positive_excess']} fringe_p95={current_residual['p95_positive_excess']}"
+            f"<=v4:{baseline_residual['p95_positive_excess']} core_drift={core_delta} unchanged_drift={unchanged_delta}"
+        )
+
+    print("Phase 2 linear-light checks vs v4 baseline:")
+    for line in summaries:
+        print(f"  {line}")
+
+
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
     rgb, _, settings = _edge_fringe_fixture(key_color)
     before_settings = replace(
@@ -1176,9 +1288,13 @@ def main(argv: list[str] | None = None) -> None:
             f"unknown: {', '.join(unknown)}"
         )
 
+    writing_algorithm_baseline = "--write-algorithm-baseline" in args
+
     rgba = run_current_baseline()
     run_v2_numeric_tests()
     run_v4_edge_repair_tests()
+    if not writing_algorithm_baseline:
+        run_phase2_linear_color_tests()
     run_optional_ai_seam_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

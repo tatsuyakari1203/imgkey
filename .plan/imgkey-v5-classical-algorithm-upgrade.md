@@ -204,10 +204,10 @@ Isolation:
 - Own `keyer.py` color repair helpers and `_process_color_tile()` path plus enforcing tests in `smoke_test.py`. Do not change alpha generation or UI controls in this phase.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P2.1 - Add sRGB/linear conversion helpers
 - Add helper functions near existing color helpers:
@@ -227,10 +227,10 @@ Acceptance:
 - Helpers round-trip representative colors within expected `uint8` tolerance and do not affect existing outputs until wired.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P2.2 - Move color reconstruction math to linear light
 - In `_process_color_tile()` convert `rgb_tile`, `screen_tile`/screen color, and nearest-inner RGB to linear before unmix/clamp/pull/luma protect.
@@ -251,10 +251,13 @@ Acceptance:
 - Alpha max diff is `0` vs pre-phase behavior for baseline fixtures; transparent RGB remains zero; key-channel fringe excess is equal or better than v4; opaque foreground max RGB delta `<= 5`, target `<= 3`; tiled vs reference max diff `<= 1`.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Added tile/ROI-safe sRGB/linear conversion helpers and moved edge unmix, Vlahos clamp, nearest-inner pull, and luminance protection inside `_process_color_tile()` to linear RGB while preserving alpha and zeroing transparent RGB. Added Phase 2 smoke checks against `.artifact/algorithm-upgrade-baseline/` artifacts for exact alpha stability, transparent RGB zero, no worse fringe max/p95 excess, opaque-core drift `<= 5`, unchanged pixels outside color masks, and large tiled/reference diff `<= 1`. Verification passed with v4 baseline comparisons: blue `17<=17`, green `24<=28`, same-key core `23<=25`, hair `171<=171`, glass `91<=91`, composite `32<=36`, large `24<=28`; alpha diff `0` for all.
 
 ---
 
@@ -276,7 +279,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P3.1 - Add optional guided alpha settings and helper
 - Add compatible `KeySettings` fields:
@@ -300,7 +303,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P3.2 - Apply guided refinement only in edge/unknown band
 - Add `_refine_alpha_guided()` after initial trimap alpha is built, preferably in `_build_global_matte` to avoid invasive `_build_alpha_from_trimap()` signature changes.
