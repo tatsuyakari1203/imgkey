@@ -793,6 +793,23 @@ def edge_key_residual(rgba: np.ndarray, key_color: tuple[int, int, int], edge_ma
     }
 
 
+def rgb_key_residual(rgb: np.ndarray, key_color: tuple[int, int, int], edge_mask: np.ndarray) -> dict[str, int | float]:
+    mask = edge_mask.astype(bool, copy=False)
+    if not np.any(mask):
+        return {"count": 0, "mean_positive_excess": 0.0, "p95_positive_excess": 0.0, "max_positive_excess": 0}
+    key_channel = int(np.argmax(np.asarray(key_color)))
+    other = [c for c in range(3) if c != key_channel]
+    rgb_i = rgb.astype(np.int16)
+    excess = rgb_i[:, :, key_channel] - np.maximum(rgb_i[:, :, other[0]], rgb_i[:, :, other[1]])
+    positive = np.maximum(excess[mask], 0)
+    return {
+        "count": int(positive.size),
+        "mean_positive_excess": float(np.mean(positive)),
+        "p95_positive_excess": float(np.percentile(positive, 95)),
+        "max_positive_excess": int(np.max(positive)),
+    }
+
+
 def opaque_foreground_max_delta(
     source_rgb: np.ndarray,
     rgba: np.ndarray,
@@ -2195,18 +2212,30 @@ def run_app_birefnet_ui_tests() -> None:
         assert window.cancel_ai_btn.text() == "Cancel AI"
         assert window.gpu_status_btn.text() == "GPU Status"
         assert window.view_combo.findText("BiRefNet Alpha") >= 0
+        assert window.output_mode.findText("Classical") >= 0
+        assert window.output_mode.findText("Manual AI Hint") >= 0
+        assert window.output_mode.findText("Hybrid BiRefNet") >= 0
         assert window.biref_alpha_mask is None
         assert window.alpha_hint_mask is None
 
         window.biref_alpha_mask = np.full((6, 8), 127, dtype=np.uint8)
         window._sync_birefnet_status("done")
-        assert "not final hybrid output" in window.birefnet_status.text()
+        assert "Hybrid BiRefNet" in window.birefnet_status.text()
         assert window.current_settings().mode == "GraphicExact", "generated BiRefNet hint must not switch classical mode"
+        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
+        assert alpha_hint is None and generated_hint is None, "Classical output mode must not pass manual or generated hints"
 
         manual_hint = np.full((6, 8), 255, dtype=np.uint8)
         window.alpha_hint_mask = manual_hint
         window._sync_ai_hint_status("manual.png")
+        window.output_mode.setCurrentText("Manual AI Hint")
         assert window.current_settings().mode == "AIHint", "manual alpha hint import path must still drive AIHint mode"
+        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
+        assert alpha_hint is not None and generated_hint is None, "Manual AI Hint mode must pass only the imported manual hint"
+        window.output_mode.setCurrentText("Hybrid BiRefNet")
+        assert window.current_settings().mode == "HybridBiRefNet", "Hybrid BiRefNet output mode must select the hybrid keyer"
+        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
+        assert alpha_hint is None and generated_hint is not None, "Hybrid BiRefNet mode must pass only generated BiRefNet alpha"
         assert window.biref_alpha_mask is not window.alpha_hint_mask, "BiRefNet alpha must stay separate from manual alpha_hint_mask"
 
         with tempfile.TemporaryDirectory(prefix="imgkey-ui-ai-process-") as tmp_dir:
@@ -2701,6 +2730,106 @@ def run_v6_hybrid_alpha_mode_tests() -> None:
     )
 
 
+def run_v6_hybrid_rgb_cleanup_tests() -> None:
+    before_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    fixture = hair_lines_fixture()
+    biref_alpha = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    cleanup_off_settings = replace(
+        fixture.settings,
+        mode="HybridBiRefNet",
+        guided_alpha_refine=0.0,
+        edge_color_repair=0.0,
+        unmix_amount=0.0,
+        despill=0.0,
+        fringe_remove=0.0,
+    )
+    cleanup_on_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
+    before = process_key_image(fixture.rgb, cleanup_off_settings, biref_alpha=biref_alpha)
+    after = process_key_image(fixture.rgb, cleanup_on_settings, biref_alpha=biref_alpha)
+
+    assert np.array_equal(before.alpha, after.alpha), "P8 RGB cleanup must not alter final HybridBiRefNet alpha"
+    assert int(after.rgba[after.alpha == 0, :3].max()) == 0, "P8 must keep alpha==0 RGB exactly zero"
+    assert np.isfinite(after.rgba.astype(np.float32)).all(), "P8 RGBA output must not contain NaN/Inf"
+
+    edge_mask = fixture.soft_edge_mask & (after.alpha > 0)
+    composite_residuals: dict[str, tuple[dict[str, int | float], dict[str, int | float]]] = {}
+    for name, color in {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "gray": (128, 128, 128),
+        "checker": None,
+    }.items():
+        before_rgb = checkerboard_composite(before.rgba) if color is None else _solid_composite(before.rgba, color)
+        after_rgb = checkerboard_composite(after.rgba) if color is None else _solid_composite(after.rgba, color)
+        before_residual = rgb_key_residual(before_rgb, fixture.settings.key_color, edge_mask)
+        after_residual = rgb_key_residual(after_rgb, fixture.settings.key_color, edge_mask)
+        composite_residuals[name] = (before_residual, after_residual)
+        assert after_residual["mean_positive_excess"] < before_residual["mean_positive_excess"] * 0.70, (
+            f"hybrid cleanup should lower {name} composite halo mean: {before_residual} -> {after_residual}"
+        )
+        assert after_residual["p95_positive_excess"] <= before_residual["p95_positive_excess"], (
+            f"hybrid cleanup should not worsen {name} composite p95 halo: {before_residual} -> {after_residual}"
+        )
+
+    core_delta = opaque_foreground_max_delta(fixture.rgb, after.rgba, fixture.foreground_core_mask, fixture.expected_foreground_rgb)
+    assert core_delta["max_delta"] <= 32, f"hybrid cleanup changed protected foreground core too much: {core_delta}"
+
+    low_alpha = edge_mask & (after.alpha > 0) & (after.alpha < 38)
+    low_alpha_residual = edge_key_residual(after.rgba, fixture.settings.key_color, low_alpha)
+    assert low_alpha_residual["max_positive_excess"] <= 96, f"low-alpha hybrid RGB stayed too saturated/noisy: {low_alpha_residual}"
+    assert low_alpha_residual["p95_positive_excess"] <= 80, f"low-alpha hybrid RGB p95 stayed too saturated/noisy: {low_alpha_residual}"
+
+    original_alpha = np.ones(fixture.rgb.shape[:2], dtype=np.float32)
+    original_alpha[fixture.foreground_core_mask] = 0.42
+    keep_mask = fixture.foreground_core_mask.astype(np.uint8) * 255
+    capped = process_key_image(
+        fixture.rgb,
+        cleanup_on_settings,
+        original_alpha=original_alpha,
+        keep_mask=keep_mask,
+        biref_alpha=biref_alpha,
+    )
+    cap_limit = int(round(255.0 * 0.42)) + 1
+    assert int(capped.alpha[fixture.foreground_core_mask].max()) <= cap_limit, "P8 must not raise source-alpha-capped manual-keep pixels"
+    assert int(capped.rgba[capped.alpha == 0, :3].max()) == 0, "source-capped known background must keep RGB zero"
+
+    noisy_biref = np.full(fixture.rgb.shape[:2], 255, dtype=np.uint8)
+    classical = process_key_image(fixture.rgb, replace(fixture.settings, mode="GraphicExact"))
+    classical_with_biref = process_key_image(fixture.rgb, replace(fixture.settings, mode="GraphicExact"), biref_alpha=noisy_biref)
+    assert np.array_equal(classical.rgba, classical_with_biref.rgba), "generated BiRefNet hints must not alter classical output"
+
+    gradient = green_gradient_screen_fixture()
+    gradient_biref = np.rint(np.clip(gradient.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    gradient_off_settings = replace(
+        gradient.settings,
+        mode="HybridBiRefNet",
+        guided_alpha_refine=0.0,
+        edge_color_repair=0.0,
+        unmix_amount=0.0,
+        despill=0.0,
+        fringe_remove=0.0,
+    )
+    gradient_off = process_key_image(gradient.rgb, gradient_off_settings, biref_alpha=gradient_biref)
+    gradient_on = process_key_image(gradient.rgb, replace(gradient.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0), biref_alpha=gradient_biref)
+    gradient_edge = gradient.soft_edge_mask & (gradient_on.alpha > 0)
+    gradient_before = edge_key_residual(gradient_off.rgba, gradient.settings.key_color, gradient_edge)
+    gradient_after = edge_key_residual(gradient_on.rgba, gradient.settings.key_color, gradient_edge)
+    assert gradient_after["mean_positive_excess"] < gradient_before["mean_positive_excess"], (
+        f"local screen plate cleanup should reduce gradient-screen edge residual: {gradient_before} -> {gradient_after}"
+    )
+
+    after_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_imports == before_imports, f"HybridBiRefNet RGB cleanup tests must not import heavy runtimes: {after_imports - before_imports}"
+    print(
+        "Phase 8 HybridBiRefNet RGB cleanup checks: "
+        + "; ".join(
+            f"{name} mean {pair[0]['mean_positive_excess']:.2f}->{pair[1]['mean_positive_excess']:.2f}"
+            for name, pair in composite_residuals.items()
+        )
+        + f"; core_delta={core_delta['max_delta']}; low_alpha_p95={low_alpha_residual['p95_positive_excess']:.1f}"
+    )
+
+
 def run_import_compile_tests() -> None:
     for source in (
         "app.py",
@@ -2750,6 +2879,7 @@ def main(argv: list[str] | None = None) -> None:
     run_v6_screen_analysis_tests()
     run_v6_hybrid_trimap_tests()
     run_v6_hybrid_alpha_mode_tests()
+    run_v6_hybrid_rgb_cleanup_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()

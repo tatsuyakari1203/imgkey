@@ -697,10 +697,16 @@ Isolation:
 - Own final color cleanup path in `keyer.py` and tests. Alpha behavior from Phase 7 must remain stable.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 8 completed. HybridBiRefNet RGB cleanup now recomputes final unmix/despill/protection regions from final capped alpha, resolves a bounded local clean screen plate, performs linear-light alpha-aware unmix plus edge-only despill, and keeps classical modes isolated.
+
+Verification:
+- 2026-05-18: Added and passed smoke coverage for hybrid composite halo reduction, foreground-core color tolerance, source-alpha caps, low-alpha noise suppression, classical mode isolation, and UI mode selection/probe. Verification passed: `python smoke_test.py`, required `py_compile`, `import app, keyer`, extended default dependency fence, AI import fence, and headless UI probe.
 
 
 
@@ -727,10 +733,10 @@ Acceptance:
 - Foreground core RGB delta remains within v5 tolerance.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 
 #### P8.1a - Build local screen/clean plate
@@ -745,7 +751,7 @@ Acceptance:
 - `B` is stable on gradient screen fixtures.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -777,7 +783,7 @@ Acceptance:
 - Low-alpha pixels do not explode into noisy saturated colors.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -799,7 +805,7 @@ Acceptance:
 - Real green/blue foreground objects are not destroyed in opaque core.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -821,7 +827,7 @@ Acceptance:
 - Semi-transparent source pixels remain capped in known-fg and manual-keep cases.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -843,7 +849,7 @@ Acceptance:
 - Mode-isolation test proves generated BiRefNet hints do not change classical preview/export unless `HybridBiRefNet` is selected.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -869,7 +875,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -928,7 +934,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 ---
@@ -1073,4 +1079,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Execute Phase 8/P8.1 next: apply classical screen/clean-plate RGB cleanup to the final hybrid alpha while preserving Phase 7 alpha ordering and classical-mode behavior.
+Execute Phase 9/P9.1 next: add the BiRefNet diagnostics command and artifact output without changing the Phase 8 algorithm unless fixing diagnostics test bugs.
