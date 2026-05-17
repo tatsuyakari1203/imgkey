@@ -18,6 +18,7 @@ from keyer import (
     KeySettings,
     _MAX_INNER_LABEL_PIXELS,
     _build_nearest_inner_label_map,
+    _estimate_screen_tile,
     _guided_filter_gray,
     _linear_f32_to_srgb_u8,
     _srgb_u8_to_linear_f32,
@@ -66,6 +67,13 @@ def _composite_rgb_array(background: np.ndarray, foreground_rgb: np.ndarray, alp
     fg = foreground_rgb.astype(np.float32)
     rgb = bg * (1.0 - alpha[:, :, None]) + fg * alpha[:, :, None]
     return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _composite_rgb_linear(background: np.ndarray, foreground_rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    bg = _srgb_u8_to_linear_f32(background)
+    fg = _srgb_u8_to_linear_f32(foreground_rgb)
+    rgb = bg * (1.0 - alpha[:, :, None]) + fg * alpha[:, :, None]
+    return _linear_f32_to_srgb_u8(rgb)
 
 
 def _masks_from_alpha(alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -539,6 +547,80 @@ def large_tile_gradient_runtime_fixture() -> DiagnosticFixture:
         expected_alpha=alpha,
         expected_foreground_rgb=foreground,
     )
+
+
+def tile_local_diagonal_gradient_fixture() -> DiagnosticFixture:
+    h, w = 540, 760
+    x_grad = np.linspace(-70, 70, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-45, 45, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(3 + x_grad * 0.06 + y_grad * 0.05, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(220 + x_grad + y_grad * 0.45, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(45 + x_grad * 0.10 - y_grad * 0.12, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 150, feather=14.0)
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (218, 162, 124)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="tile_local_diagonal_gradient",
+        rgb=_composite_rgb_linear(background, foreground, alpha),
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+            clip_background=0.65,
+            brightness_tolerance=0.55,
+            tolerance=0.28,
+            tile_size=173,
+            tile_overlap=8,
+        ),
+        notes="Phase 4 fixture: diagonal green-screen illumination gradient for tile-local screen estimation.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def tile_local_shadow_gradient_fixture() -> DiagnosticFixture:
+    h, w = 500, 720
+    x_grad = np.linspace(-35, 35, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-80, 65, h, dtype=np.float32).reshape(h, 1)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :, 0] = np.clip(5 + x_grad * 0.05 + y_grad * 0.04, 0, 255).astype(np.uint8)
+    background[:, :, 1] = np.clip(215 + x_grad * 0.20 + y_grad * 0.90, 0, 255).astype(np.uint8)
+    background[:, :, 2] = np.clip(48 + x_grad * 0.08 - y_grad * 0.10, 0, 255).astype(np.uint8)
+    alpha = _disc_alpha(h, w, 135, feather=16.0)
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (222, 166, 126)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="tile_local_shadow_gradient",
+        rgb=_composite_rgb_linear(background, foreground, alpha),
+        settings=KeySettings(
+            key_color=(0, 220, 50),
+            auto_border_sample=True,
+            edge_refine_radius=8,
+            fringe_band_radius=3,
+            clip_background=0.65,
+            brightness_tolerance=0.55,
+            tolerance=0.28,
+            tile_size=173,
+            tile_overlap=8,
+        ),
+        notes="Phase 4 fixture: green screen with vertical shadow gradient for tile-local screen estimation.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def phase4_tile_local_screen_fixtures() -> list[DiagnosticFixture]:
+    return [tile_local_diagonal_gradient_fixture(), tile_local_shadow_gradient_fixture()]
 
 
 def large_synthetic_fixture() -> DiagnosticFixture:
@@ -1063,6 +1145,121 @@ def run_phase3_guided_alpha_tests() -> None:
     )
 
 
+def _tile_boundary_band_mask(shape: tuple[int, int], tile_size: int, band_radius: int = 2) -> np.ndarray:
+    h, w = shape
+    mask = np.zeros((h, w), dtype=bool)
+    radius = max(1, int(band_radius))
+    for x in range(int(tile_size), w, int(tile_size)):
+        mask[:, max(0, x - radius) : min(w, x + radius + 1)] = True
+    for y in range(int(tile_size), h, int(tile_size)):
+        mask[max(0, y - radius) : min(h, y + radius + 1), :] = True
+    return mask
+
+
+def tile_boundary_band_metrics(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    tile_sizes: tuple[int, int],
+) -> dict[str, int]:
+    first = process_key_image(
+        rgb,
+        replace(settings, use_tiling=True, tile_size=tile_sizes[0], local_screen_model=True, max_local_screen_model_pixels=1),
+    )
+    second = process_key_image(
+        rgb,
+        replace(settings, use_tiling=True, tile_size=tile_sizes[1], local_screen_model=True, max_local_screen_model_pixels=1),
+    )
+    band = _tile_boundary_band_mask(rgb.shape[:2], tile_sizes[0]) | _tile_boundary_band_mask(rgb.shape[:2], tile_sizes[1])
+    if not np.any(band):
+        raise AssertionError("tile boundary band mask should not be empty")
+
+    diff = np.abs(first.rgba.astype(np.int16) - second.rgba.astype(np.int16))
+    fringe_first = first.fringe_mask > 4 if first.fringe_mask is not None else np.zeros(rgb.shape[:2], dtype=bool)
+    fringe_second = second.fringe_mask > 4 if second.fringe_mask is not None else np.zeros(rgb.shape[:2], dtype=bool)
+    opaque_nonfringe = band & (first.alpha >= 250) & (second.alpha >= 250) & ~fringe_first & ~fringe_second
+    visible = band & ((first.alpha > 0) | (second.alpha > 0))
+    checker_diff = np.abs(checkerboard_composite(first.rgba).astype(np.int16) - checkerboard_composite(second.rgba).astype(np.int16))
+    return {
+        "tile_size_a": int(tile_sizes[0]),
+        "tile_size_b": int(tile_sizes[1]),
+        "boundary_pixels": int(np.count_nonzero(band)),
+        "opaque_nonfringe_pixels": int(np.count_nonzero(opaque_nonfringe)),
+        "visible_pixels": int(np.count_nonzero(visible)),
+        "max_alpha_diff": int(diff[:, :, 3][band].max()),
+        "max_rgb_diff_opaque_nonfringe": int(diff[:, :, :3][opaque_nonfringe].max()) if np.any(opaque_nonfringe) else 0,
+        "max_checker_diff_visible": int(checker_diff[visible].max()) if np.any(visible) else 0,
+        "max_rgba_diff_boundary": int(diff[band].max()),
+    }
+
+
+def run_phase4_tile_local_screen_tests() -> None:
+    helper_rgb = np.zeros((9, 11, 3), dtype=np.uint8)
+    helper_rgb[:, :, :] = (0, 220, 50)
+    helper_rgb[:, 6:, :] = (0, 180, 42)
+    helper_known = np.zeros((9, 11), dtype=bool)
+    helper_known[:, :3] = True
+    helper_known[:, 8:] = True
+    helper_screen = _estimate_screen_tile(helper_rgb, helper_known, (0, 200, 45), radius=2)
+    assert helper_screen.shape == helper_rgb.shape and helper_screen.dtype == np.uint8, "screen tile estimate must be uint8 HxWx3"
+    assert int(helper_screen[4, 1, 1]) >= 215, "known bright screen side should estimate local green level"
+    assert int(helper_screen[4, 9, 1]) <= 185, "known shadow screen side should estimate local green level"
+    fallback_screen = _estimate_screen_tile(helper_rgb, np.zeros((9, 11), dtype=bool), (0, 200, 45), radius=2)
+    assert np.array_equal(fallback_screen, np.broadcast_to(np.array([0, 200, 45], dtype=np.uint8), helper_rgb.shape)), (
+        "screen tile estimate should fall back to global color when no connected-safe background exists"
+    )
+
+    summaries: list[str] = []
+    for fixture in phase4_tile_local_screen_fixtures():
+        _, _, soft_edge = _fixture_masks(fixture)
+        global_fallback = process_key_image(
+            fixture.rgb,
+            replace(fixture.settings, local_screen_model=False, use_tiling=True, tile_size=173, tile_overlap=8),
+        )
+        tile_local = process_key_image(
+            fixture.rgb,
+            replace(
+                fixture.settings,
+                local_screen_model=True,
+                max_local_screen_model_pixels=1,
+                use_tiling=True,
+                tile_size=173,
+                tile_overlap=8,
+            ),
+        )
+        global_residual = edge_key_residual(global_fallback.rgba, fixture.settings.key_color, soft_edge)
+        local_residual = edge_key_residual(tile_local.rgba, fixture.settings.key_color, soft_edge)
+        assert local_residual["max_positive_excess"] < global_residual["max_positive_excess"], (
+            f"{fixture.name}: tile-local screen should lower max edge residual, "
+            f"{local_residual['max_positive_excess']} >= {global_residual['max_positive_excess']}"
+        )
+        assert local_residual["p95_positive_excess"] < global_residual["p95_positive_excess"], (
+            f"{fixture.name}: tile-local screen should lower p95 edge residual, "
+            f"{local_residual['p95_positive_excess']} >= {global_residual['p95_positive_excess']}"
+        )
+        assert np.array_equal(global_fallback.alpha, tile_local.alpha), f"{fixture.name}: local screen model must not alter alpha"
+
+        seam = tile_boundary_band_metrics(fixture.rgb, fixture.settings, tile_sizes=(137, 199))
+        assert seam["opaque_nonfringe_pixels"] > 0, f"{fixture.name}: seam test should cover opaque non-fringe pixels"
+        assert seam["max_alpha_diff"] <= 1, f"{fixture.name}: boundary alpha diff too high: {seam}"
+        assert seam["max_rgb_diff_opaque_nonfringe"] <= 2, f"{fixture.name}: opaque boundary RGB diff too high: {seam}"
+        assert seam["max_checker_diff_visible"] <= 2, f"{fixture.name}: visible checker seam diff too high: {seam}"
+
+        summaries.append(
+            f"{fixture.name}: max {global_residual['max_positive_excess']}->{local_residual['max_positive_excess']}; "
+            f"p95 {global_residual['p95_positive_excess']}->{local_residual['p95_positive_excess']}; "
+            f"seam alpha={seam['max_alpha_diff']} rgb={seam['max_rgb_diff_opaque_nonfringe']} "
+            f"checker={seam['max_checker_diff_visible']}"
+        )
+
+    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    imported = forbidden & set(sys.modules)
+    assert not imported, f"tile-local screen model must not import heavy optional modules: {sorted(imported)}"
+
+    print("Phase 4 tile-local screen checks:")
+    for line in summaries:
+        print(f"  {line}")
+
+
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
     rgb, _, settings = _edge_fringe_fixture(key_color)
     before_settings = replace(
@@ -1420,6 +1617,7 @@ def main(argv: list[str] | None = None) -> None:
     if not writing_algorithm_baseline:
         run_phase2_linear_color_tests()
         run_phase3_guided_alpha_tests()
+        run_phase4_tile_local_screen_tests()
     run_optional_ai_seam_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

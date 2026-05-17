@@ -38,6 +38,9 @@ class KeySettings:
     auto_border_sample: bool = True
     auto_detect_key_color: bool = False
     border_sample_width: int = 24
+    # Local screen model builds a full-image uint8 screen map when the image is
+    # small enough, and falls back to tile-local read-region estimates for large
+    # tiled renders. It does not change matte probability decisions.
     local_screen_model: bool = True
     max_local_screen_model_pixels: int = 12_000_000
 
@@ -862,18 +865,46 @@ def _estimate_screen_map(
     h, w = rgb.shape[:2]
     if h * w > int(settings.max_local_screen_model_pixels):
         return None
-    known = known_background.astype(np.float32)
-    if float(np.mean(known)) < 0.01:
+    if float(np.mean(known_background.astype(np.float32))) < 0.01:
         return None
-    radius = int(np.clip(max(h, w) // 18, 24, 181))
-    ksize = (radius * 2 + 1, radius * 2 + 1)
-    denom = cv2.boxFilter(known, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
-    out = np.empty_like(rgb)
-    fallback = np.asarray(screen_color, dtype=np.float32)
+    radius = _screen_model_radius_for_shape((h, w))
+    return _estimate_screen_tile(rgb, known_background, screen_color, radius)
+
+
+def _estimate_screen_tile(
+    rgb_tile: np.ndarray,
+    known_bg_tile: np.ndarray,
+    fallback_color: tuple[int, int, int] | np.ndarray,
+    radius: int,
+) -> np.ndarray:
+    rgb_arr = np.asarray(rgb_tile, dtype=np.uint8)
+    h, w = rgb_arr.shape[:2]
+    if rgb_arr.ndim != 3 or rgb_arr.shape[2] < 3:
+        raise ValueError("rgb_tile must have shape HxWx3")
+    known = np.asarray(known_bg_tile).astype(bool, copy=False)
+    if known.shape != (h, w):
+        raise ValueError("known_bg_tile must match rgb_tile height/width")
+
+    fallback = np.clip(np.rint(np.asarray(fallback_color, dtype=np.float32).reshape(3)), 0, 255)
+    out = np.empty((h, w, 3), dtype=np.uint8)
+    out[:, :, :] = fallback.astype(np.uint8).reshape(1, 1, 3)
+    if h == 0 or w == 0 or not np.any(known):
+        return out
+
+    radius_i = max(0, int(radius))
+    ksize = (radius_i * 2 + 1, radius_i * 2 + 1)
+    known_f = known.astype(np.float32)
+    denom = cv2.boxFilter(known_f, cv2.CV_32F, ksize, normalize=False, borderType=cv2.BORDER_REPLICATE)
+    valid = denom >= 1.0
     for channel in range(3):
-        src = rgb[:, :, channel].astype(np.float32) * known
-        num = cv2.boxFilter(src, cv2.CV_32F, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
-        value = np.where(denom > 1e-4, num / np.maximum(denom, 1e-4), fallback[channel])
+        src = rgb_arr[:, :, channel].astype(np.float32) * known_f
+        num = cv2.boxFilter(src, cv2.CV_32F, ksize, normalize=False, borderType=cv2.BORDER_REPLICATE)
+        value = np.divide(
+            num,
+            np.maximum(denom, 1.0),
+            out=np.full((h, w), float(fallback[channel]), dtype=np.float32),
+            where=valid,
+        )
         out[:, :, channel] = np.clip(np.rint(value), 0, 255).astype(np.uint8)
     return out
 
@@ -1039,14 +1070,25 @@ def _render_tiled_rgba(
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[:, :, 3] = matte.alpha
     despill_mask = np.zeros((h, w), dtype=np.uint8)
-    tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings)))
+    screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
+    tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=screen_radius))
     total = max(1, len(tiles))
     for index, tile in enumerate(tiles, start=1):
         _raise_if_cancelled(cancel_callback)
         read_y, read_x, core_y, core_x = tile
         rel_y = slice(core_y.start - read_y.start, core_y.stop - read_y.start)
         rel_x = slice(core_x.start - read_x.start, core_x.stop - read_x.start)
-        screen_tile = None if matte.screen_map is None else matte.screen_map[read_y, read_x]
+        if matte.screen_map is not None:
+            screen_tile = matte.screen_map[read_y, read_x]
+        elif settings.local_screen_model:
+            screen_tile = _estimate_screen_tile(
+                rgb[read_y, read_x],
+                matte.background_mask[read_y, read_x],
+                matte.screen_color,
+                screen_radius,
+            )
+        else:
+            screen_tile = None
         nearest_inner_rgb, nearest_inner_valid = _nearest_inner_rgb_for_slice(
             rgb,
             matte.inner_labels,
@@ -1268,12 +1310,13 @@ def _iter_tiles(
     w: int,
     settings: KeySettings,
     edge_radius: int,
+    extra_overlap: int = 0,
 ) -> Iterator[tuple[slice, slice, slice, slice]]:
     tile_size = max(1, int(settings.tile_size))
     if not settings.use_tiling or max(h, w) <= tile_size:
         yield slice(0, h), slice(0, w), slice(0, h), slice(0, w)
         return
-    overlap = max(int(settings.tile_overlap), int(edge_radius) * 4, 0)
+    overlap = max(int(settings.tile_overlap), int(edge_radius) * 4, int(extra_overlap), 0)
     for y0 in range(0, h, tile_size):
         y1 = min(h, y0 + tile_size)
         for x0 in range(0, w, tile_size):
@@ -1307,6 +1350,11 @@ def _effective_edge_radius(settings: KeySettings) -> int:
     if settings.edge_refine_radius > 0:
         return max(1, int(settings.edge_refine_radius))
     return max(2, int(round(max(0.0, float(settings.edge_blur)) * 4.0 + 1.0)))
+
+
+def _screen_model_radius_for_shape(shape: tuple[int, int]) -> int:
+    h, w = shape
+    return int(np.clip(max(int(h), int(w)) // 18, 24, 181))
 
 
 def _clip01(value: float) -> float:

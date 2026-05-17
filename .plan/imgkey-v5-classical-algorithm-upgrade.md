@@ -350,10 +350,10 @@ Isolation:
 - Own local screen map helpers and tiled render data flow in `keyer.py`. Do not change probability model yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P4.1 - Add tile-local screen estimate fallback
 - Reuse existing `local_screen_model` if already present and semantically equivalent; otherwise add `tile_local_screen_model: bool = True` with clear docs. Do not create duplicate/conflicting UI semantics.
@@ -372,10 +372,13 @@ Acceptance:
 - Gradient screen fixtures show lower edge residual than global screen fallback; no full-image float32 RGB allocation; boundary-band seam metrics pass across at least two tile sizes.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Reused the existing `local_screen_model` setting for both capped full-image maps and tile-local fallback; no duplicate `tile_local_screen_model` setting was added. Implemented `_estimate_screen_tile()` as a uint8 tile/read-region screen estimate using normalized `cv2.boxFilter` sums over connected/background-safe `matte.background_mask` pixels, with fallback to the sampled global screen color where no safe background exists. `_render_tiled_rgba()` now expands read overlap by the screen-estimation radius when the global `screen_map` is absent, computes the local screen estimate from each read tile, and still writes only tile cores. Smoke coverage now verifies lower gradient/shadow edge residuals vs global fallback (`tile_local_diagonal_gradient` max `39 -> 26`, p95 `30.0 -> 24.0`; `tile_local_shadow_gradient` max `40 -> 27`, p95 `31.0 -> 24.0`) plus two-tile-size boundary-band seam metrics (`alpha=0`, opaque non-fringe `rgb=0`, checker `0`) and the dependency fence. Required Phase 4 verification passed: `python smoke_test.py`, `python -m py_compile app.py keyer.py smoke_test.py ai_assist.py`, `python -c "import app, keyer; print('import ok')"`, and the plan dependency-fence command.
 
 ---
 
@@ -397,7 +400,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P5.1 - Define and implement crop-render result contract in keyer.py
 - Extend `_render_tiled_rgba()` with `render_crop: tuple[int,int,int,int] | None = None`, or add a wrapper if less invasive.
