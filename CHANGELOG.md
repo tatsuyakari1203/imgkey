@@ -2,7 +2,7 @@
 
 All notable changes to ImgKey are documented here.
 
-## Unreleased - v5 classical algorithm upgrade
+## v1.1.0 - 2026-05-17
 
 ### Added
 
