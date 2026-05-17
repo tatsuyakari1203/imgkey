@@ -2,6 +2,18 @@
 
 All notable changes to ImgKey are documented here.
 
+## Unreleased
+
+### Added
+
+- Separate GPU packaging scaffolding: `ImgKey-GPU.spec` for CUDA runtime/probe builds and `ImgKey-GPU-BiRefNet.spec` for the BiRefNet-only worker/adapter build path.
+- CUDA 12.8 GPU requirement files and GPU build notes covering RTX 50-series constraints, local/offline BiRefNet model paths, manifest/license gates, and clean-target testing.
+
+### Notes
+
+- Default `ImgKey.spec` remains the classical non-AI build: no torch, no CUDA runtime, no hidden model downloads, and no bundled weights.
+- v6 GPU AI scope is BiRefNet-only; no other AI model packages or weights are introduced.
+
 ## v1.1.0 - 2026-05-17
 
 ### Added

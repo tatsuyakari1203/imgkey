@@ -22,6 +22,9 @@ env/
 build/
 dist/
 *.egg-info/
+wheelhouse/
+wheels/
+*.whl
 
 # Generated image/output artifacts
 output.png
@@ -37,7 +40,15 @@ model-cache/
 model_cache/
 .model_cache/
 .cache/
+.huggingface/
+hf-cache/
+torch-cache/
+pip-cache/
 *.onnx
 *.pt
 *.pth
 *.safetensors
+*.ckpt
+*.bin
+*.gguf
+*.engine

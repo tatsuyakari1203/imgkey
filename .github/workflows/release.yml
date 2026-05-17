@@ -61,8 +61,10 @@ jobs:
         shell: pwsh
         run: |
           python smoke_test.py
-          python -m py_compile app.py keyer.py smoke_test.py ai_assist.py
+          python -m py_compile app.py keyer.py smoke_test.py ai_assist.py gpu_runtime.py ai_worker.py screen_analysis.py hybrid_trimap.py ai_backends/__init__.py ai_backends/birefnet_adapter.py
           python -c "import app, keyer; print('import ok')"
+          python -c "import sys, app, keyer; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
+          python -c "import sys, app, keyer, ai_assist, gpu_runtime, screen_analysis, hybrid_trimap; import ai_backends; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','scipy','onnxruntime','onnxruntime_gpu'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'AI/heavy modules imported at startup: {loaded}'; print('AI import fence ok')"
 
       - name: Build ImgKey.exe
         shell: pwsh

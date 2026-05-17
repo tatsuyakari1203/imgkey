@@ -1,7 +1,7 @@
 # 05 - ImgKey v6 BiRefNet Detail Keyer
 
 Date: 2026-05-18
-Status: In progress
+Status: Completed
 Owner: ImgKey AI/GPU Detail Keyer
 Scope: Integrate BiRefNet as the only AI model path for detail-preserving alpha hints, then merge it with the classical chroma keyer and keep classical RGB cleanup.
 
@@ -963,10 +963,16 @@ Isolation:
 - Own requirements/spec/workflow/docs. Keep model scope BiRefNet-only.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 10 completed packaging scaffolding and docs for three separated flavors: default classical `ImgKey.spec`, GPU runtime `ImgKey-GPU.spec`, and GPU BiRefNet-only `ImgKey-GPU-BiRefNet.spec`. Added CUDA 12.8 GPU requirement files, a PyInstaller CUDA runtime hook, frozen EXE headless dispatch for GPU probe/AI worker subprocesses, stronger default excludes, `.gitignore` cache/model/wheel guards, and `docs/build-gpu.md` with RTX 5060 Ti constraints plus model/license/manifest gate behavior. GPU EXE builds remain environmental because torch/transformers and a validated local/bundled BiRefNet snapshot are not installed in this environment.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py`, required `py_compile`, `import app, keyer`, default dependency fence, AI import fence, PyInstaller spec syntax compile, `python app.py --gpu-probe --json`, and default classical `python -m PyInstaller --noconfirm --clean ImgKey.spec` plus `dist\ImgKey.exe --gpu-probe --json` (reports no torch but detects RTX 5060 Ti via nvidia-smi). Skipped GPU runtime/BiRefNet EXE builds because `torch` and `transformers` are not installed; exact install/build commands are documented in `docs/build-gpu.md`.
 
 
 
@@ -988,10 +994,13 @@ Acceptance:
 - GPU BiRefNet EXE can generate alpha hint with bundled/local BiRefNet, subject to license gate.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added separate cu128 GPU runtime and GPU BiRefNet requirements, PyInstaller specs, runtime hook/DLL path setup, bundled-model env detection, local/offline model policy docs, and release/context updates. Classical EXE remains non-AI and dependency-fenced; GPU runtime can probe CUDA when torch cu128 is installed; GPU BiRefNet can use a local model path or a bundled snapshot only after license acknowledgment and required SHA256 manifest hashes are present.
 
 
 ---
@@ -1088,4 +1097,4 @@ Packaging must also be tested on a clean Windows target with NVIDIA driver only:
 
 ## 7) Immediate next step
 
-Execute Phase 10/P10.1 next: keep the three packaging flavors separated, verify BiRefNet-only licensing/asset boundaries before bundling weights, and preserve the classical non-AI dependency fence.
+Plan implementation is complete. Remaining release work is environmental: install CUDA-enabled PyTorch/Transformers for GPU builds, provide a validated local BiRefNet snapshot, fill required SHA256 hashes before bundling weights, and perform clean-target Windows/NVIDIA-driver-only EXE validation.

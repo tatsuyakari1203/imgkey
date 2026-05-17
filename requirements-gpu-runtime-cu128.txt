@@ -1,0 +1,9 @@
+# ImgKey GPU runtime flavor (CUDA 12.8 PyTorch wheels).
+# Install after requirements.txt in a clean Windows venv:
+#   python -m pip install -r requirements.txt
+#   python -m pip install -r requirements-gpu-runtime-cu128.txt
+# RTX 50-series / Blackwell targets require a recent PyTorch CUDA wheel;
+# do not substitute old cu121/cu124 wheels for this flavor.
+--index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+torchvision>=0.22

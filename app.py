@@ -75,7 +75,11 @@ VIEW_MODES = (
 BACKGROUND_MODES = ("Checkerboard", "Black", "White", "Gray", "Transparent")
 OUTPUT_MODES = ("Classical", "Manual AI Hint", "Hybrid BiRefNet")
 APP_DIR = Path(__file__).resolve().parent
-AI_UI_ARTIFACT_DIR = APP_DIR / ".artifact" / "ai-ui"
+FROZEN_APP = bool(getattr(sys, "frozen", False))
+FROZEN_BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+BUNDLED_BIREFNET_MODEL_DIR = FROZEN_BUNDLE_DIR / "models" / "BiRefNet"
+WRITABLE_APP_DIR = Path(sys.executable).resolve().parent if FROZEN_APP else APP_DIR
+AI_UI_ARTIFACT_DIR = WRITABLE_APP_DIR / ".artifact" / "ai-ui"
 APP_DEFAULT_KEY_MODE = "Blue"
 APP_DEFAULT_EDGE_RADIUS = 32
 APP_DEFAULT_SETTINGS = KeySettings(
@@ -108,6 +112,41 @@ APP_DEFAULT_SETTINGS = KeySettings(
 
 def app_default_settings() -> KeySettings:
     return replace(APP_DEFAULT_SETTINGS)
+
+
+def ai_worker_subprocess_command(request_path: Path) -> tuple[str, list[str]]:
+    args = ["--request", str(request_path), "--json"]
+    if FROZEN_APP:
+        return sys.executable, ["--imgkey-ai-worker", *args]
+    return sys.executable, [str(APP_DIR / "ai_worker.py"), *args]
+
+
+def gpu_probe_subprocess_command() -> tuple[str, list[str]]:
+    if FROZEN_APP:
+        return sys.executable, ["--gpu-probe", "--json"]
+    return sys.executable, ["-m", "gpu_runtime", "--probe", "--json"]
+
+
+def dispatch_headless_cli(argv: list[str]) -> int | None:
+    args = list(argv[1:])
+    if not args:
+        return None
+
+    if "--imgkey-ai-worker" in args:
+        worker_args = [arg for arg in args if arg != "--imgkey-ai-worker"]
+        from ai_worker import main as ai_worker_main
+
+        return ai_worker_main(worker_args)
+
+    if "--gpu-probe" in args or "--imgkey-gpu-probe" in args:
+        probe_args = [arg for arg in args if arg != "--imgkey-gpu-probe"]
+        if "--gpu-probe" not in probe_args and "--probe" not in probe_args:
+            probe_args.insert(0, "--gpu-probe")
+        from gpu_runtime import main as gpu_runtime_main
+
+        return gpu_runtime_main(probe_args)
+
+    return None
 
 
 @dataclass(slots=True)
@@ -1812,10 +1851,9 @@ class MainWindow(QMainWindow):
             self._update_enabled_state()
             return
 
-        worker_script = APP_DIR / "ai_worker.py"
         process = QProcess(self)
         process.setObjectName("BiRefNetAIWorkerProcess")
-        process.setWorkingDirectory(str(APP_DIR))
+        process.setWorkingDirectory(str(WRITABLE_APP_DIR))
         process.setProcessChannelMode(QProcess.SeparateChannels)
         process.finished.connect(
             lambda exit_code, exit_status, gen=generation, proc=process: self._on_ai_worker_finished(gen, proc, exit_code, exit_status)
@@ -1828,7 +1866,8 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("BiRefNet alpha hint generation started…")
         self._update_enabled_state()
-        process.start(sys.executable, [str(worker_script), "--request", str(request_path), "--json"])
+        command, arguments = ai_worker_subprocess_command(request_path)
+        process.start(command, arguments)
 
     def cancel_ai(self, checked: bool = False, *, silent: bool = False) -> None:
         del checked
@@ -1858,7 +1897,7 @@ class MainWindow(QMainWindow):
             return
         process = QProcess(self)
         process.setObjectName("GPUStatusProcess")
-        process.setWorkingDirectory(str(APP_DIR))
+        process.setWorkingDirectory(str(WRITABLE_APP_DIR))
         process.setProcessChannelMode(QProcess.SeparateChannels)
         process.finished.connect(lambda exit_code, exit_status, proc=process: self._on_gpu_probe_finished(proc, exit_code, exit_status))
         process.errorOccurred.connect(lambda error, proc=process: self._on_gpu_probe_error(proc, error))
@@ -1867,7 +1906,8 @@ class MainWindow(QMainWindow):
             self.gpu_probe_status.setText("GPU Status: running probe in subprocess…")
         self.statusBar().showMessage("GPU status probe running…")
         self._update_enabled_state()
-        process.start(sys.executable, ["-m", "gpu_runtime", "--probe", "--json"])
+        command, arguments = gpu_probe_subprocess_command()
+        process.start(command, arguments)
 
     def _prepare_birefnet_worker_request(self, model_path: Path) -> Path:
         assert self.full_rgb is not None
@@ -2022,6 +2062,8 @@ class MainWindow(QMainWindow):
     def _current_birefnet_model_path(self) -> Path | None:
         text = os.environ.get(BIREFNET_MODEL_ENV, "").strip()
         if not text:
+            if FROZEN_APP and BUNDLED_BIREFNET_MODEL_DIR.exists():
+                return BUNDLED_BIREFNET_MODEL_DIR
             return None
         return Path(text).expanduser().resolve(strict=False)
 
@@ -2519,8 +2561,13 @@ def composite_rgba_for_mode(rgba: np.ndarray, mode: str) -> np.ndarray:
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
-def main() -> int:
-    app = QApplication(sys.argv)
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    headless_result = dispatch_headless_cli(argv)
+    if headless_result is not None:
+        return headless_result
+
+    app = QApplication(argv)
     app.setApplicationName("ImgKey")
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor("#0B0D10"))

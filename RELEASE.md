@@ -8,7 +8,7 @@ This document describes how ImgKey releases are produced, verified, and publishe
 - Target platform: Windows x64
 - Release artifact: `ImgKey-v1.0.0-windows-x64.exe`
 - Build type: one-file, windowed PyInstaller executable
-- Runtime profile: default non-AI build; no PyTorch/CUDA/model weights are bundled
+- Runtime profile: default classical/non-AI build; no PyTorch/CUDA/model weights are bundled
 
 ## What is included
 
@@ -38,9 +38,9 @@ The workflow runs on `windows-latest` and performs:
 2. Set up Python 3.10.
 3. Install dependencies from `requirements.txt` plus PyInstaller.
 4. Run verification:
-   - `python smoke_test.py`
-   - `python -m py_compile app.py keyer.py smoke_test.py ai_assist.py`
-   - `python -c "import app, keyer; print('import ok')"`
+    - `python smoke_test.py`
+    - `python -m py_compile app.py keyer.py smoke_test.py ai_assist.py gpu_runtime.py ai_worker.py screen_analysis.py hybrid_trimap.py ai_backends/__init__.py ai_backends/birefnet_adapter.py`
+    - `python -c "import app, keyer; print('import ok')"`
 5. Build the executable with:
    - `python -m PyInstaller --noconfirm --clean ImgKey.spec`
 6. Rename the release asset to:
@@ -89,8 +89,10 @@ Run these commands before creating a release tag:
 
 ```powershell
 python smoke_test.py
-python -m py_compile app.py keyer.py smoke_test.py ai_assist.py
+python -m py_compile app.py keyer.py smoke_test.py ai_assist.py gpu_runtime.py ai_worker.py screen_analysis.py hybrid_trimap.py ai_backends/__init__.py ai_backends/birefnet_adapter.py
 python -c "import app, keyer; print('import ok')"
+python -c "import sys, app, keyer; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
+python -c "import sys, app, keyer, ai_assist, gpu_runtime, screen_analysis, hybrid_trimap; import ai_backends; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','scipy','onnxruntime','onnxruntime_gpu'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'AI/heavy modules imported at startup: {loaded}'; print('AI import fence ok')"
 python -m PyInstaller --noconfirm --clean ImgKey.spec
 ```
 
@@ -99,6 +101,7 @@ Optional diagnostics:
 ```powershell
 python smoke_test.py --write-diagnostics
 python smoke_test.py --write-edge-repair-diagnostics
+python smoke_test.py --write-birefnet-diagnostics
 ```
 
 Diagnostics are generated under `.artifact/` and are intentionally not committed.
@@ -111,6 +114,15 @@ The default release must stay lightweight and non-AI:
 - Do not bundle PyTorch, CUDA, ONNX Runtime GPU, PyMatting, CorridorKey, BiRefNet weights, or other model assets without an explicit distribution and licensing decision.
 - Optional AI integrations must remain external/plugin-style and must not import heavy runtimes at app startup.
 
+## Optional GPU/BiRefNet edition policy
+
+GPU releases are separate assets, not replacements for the default classical EXE:
+
+1. `ImgKey-GPU.exe`: PyTorch CUDA runtime/probe support only; no Transformers/BiRefNet model stack and no weights.
+2. `ImgKey-GPU-BiRefNet.exe`: PyTorch CUDA plus the BiRefNet-only worker/adapter path. It must not include Matting Anything, SAM, U2Net, MODNet, ViTMatte, CorridorKey models, or any other AI model package/weights.
+
+Before publishing a bundled BiRefNet model asset, verify and record the exact local snapshot path, source revision, license/notice files, model size, and SHA256 manifest. Runtime must remain offline/local-only: no hidden downloads and no URL/repo-ID model paths. See `docs/build-gpu.md` for exact commands and clean-target tests.
+
 ## Artifact policy
 
 Committed source of truth:
@@ -120,7 +132,12 @@ Committed source of truth:
 - `ai_assist.py`
 - `smoke_test.py`
 - `requirements.txt`
+- `requirements-gpu-runtime-cu128.txt`
+- `requirements-gpu-birefnet-cu128.txt`
 - `ImgKey.spec`
+- `ImgKey-GPU.spec`
+- `ImgKey-GPU-BiRefNet.spec`
+- `docs/build-gpu.md`
 - `README.md`
 - `RELEASE.md`
 - `CHANGELOG.md`

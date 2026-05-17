@@ -1,6 +1,6 @@
 # ImgKey
 
-ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The current v5 workflow is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks: no AI runtime, no PyTorch/CUDA, no bundled model weights, and no new default dependencies.
+ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The default build remains a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks: no AI runtime, no PyTorch/CUDA, no bundled model weights, and no new default dependencies. The v6 branch adds separate GPU packaging flavors for a BiRefNet-only alpha-hint workflow.
 
 ## Quick start
 
@@ -15,7 +15,7 @@ python app.py
 
 1. Click **Open image** or drag an image into the window.
 2. Choose **Auto**, **Green**, **Blue**, or **Pick**. In **Pick** mode, click the canvas to sample the screen color accurately.
-3. Inspect the matte and repair maps with **Result**, **Source**, **Alpha**, **AI Hint**, **Background Mask**, **Edge Mask**, **Fringe Mask**, **Despill Mask**, **Foreground RGB**, and **Split Compare** views.
+3. Inspect the matte and repair maps with **Result**, **Source**, **Alpha**, **AI Hint**, **BiRefNet Alpha**, **Background Mask**, **Edge Mask**, **Fringe Mask**, **Despill Mask**, **Foreground RGB**, and **Split Compare** views.
 4. Use **Fit** for whole-image work, **100%** for crop-quality inspection, and pan/zoom in the central canvas before export.
 5. Tune grouped controls in the inspector:
    - **Key**: key mode, sample size, key chip.
@@ -23,7 +23,7 @@ python app.py
    - **Edge**: refine radius, edge softness, erode/expand, edge restore.
    - **Color / Spill Cleanup**: despill, decontaminate, luminance restore/protect, fringe remove, edge color repair, inner color pull, and fringe band.
    - **Output**: proxy/full-crop preview and full-resolution PNG export.
-6. Optionally import grayscale masks with **Import Keep**, **Import Remove**, or **Import AI Hint**. Use **Export Matte** to save the current matte as a reusable grayscale PNG.
+6. Optionally import grayscale masks with **Import Keep**, **Import Remove**, or **Import AI Hint**. GPU BiRefNet builds can also generate a separate **BiRefNet Alpha** hint from a local model snapshot; select **Hybrid BiRefNet** output mode to use it. Use **Export Matte** to save the current matte as a reusable grayscale PNG.
 7. Click **Export PNG** to process the full-resolution image in a worker with progress/cancel support.
 
 ## Large-image behavior
@@ -46,12 +46,15 @@ python app.py
 - **Fringe Remove** controls channel/spill removal strength, **Edge Color Repair** blends reconstructed RGB into the edge, **Inner Color Pull** controls nearest-foreground color pull, and **Fringe Band** widens the soft-edge repair area. Repair is color-only; it does not change alpha.
 - Exported PNGs are straight-alpha; fully transparent RGB is zeroed.
 
-## AI Alpha Hint and optional AI seams
+## AI Alpha Hint, BiRefNet GPU edition, and optional seams
 
-ImgKey currently **does not bundle, download, or install** PyTorch/CUDA, `onnxruntime-gpu`, BiRefNet weights, CorridorKey, or noncommercial model/runtime assets. `requirements.txt` contains only the default non-AI runtime dependencies.
+ImgKey classical **does not bundle, download, or install** PyTorch/CUDA, `onnxruntime-gpu`, BiRefNet weights, CorridorKey, or noncommercial model/runtime assets. `requirements.txt` contains only the default non-AI runtime dependencies.
 
 - **Import AI Hint** accepts PNG/TIFF/JPG/BMP grayscale masks as coarse alpha hints from any external tool. Bright pixels protect foreground/core and can raise alpha where the classical connected-background model does not mark background. Dark hint pixels do **not** automatically remove background; use **Import Remove** for forced removal.
-- **BiRefNet Assist** in `ai_assist.py` is an external-adapter seam only. It checks optional packages, `IMGKEY_BIREFNET_MODEL`, and `IMGKEY_BIREFNET_ADAPTER=module:function`; it does not import heavy runtimes at startup and does not download a model.
+- **BiRefNet GPU edition** is the only bundled-AI scope for v6. It uses the local/offline BiRefNet adapter and worker path to generate a separate alpha hint; final alpha/RGB cleanup still comes from ImgKey's Hybrid BiRefNet classical merge. It never accepts URLs/repo IDs at runtime and never downloads weights.
+- **Model path policy**: set `IMGKEY_BIREFNET_MODEL` to an existing local BiRefNet snapshot, or build `ImgKey-GPU-BiRefNet.spec` with a gated bundled snapshot whose license/notice files and SHA256 manifest have been reviewed. Missing model paths fail cleanly.
+- **No other AI models**: Matting Anything, SAM, U2Net, MODNet, ViTMatte, CorridorKey models, and other AI model packages/weights are out of scope for the v6 GPU edition.
+- **BiRefNet Assist** in `ai_assist.py` remains an external-adapter seam for non-packaged experiments. It checks optional packages, `IMGKEY_BIREFNET_MODEL`, and `IMGKEY_BIREFNET_ADAPTER=module:function`; it does not import heavy runtimes at startup and does not download a model.
 - **CorridorKey Plugin** is also external/plugin-style. Contract: input `rgb_u8` HxWx3 + `alpha_hint_u8` HxW; output optional foreground RGB, alpha grayscale, and processed RGBA. Stop for a license/distribution decision before bundling or redistributing CorridorKey, runtimes, or weights.
 
 ## Verification
@@ -59,9 +62,11 @@ ImgKey currently **does not bundle, download, or install** PyTorch/CUDA, `onnxru
 ```powershell
 python smoke_test.py
 python smoke_test.py --write-edge-repair-diagnostics
-python -m py_compile app.py keyer.py smoke_test.py ai_assist.py
+python smoke_test.py --write-birefnet-diagnostics
+python -m py_compile app.py keyer.py smoke_test.py ai_assist.py gpu_runtime.py ai_worker.py screen_analysis.py hybrid_trimap.py ai_backends/__init__.py ai_backends/birefnet_adapter.py
 python -c "import app, keyer; print('import ok')"
-python -c "import sys, app, keyer; blocked={'torch','torchvision','transformers','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported: {loaded}'; print('dependency fence ok')"
+python -c "import sys, app, keyer; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported: {loaded}'; print('dependency fence ok')"
+python -c "import sys, app, keyer, ai_assist, gpu_runtime, screen_analysis, hybrid_trimap; import ai_backends; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','scipy','onnxruntime','onnxruntime_gpu'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'AI/heavy modules imported at startup: {loaded}'; print('AI import fence ok')"
 ```
 
 Optional diagnostics are written under `.artifact/` only:
@@ -71,6 +76,7 @@ python smoke_test.py --write-diagnostics
 ```
 
 Edge repair diagnostics include before/after PNGs and black/white/gray/checkerboard composites under `.artifact/edge-repair-verification/`.
+BiRefNet diagnostics use a synthetic/mock alpha hint when no model is available and write under `.artifact/birefnet-diagnostics/`.
 
 ## Build default non-AI EXE
 
@@ -82,6 +88,15 @@ $p = Start-Process -FilePath ".\dist\ImgKey.exe" -PassThru
 Start-Sleep -Seconds 6
 if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 ```
+
+## Build GPU flavors
+
+GPU packaging is intentionally split from the default release:
+
+- `ImgKey-GPU.spec` builds `dist\ImgKey-GPU.exe` with PyTorch CUDA runtime/probe support and no model stack or weights.
+- `ImgKey-GPU-BiRefNet.spec` builds `dist\ImgKey-GPU-BiRefNet.exe` with PyTorch CUDA plus the BiRefNet-only worker/adapter path. It uses `IMGKEY_BIREFNET_MODEL` for local runtime snapshots, or a gated bundled snapshot only after license/notice/SHA256 manifest review.
+
+See `docs/build-gpu.md` for exact clean-environment install/build commands and RTX 5060 Ti / CUDA 12.8 constraints.
 
 ## Release workflow
 
