@@ -198,10 +198,16 @@ Isolation:
 - Own `ai_backends/`, no UI worker yet. Adapter must require explicit local/bundled model path and never download.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Phase 3 implemented and verified. Added BiRefNet-only `ai_backends` adapter plus checked-in offline manifest for the pinned `ZhengPeng7/BiRefNet` Hugging Face snapshot (`e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4`), with local-path-only validation, optional SHA256 enforcement, no runtime downloads, and no torch/transformers import at default startup.
+
+Verification:
+- 2026-05-18: Passed `python smoke_test.py`, required `py_compile`, `import app, keyer`, extended default dependency fence, and AI import fence including `ai_backends.birefnet_adapter`.
 
 
 
@@ -216,10 +222,13 @@ Acceptance:
 - Missing/URL/repo-ID/empty-cache/network-denied paths fail cleanly without network access.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress:
+- 2026-05-18: Added `ai_backends/birefnet_manifest.json` recording source repo, pinned revision, expected files/layout, license metadata files, offline policy, and optional hash validation rules. Validator rejects empty paths, URLs, repo IDs, missing directories, and incomplete/empty local snapshots before any AI runtime import.
 
 
 
@@ -265,10 +274,13 @@ Acceptance:
 - Output `alpha_hint` is HxW `uint8`, same shape as input.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-18: Added `ai_backends/__init__.py` and `ai_backends/birefnet_adapter.py` with lazy inference imports, `generate_alpha_hint(...)`, `global_only` support, conservative `global_plus_roi` global fallback metadata, local `AutoModelForImageSegmentation.from_pretrained(..., local_files_only=True, trust_remote_code=True)`, offline env handling, shape helpers, and focused smoke coverage.
 
 
 ---
@@ -291,7 +303,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 
@@ -336,7 +348,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 
 ---

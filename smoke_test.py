@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import py_compile
 import sys
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -1897,6 +1898,96 @@ def run_optional_ai_seam_tests() -> None:
     assert after == before, f"AI capability checks must not import heavy runtimes: {after - before}"
 
 
+def run_birefnet_adapter_manifest_tests() -> None:
+    heavy_modules = HEAVY_OPTIONAL_MODULES
+    before = {name for name in heavy_modules if name in sys.modules}
+
+    importlib.import_module("ai_backends")
+    adapter = importlib.import_module("ai_backends.birefnet_adapter")
+    after_import = {name for name in heavy_modules if name in sys.modules}
+    assert after_import == before, f"importing BiRefNet adapter must not import heavy runtimes: {after_import - before}"
+
+    manifest = adapter.load_manifest()
+    assert manifest["backend"] == "birefnet", "manifest must be BiRefNet-only"
+    assert manifest["model_family"] == "BiRefNet", "manifest model family must be BiRefNet"
+    assert manifest["selected_model"] == "ZhengPeng7/BiRefNet", "manifest must pin the selected BiRefNet source"
+    assert manifest["source"]["repo_id"] == "ZhengPeng7/BiRefNet", "manifest must record exact HF source repo"
+    assert manifest["source"].get("revision"), "manifest must record a pinned revision/commit"
+    policy = manifest["local_path_policy"]
+    assert policy["network_access"] == "forbidden", "BiRefNet runtime must be offline/local-only"
+    assert policy["transformers_from_pretrained_args"]["local_files_only"] is True, "manifest must require local_files_only"
+    assert policy["transformers_from_pretrained_args"]["trust_remote_code"] is True, "manifest must document remote-code loading"
+
+    required_paths = {entry["path"] for entry in manifest["expected_layout"]["root_required_files"]}
+    expected_paths = {"config.json", "BiRefNet_config.py", "birefnet.py", "model.safetensors", "README.md"}
+    assert expected_paths <= required_paths, f"manifest missing required BiRefNet snapshot files: {expected_paths - required_paths}"
+    license_paths = {entry["path"] for entry in manifest["expected_layout"]["license_files"]}
+    assert "README.md" in license_paths, "manifest must record license/notice metadata file names"
+
+    bad_paths = {
+        "": "empty",
+        "https://huggingface.co/ZhengPeng7/BiRefNet": "URL",
+        "ZhengPeng7/BiRefNet": "repo IDs",
+        str(Path(".artifact") / "missing-birefnet-model"): "does not exist",
+    }
+    for bad_path, expected_text in bad_paths.items():
+        try:
+            adapter.validate_model_path(bad_path)
+        except adapter.ModelValidationError as exc:
+            assert expected_text.lower() in str(exc).lower(), f"unexpected validation error for {bad_path!r}: {exc}"
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"invalid BiRefNet path should be rejected: {bad_path!r}")
+
+        result = adapter.generate_alpha_hint(np.zeros((4, 5, 3), dtype=np.uint8), bad_path)
+        assert result["ok"] is False and result["alpha_hint"] is None, "invalid paths must fail cleanly without inference"
+        assert result["error"]["code"] == "model_validation_failed", "invalid paths should report model validation failure"
+
+    with tempfile.TemporaryDirectory(prefix="imgkey-empty-hf-cache-") as empty_cache:
+        try:
+            adapter.validate_model_path(empty_cache)
+        except adapter.ModelValidationError as exc:
+            assert "missing required file" in str(exc).lower(), f"empty cache should fail on manifest layout: {exc}"
+        else:  # pragma: no cover - defensive
+            raise AssertionError("empty BiRefNet cache directory should be rejected")
+        result = adapter.generate_alpha_hint(np.zeros((4, 5, 3), dtype=np.uint8), empty_cache)
+        assert result["ok"] is False and result["error"]["code"] == "model_validation_failed", (
+            "empty local cache paths must fail cleanly without downloads"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="imgkey-birefnet-manifest-") as tmp_dir:
+        snapshot = Path(tmp_dir)
+        (snapshot / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["BiRefNet"],
+                    "auto_map": {
+                        "AutoConfig": "BiRefNet_config.BiRefNetConfig",
+                        "AutoModelForImageSegmentation": "birefnet.BiRefNet",
+                    },
+                    "bb_pretrained": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (snapshot / "BiRefNet_config.py").write_text("class BiRefNetConfig: pass\n", encoding="utf-8")
+        (snapshot / "birefnet.py").write_text("class BiRefNet: pass\n", encoding="utf-8")
+        (snapshot / "model.safetensors").write_bytes(b"placeholder weights for manifest validation only")
+        (snapshot / "README.md").write_text("---\nlicense: mit\n---\n", encoding="utf-8")
+        validation = adapter.validate_model_path(snapshot)
+        assert validation["ok"] is True, "validator must consume manifest for local snapshot layout"
+        assert validation["config"]["architectures"] == ["BiRefNet"], "validator must check BiRefNet config architecture"
+
+    rgb = adapter.ensure_rgb_u8(np.full((2, 3, 4), 128.8, dtype=np.float32))
+    assert rgb.shape == (2, 3, 3) and rgb.dtype == np.uint8 and rgb.flags.c_contiguous, "RGB helper must return HxWx3 uint8"
+    alpha = adapter.ensure_alpha_u8(np.array([[0.0, 0.5], [1.0, np.nan]], dtype=np.float32), (2, 2))
+    assert alpha.shape == (2, 2) and alpha.dtype == np.uint8 and alpha[0, 0] == 0 and alpha[1, 0] == 255, (
+        "alpha helper must convert float masks to HxW uint8"
+    )
+
+    after_validation = {name for name in heavy_modules if name in sys.modules}
+    assert after_validation == before, f"BiRefNet manifest/validation tests must not import heavy runtimes: {after_validation - before}"
+
+
 def run_gpu_runtime_probe_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert "torch" not in sys.modules, "smoke test start should not have torch imported"
@@ -1963,7 +2054,15 @@ def run_gpu_runtime_probe_tests() -> None:
 
 
 def run_import_compile_tests() -> None:
-    for source in ("app.py", "keyer.py", "smoke_test.py", "ai_assist.py", "gpu_runtime.py"):
+    for source in (
+        "app.py",
+        "keyer.py",
+        "smoke_test.py",
+        "ai_assist.py",
+        "gpu_runtime.py",
+        "ai_backends/__init__.py",
+        "ai_backends/birefnet_adapter.py",
+    ):
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
@@ -1993,6 +2092,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
     run_optional_ai_seam_tests()
+    run_birefnet_adapter_manifest_tests()
     run_gpu_runtime_probe_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
