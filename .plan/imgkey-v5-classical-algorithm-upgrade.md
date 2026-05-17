@@ -397,10 +397,10 @@ Isolation:
 - Own `keyer.py` render crop support and minimal `app.py` preview job wiring. Preserve current UI behavior: no zoom reset, export progress/cancel remains intact.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P5.1 - Define and implement crop-render result contract in keyer.py
 - Extend `_render_tiled_rgba()` with `render_crop: tuple[int,int,int,int] | None = None`, or add a wrapper if less invasive.
@@ -422,7 +422,7 @@ Acceptance:
 - Crop-only result matches crop from full render with max RGBA diff `<= 1`; all crop-shaped debug/view arrays align and do not crash view modes.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -440,10 +440,13 @@ Acceptance:
 - Full Crop preview avoids full-image RGBA color pass; UI pan/zoom behavior remains stable; relevant UI probes pass.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress:
+- 2026-05-17: Added crop-aware `_render_tiled_rgba(render_crop=...)` so full-resolution crop previews still build the global matte on the whole image but only color-render full-image tile-grid cores intersecting the crop. Crop outputs now align `KeyResult.rgba`, `alpha`, matte/debug masks, `despill_mask`, `fringe_mask`, `screen_probability`, `alpha_hint`, and foreground/debug RGB to the crop while preserving original full-image status/UI metadata outside the result arrays. Full Crop preview explicitly requests the tiled crop render path without changing no-reset view behavior or export progress/cancel. Smoke coverage verifies crop/full parity (`max_rgba_diff=0`, `max_alpha_diff=0`), crop debug/view shape alignment, and reduced color-rendered tiles (`4/24`); offscreen UI job probe confirmed stable full-crop job settings and crop-origin/display shape.
 
 ---
 
@@ -465,7 +468,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P6.1 - Add tile-local nearest-inner pull when global labels are skipped
 - Keep existing global label map for images below cap.

@@ -255,17 +255,21 @@ def process_key_image(
     _report(progress_callback, 0.18, "global matte")
     _raise_if_cancelled(cancel_callback)
 
-    rgba, despill_mask = _render_tiled_rgba(rgb, settings, global_matte, progress_callback, cancel_callback)
-    foreground = rgba[:, :, :3].copy()
     crop = _normalized_crop(settings.full_res_crop, w, h)
+    rgba, despill_mask = _render_tiled_rgba(
+        rgb,
+        settings,
+        global_matte,
+        progress_callback,
+        cancel_callback,
+        render_crop=crop,
+    )
+    foreground = rgba[:, :, :3].copy()
     if crop is not None:
         x0, y0, x1, y1 = crop
-        rgba = rgba[y0:y1, x0:x1].copy()
-        foreground = foreground[y0:y1, x0:x1].copy()
         alpha = global_matte.alpha[y0:y1, x0:x1].copy()
         background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
         edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-        despill_mask = despill_mask[y0:y1, x0:x1].copy()
         fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
         probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
         hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
@@ -1065,19 +1069,47 @@ def _render_tiled_rgba(
     matte: _GlobalMatte,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
+    *,
+    render_crop: tuple[int, int, int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     h, w = rgb.shape[:2]
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 3] = matte.alpha
-    despill_mask = np.zeros((h, w), dtype=np.uint8)
+    crop = _normalized_crop(render_crop, w, h)
+    if crop is None:
+        out_x0 = out_y0 = 0
+        out_h, out_w = h, w
+        alpha_out = matte.alpha
+    else:
+        out_x0, out_y0, out_x1, out_y1 = crop
+        out_h, out_w = out_y1 - out_y0, out_x1 - out_x0
+        alpha_out = matte.alpha[out_y0:out_y1, out_x0:out_x1]
+
+    rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+    rgba[:, :, 3] = alpha_out
+    despill_mask = np.zeros((out_h, out_w), dtype=np.uint8)
     screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
-    tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=screen_radius))
+    extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius)
+    tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=extra_overlap))
+    if crop is not None:
+        tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
     total = max(1, len(tiles))
     for index, tile in enumerate(tiles, start=1):
         _raise_if_cancelled(cancel_callback)
         read_y, read_x, core_y, core_x = tile
-        rel_y = slice(core_y.start - read_y.start, core_y.stop - read_y.start)
-        rel_x = slice(core_x.start - read_x.start, core_x.stop - read_x.start)
+        if crop is None:
+            write_y0, write_y1 = core_y.start, core_y.stop
+            write_x0, write_x1 = core_x.start, core_x.stop
+        else:
+            crop_x0, crop_y0, crop_x1, crop_y1 = crop
+            write_y0 = max(core_y.start, crop_y0)
+            write_y1 = min(core_y.stop, crop_y1)
+            write_x0 = max(core_x.start, crop_x0)
+            write_x1 = min(core_x.stop, crop_x1)
+            if write_y1 <= write_y0 or write_x1 <= write_x0:
+                continue
+        rel_y = slice(write_y0 - read_y.start, write_y1 - read_y.start)
+        rel_x = slice(write_x0 - read_x.start, write_x1 - read_x.start)
+        out_y = slice(write_y0 - out_y0, write_y1 - out_y0)
+        out_x = slice(write_x0 - out_x0, write_x1 - out_x0)
         if matte.screen_map is not None:
             screen_tile = matte.screen_map[read_y, read_x]
         elif settings.local_screen_model:
@@ -1108,11 +1140,34 @@ def _render_tiled_rgba(
             matte.screen_color,
             settings,
         )
-        rgba[core_y, core_x, :3] = rgb_tile[rel_y, rel_x]
-        despill_mask[core_y, core_x] = spill_tile[rel_y, rel_x]
+        rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
+        despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
         _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
-    rgba[matte.alpha <= 0, :3] = 0
+    rgba[alpha_out <= 0, :3] = 0
     return rgba, despill_mask
+
+
+def _tile_intersects_crop(core_y: slice, core_x: slice, crop: tuple[int, int, int, int]) -> bool:
+    x0, y0, x1, y1 = crop
+    return core_y.start < y1 and core_y.stop > y0 and core_x.start < x1 and core_x.stop > x0
+
+
+def _tile_extra_overlap(settings: KeySettings, shape: tuple[int, int], screen_radius: int | None = None) -> int:
+    if screen_radius is None:
+        screen_radius = _screen_model_radius_for_shape(shape) if settings.local_screen_model else 0
+    guided_radius = max(0, int(settings.guided_radius)) * 2 + 2 if _clip01(settings.guided_alpha_refine) > 0 else 0
+    return max(
+        int(screen_radius),
+        max(0, int(settings.fringe_band_radius)),
+        guided_radius,
+        _tile_local_nearest_inner_radius(settings),
+    )
+
+
+def _tile_local_nearest_inner_radius(settings: KeySettings) -> int:
+    # Phase 6 wires tile-local nearest-inner labels here. Until then global labels
+    # or deterministic no-pull fallback need no additional read-region margin.
+    return 0
 
 
 def _process_color_tile(

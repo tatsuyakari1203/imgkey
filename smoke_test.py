@@ -1260,6 +1260,89 @@ def run_phase4_tile_local_screen_tests() -> None:
         print(f"  {line}")
 
 
+def _count_tile_progress(stages: list[str]) -> int:
+    return sum(1 for stage in stages if stage.startswith("tile "))
+
+
+def run_phase5_crop_render_tests() -> None:
+    fixture = tile_local_diagonal_gradient_fixture()
+    crop = (300, 170, 460, 330)
+    x0, y0, x1, y1 = crop
+    crop_h, crop_w = y1 - y0, x1 - x0
+    settings = replace(
+        fixture.settings,
+        use_tiling=True,
+        tile_size=137,
+        tile_overlap=11,
+        local_screen_model=True,
+        max_local_screen_model_pixels=1,
+        guided_alpha_refine=0.35,
+        guided_radius=5,
+        guided_max_pixels=1_000_000,
+        fringe_band_radius=4,
+    )
+    alpha_hint = np.zeros(fixture.rgb.shape[:2], dtype=np.uint8)
+    alpha_hint[205:295, 340:430] = 224
+
+    full_stages: list[str] = []
+    full = process_key_image(
+        fixture.rgb,
+        replace(settings, full_res_crop=None),
+        alpha_hint=alpha_hint,
+        progress_callback=lambda _value, stage: full_stages.append(stage),
+    )
+
+    crop_stages: list[str] = []
+    cropped = process_key_image(
+        fixture.rgb,
+        replace(settings, full_res_crop=crop, preview_scale=1.0),
+        alpha_hint=alpha_hint,
+        progress_callback=lambda _value, stage: crop_stages.append(stage),
+    )
+    display_rgb = fixture.rgb[y0:y1, x0:x1]
+
+    diff = np.abs(cropped.rgba.astype(np.int16) - full.rgba[y0:y1, x0:x1].astype(np.int16))
+    max_rgba_diff = int(diff.max())
+    max_alpha_diff = int(diff[:, :, 3].max())
+    assert max_rgba_diff <= 1, f"crop-only render must match full-render crop, max RGBA diff={max_rgba_diff}"
+    assert max_alpha_diff == 0, f"crop-only alpha must exactly match full-render crop, max alpha diff={max_alpha_diff}"
+
+    expected_2d_shape = (crop_h, crop_w)
+    expected_rgb_shape = (crop_h, crop_w, 3)
+    assert cropped.rgba.shape == (crop_h, crop_w, 4), "crop-only RGBA must be crop-shaped"
+    assert cropped.foreground is not None and cropped.foreground.shape == expected_rgb_shape, "foreground debug RGB must align to crop"
+    for name in ("alpha", "background_mask", "edge_mask", "despill_mask", "screen_probability", "alpha_hint", "fringe_mask"):
+        arr = getattr(cropped, name)
+        assert arr is not None, f"{name} should be available for crop debug views"
+        assert arr.shape == expected_2d_shape, f"{name} must be crop-shaped, got {arr.shape}"
+    assert np.array_equal(cropped.alpha, full.alpha[y0:y1, x0:x1]), "crop alpha array must align with full alpha crop"
+    assert np.array_equal(cropped.fringe_mask, full.fringe_mask[y0:y1, x0:x1]), "crop fringe mask must align with full crop"
+    assert np.array_equal(cropped.despill_mask, full.despill_mask[y0:y1, x0:x1]), "crop despill mask must align with full crop"
+    assert display_rgb.shape == expected_rgb_shape, "app display RGB crop must align with crop result"
+
+    from app import debug_rgb_to_rgb, mask_to_rgb
+
+    for name in ("alpha", "background_mask", "edge_mask", "despill_mask", "screen_probability", "alpha_hint", "fringe_mask"):
+        view_rgb = mask_to_rgb(getattr(cropped, name), display_rgb.shape[:2])
+        assert view_rgb.shape == display_rgb.shape, f"{name} debug view should render without shape drift"
+    foreground_view = debug_rgb_to_rgb(cropped.foreground, display_rgb.shape[:2])
+    assert foreground_view.shape == display_rgb.shape, "foreground debug view should render without shape drift"
+
+    full_tiles = _count_tile_progress(full_stages)
+    crop_tiles = _count_tile_progress(crop_stages)
+    assert 0 < crop_tiles < full_tiles, f"crop preview should color-render fewer tiles than full render ({crop_tiles}/{full_tiles})"
+
+    forbidden = {"pymatting", "scipy", "numba", "torch", "torchvision", "transformers", "onnxruntime", "onnxruntime_gpu"}
+    imported = forbidden & set(sys.modules)
+    assert not imported, f"crop-only render must not import heavy optional modules: {sorted(imported)}"
+
+    print(
+        "Phase 5 crop render checks: "
+        f"max_rgba_diff={max_rgba_diff}; max_alpha_diff={max_alpha_diff}; "
+        f"tiles {crop_tiles}/{full_tiles}; crop_shape={cropped.rgba.shape}"
+    )
+
+
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
     rgb, _, settings = _edge_fringe_fixture(key_color)
     before_settings = replace(
@@ -1618,6 +1701,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase2_linear_color_tests()
         run_phase3_guided_alpha_tests()
         run_phase4_tile_local_screen_tests()
+        run_phase5_crop_render_tests()
     run_optional_ai_seam_tests()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

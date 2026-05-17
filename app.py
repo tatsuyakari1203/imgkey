@@ -1334,6 +1334,7 @@ class MainWindow(QMainWindow):
             x0, y0, x1, y1 = crop
             settings.full_res_crop = crop
             settings.preview_scale = 1.0
+            settings.use_tiling = True
             display_rgb = self.full_rgb[y0:y1, x0:x1].copy()
             display_alpha = None if self.full_alpha is None else self.full_alpha[y0:y1, x0:x1].copy()
             return PreviewJob(
