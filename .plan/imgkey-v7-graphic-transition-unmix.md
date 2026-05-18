@@ -538,7 +538,10 @@ Isolation:
 - Own `smoke_test.py` and `.artifact/` diagnostics only. No algorithm changes except test-driven bug fixes.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Promoted transition-unmix fixtures into strict before/after regression gates, added manual keep/remove and source-alpha assertions, retained Imported Matte coverage, and added `--write-transition-unmix-diagnostics` under `.artifact/transition-unmix-diagnostics/`.
 
 
 #### P4.1 - Promote baseline fixtures into strict regressions
@@ -554,7 +557,7 @@ Acceptance:
 - New strict gates cover manual masks and source-alpha cap.
 
 Status:
-- Planned
+- Complete
 
 
 #### P4.2 - Add required assertions and diagnostics
@@ -589,7 +592,7 @@ Acceptance:
 - Optional diagnostics command/flag, if added, writes only under `.artifact/`.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -600,7 +603,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 5 - UI controls and defaults
 
 Category:
@@ -647,7 +650,7 @@ Status:
 
 
 Current:
-- No
+- Yes
 ### Phase 6 - Classical GPU runtime and kernels
 
 Category:
@@ -868,7 +871,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 4 next: promote the transition fixtures/metrics into diagnostics-only follow-up gates without changing the Phase 3 color algorithm.
+Planner can assign Phase 5 next: add classical transition-unmix UI controls and defaults without reintroducing AI UI surface.
 
 
 

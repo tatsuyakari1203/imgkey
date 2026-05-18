@@ -44,6 +44,7 @@ from keyer import (
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
+TRANSITION_UNMIX_DIAGNOSTIC_DIR = Path(".artifact") / "transition-unmix-diagnostics"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -77,6 +78,9 @@ class DiagnosticFixture:
     expected_alpha: np.ndarray | None = None
     expected_foreground_rgb: np.ndarray | tuple[int, int, int] | None = None
     original_alpha: np.ndarray | None = None
+    keep_mask: np.ndarray | None = None
+    remove_mask: np.ndarray | None = None
+    alpha_hint: np.ndarray | None = None
     diagnostic_only: bool = True
 
 
@@ -189,6 +193,23 @@ def _expected_rgba_for_fixture(fixture: DiagnosticFixture) -> np.ndarray | None:
     rgba[:, :, 3] = alpha_u8
     rgba[alpha_u8 == 0, :3] = 0
     return rgba
+
+
+def _process_fixture_result(
+    fixture: DiagnosticFixture,
+    settings: KeySettings | None = None,
+    *,
+    include_debug: bool = True,
+) -> KeyResult:
+    return process_key_image(
+        fixture.rgb,
+        settings or fixture.settings,
+        fixture.original_alpha,
+        keep_mask=fixture.keep_mask,
+        remove_mask=fixture.remove_mask,
+        alpha_hint=fixture.alpha_hint,
+        include_debug=include_debug,
+    )
 
 
 def _fixture_masks(fixture: DiagnosticFixture) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -730,6 +751,34 @@ def source_alpha_cap_transition_fixture() -> DiagnosticFixture:
     )
 
 
+def manual_keep_transition_fixture() -> DiagnosticFixture:
+    base = red_slash_green_transition_fixture()
+    h, w = base.rgb.shape[:2]
+    yy, xx = np.indices((h, w))
+    band = (xx >= 88) & (xx <= 226) & (yy >= 34) & (yy <= 176)
+    keep = band & (base.soft_edge_mask.astype(bool) | base.foreground_core_mask.astype(bool))
+    return replace(
+        base,
+        name="transition_manual_keep_transition_core",
+        notes="v7 regression: manual keep mask crosses transition and core pixels and must remain authoritative.",
+        keep_mask=keep.astype(np.uint8) * 255,
+    )
+
+
+def manual_remove_transition_fixture() -> DiagnosticFixture:
+    base = red_slash_green_transition_fixture()
+    h, w = base.rgb.shape[:2]
+    yy, xx = np.indices((h, w))
+    band = (xx >= 88) & (xx <= 236) & (yy >= 30) & (yy <= 184)
+    remove = band & (base.soft_edge_mask.astype(bool) | base.known_background_mask.astype(bool))
+    return replace(
+        base,
+        name="transition_manual_remove_transition_background",
+        notes="v7 regression: manual remove mask crosses transition/background pixels and must force alpha/RGB zero.",
+        remove_mask=remove.astype(np.uint8) * 255,
+    )
+
+
 def transition_unmix_baseline_fixtures() -> list[DiagnosticFixture]:
     return [
         red_slash_green_transition_fixture(),
@@ -738,6 +787,14 @@ def transition_unmix_baseline_fixtures() -> list[DiagnosticFixture]:
         black_tape_edge_transition_fixture(),
         source_alpha_cap_transition_fixture(),
     ]
+
+
+def transition_unmix_manual_mask_fixtures() -> list[DiagnosticFixture]:
+    return [manual_keep_transition_fixture(), manual_remove_transition_fixture()]
+
+
+def transition_unmix_diagnostic_fixtures() -> list[DiagnosticFixture]:
+    return transition_unmix_baseline_fixtures() + transition_unmix_manual_mask_fixtures()
 
 
 def large_tile_gradient_runtime_fixture() -> DiagnosticFixture:
@@ -1150,6 +1207,21 @@ def alpha_detail_recall(expected_alpha: np.ndarray | None, actual_alpha_u8: np.n
     }
 
 
+def foreground_core_rgb_delta(fixture: DiagnosticFixture, result: KeyResult) -> dict[str, int | float]:
+    if fixture.expected_alpha is not None:
+        mask = (fixture.expected_alpha >= 0.999) & (result.alpha >= 250)
+    else:
+        _, foreground_core, _ = _fixture_masks(fixture)
+        mask = foreground_core & (result.alpha >= 250)
+    if not np.any(mask):
+        return {"count": 0, "max_delta": 0, "mean_delta": 0.0}
+    expected = _expected_foreground_array(fixture)
+    if expected is None:
+        expected = fixture.rgb
+    delta = np.abs(result.rgba[mask, :3].astype(np.int16) - expected[mask].astype(np.int16))
+    return {"count": int(delta.shape[0]), "max_delta": int(np.max(delta)), "mean_delta": float(np.mean(delta))}
+
+
 def _baseline_metrics_for_fixture(fixture: DiagnosticFixture, result: KeyResult) -> dict[str, Any]:
     known_background, foreground_core, soft_edge = _fixture_masks(fixture)
     expected_rgba = _expected_rgba_for_fixture(fixture)
@@ -1203,6 +1275,10 @@ def _transition_unmix_baseline_metrics_for_fixture(fixture: DiagnosticFixture, r
     if not np.any(transition_mask) and fixture.expected_alpha is not None:
         transition_mask = (fixture.expected_alpha > 0.0) & ~foreground_core
 
+    transition_key = edge_key_residual(result.rgba, fixture.settings.key_color, transition_mask)
+    detail_recall = alpha_detail_recall(fixture.expected_alpha, result.alpha)
+    core_delta = foreground_core_rgb_delta(fixture, result)
+    transparent = transparent_rgb_zero(result.rgba)
     metrics = _baseline_metrics_for_fixture(fixture, result)
     metrics.update(
         {
@@ -1212,9 +1288,12 @@ def _transition_unmix_baseline_metrics_for_fixture(fixture: DiagnosticFixture, r
                 foreground_core,
                 _expected_foreground_array(fixture),
             ),
-            "transition_key_residual": edge_key_residual(result.rgba, fixture.settings.key_color, transition_mask),
-            "alpha_detail_recall": alpha_detail_recall(fixture.expected_alpha, result.alpha),
+            "foreground_core_rgb_delta": core_delta,
+            "transition_key_residual": transition_key,
+            "key_residual_on_transition": transition_key,
+            "alpha_detail_recall": detail_recall,
             "background_alpha_leak": background_alpha_leak(result.alpha, known_background),
+            "transparent_rgb_residual_max": int(transparent["max_rgb_when_transparent"]),
             "composite_residuals": None,
         }
     )
@@ -1329,6 +1408,119 @@ def write_algorithm_upgrade_baseline() -> None:
     summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     print(f"wrote algorithm baseline metrics to {metrics_path}")
     print(f"wrote algorithm baseline summary to {summary_path}")
+
+
+def _transition_detail_region(fixture: DiagnosticFixture, result: KeyResult) -> np.ndarray:
+    _, foreground_core, soft_edge = _fixture_masks(fixture)
+    detail_region = soft_edge.copy()
+    if fixture.expected_alpha is not None:
+        detail_region |= (fixture.expected_alpha > 0.0) & ~foreground_core
+    if not np.any(detail_region):
+        detail_region = result.alpha > 0
+    return detail_region
+
+
+def _transition_unmix_comparison_metrics(
+    fixture: DiagnosticFixture,
+    baseline: KeyResult,
+    result: KeyResult,
+) -> dict[str, Any]:
+    before = _transition_unmix_baseline_metrics_for_fixture(fixture, baseline)
+    after = _transition_unmix_baseline_metrics_for_fixture(fixture, result)
+    alpha_delta = result.alpha.astype(np.int16) - baseline.alpha.astype(np.int16)
+    detail_region = _transition_detail_region(fixture, result)
+    return {
+        "fixture": fixture.name,
+        "key_residual_on_transition_before": before["key_residual_on_transition"],
+        "key_residual_on_transition_after": after["key_residual_on_transition"],
+        "alpha_detail_recall_before": before["alpha_detail_recall"],
+        "alpha_detail_recall_after": after["alpha_detail_recall"],
+        "foreground_core_rgb_delta": after["foreground_core_rgb_delta"],
+        "transparent_rgb_residual_max": after["transparent_rgb_residual_max"],
+        "composite_residuals_before": before["composite_residuals"],
+        "composite_residuals_after": after["composite_residuals"],
+        "alpha_recovered_pixel_count": int(np.count_nonzero(alpha_delta[detail_region] > 0)),
+        "alpha_delta_min_on_detail": int(alpha_delta[detail_region].min()) if np.any(detail_region) else 0,
+        "alpha_delta_max_on_detail": int(alpha_delta[detail_region].max()) if np.any(detail_region) else 0,
+    }
+
+
+def _foreground_reference_validity_for_diagnostics(fixture: DiagnosticFixture, result: KeyResult) -> np.ndarray | None:
+    if result.background_mask is None or result.screen_probability is None or result.fringe_mask is None:
+        return None
+    labels, label_to_flat, distance = _build_nearest_inner_reference_map(
+        result.alpha,
+        result.background_mask > 0,
+        result.screen_probability,
+        result.fringe_mask,
+        fixture.settings,
+    )
+    if labels is None or label_to_flat is None or distance is None:
+        return None
+    radius = int(np.clip(int(fixture.settings.foreground_reference_radius), 0, np.iinfo(np.uint16).max - 1))
+    return (labels > 0) & (distance <= radius)
+
+
+def write_transition_unmix_diagnostics() -> None:
+    TRANSITION_UNMIX_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"writing transition-unmix diagnostics to {TRANSITION_UNMIX_DIAGNOSTIC_DIR}")
+    all_metrics: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --write-transition-unmix-diagnostics",
+        "fixtures": {},
+    }
+    for fixture in transition_unmix_diagnostic_fixtures():
+        baseline = _process_fixture_result(fixture, replace(fixture.settings, transition_unmix=False))
+        result = _process_fixture_result(fixture)
+        metrics = _transition_unmix_comparison_metrics(fixture, baseline, result)
+        all_metrics["fixtures"][fixture.name] = metrics
+
+        expected_rgba = _expected_rgba_for_fixture(fixture)
+        transition_mask = _transition_detail_region(fixture, result)
+        reference_valid = _foreground_reference_validity_for_diagnostics(fixture, result)
+        alpha_delta = np.maximum(result.alpha.astype(np.int16) - baseline.alpha.astype(np.int16), 0).astype(np.uint8)
+
+        _save_rgb(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_source.png", fixture.rgb)
+        _save_rgb(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_baseline_rgb.png", baseline.rgba[:, :, :3])
+        _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_baseline_alpha.png", baseline.alpha)
+        _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_transition_mask.png", transition_mask)
+        _save_mask(
+            TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_foreground_reference_valid.png",
+            reference_valid,
+            fixture.rgb.shape[:2],
+        )
+        _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_alpha_recovered.png", alpha_delta)
+        _save_rgb(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_repaired_rgb.png", result.rgba[:, :, :3])
+        _save_rgba(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_result.png", result.rgba)
+        if fixture.keep_mask is not None:
+            _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_keep_mask.png", fixture.keep_mask)
+        if fixture.remove_mask is not None:
+            _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_remove_mask.png", fixture.remove_mask)
+        if fixture.original_alpha is not None:
+            _save_mask(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_source_alpha.png", fixture.original_alpha)
+
+        for background_name, color in (
+            ("black", (0, 0, 0)),
+            ("white", (255, 255, 255)),
+            ("gray", (128, 128, 128)),
+            ("checker", None),
+        ):
+            actual = checkerboard_composite(result.rgba) if color is None else _solid_composite(result.rgba, color)
+            _save_rgb(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_composite_{background_name}.png", actual)
+            if expected_rgba is not None:
+                expected = checkerboard_composite(expected_rgba) if color is None else _solid_composite(expected_rgba, color)
+                _save_rgb(TRANSITION_UNMIX_DIAGNOSTIC_DIR / f"{fixture.name}_expected_composite_{background_name}.png", expected)
+
+        print(
+            f"transition diagnostic {fixture.name}: "
+            f"residual_mean={metrics['key_residual_on_transition_before']['mean_positive_excess']:.2f}"
+            f"->{metrics['key_residual_on_transition_after']['mean_positive_excess']:.2f}; "
+            f"recovered={metrics['alpha_recovered_pixel_count']}"
+        )
+
+    metrics_path = TRANSITION_UNMIX_DIAGNOSTIC_DIR / "metrics.json"
+    metrics_path.write_text(json.dumps(_json_ready(all_metrics), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"wrote transition-unmix metrics to {metrics_path}")
 
 
 def _load_algorithm_baseline_metrics() -> dict[str, Any]:
@@ -2182,38 +2374,37 @@ def run_transition_unmix_baseline_tests() -> None:
     improved_residual_count = 0
     total_recovered_pixels = 0
     for fixture in transition_unmix_baseline_fixtures():
-        baseline = process_key_image(
-            fixture.rgb,
-            replace(fixture.settings, transition_unmix=False),
-            fixture.original_alpha,
-        )
-        result = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha)
-        alpha_only = process_key_image(
-            fixture.rgb,
+        baseline = _process_fixture_result(fixture, replace(fixture.settings, transition_unmix=False))
+        result = _process_fixture_result(fixture)
+        alpha_only = _process_fixture_result(
+            fixture,
             replace(
                 fixture.settings,
                 key_vector_despill=0.0,
                 foreground_reference_pull=0.0,
                 preserve_foreground_luma=0.0,
             ),
-            fixture.original_alpha,
         )
         assert np.array_equal(result.alpha, alpha_only.alpha), (
             f"{fixture.name}: RGB transition cleanup knobs must not mutate recovered global alpha"
         )
         assert np.array_equal(result.alpha, result.rgba[:, :, 3]), f"{fixture.name}: debug alpha must match output alpha channel"
-        export = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha, include_debug=False)
-        compat = process_chroma_key(fixture.rgb, fixture.settings, fixture.original_alpha)
+        export = _process_fixture_result(fixture, include_debug=False)
+        compat = process_chroma_key(
+            fixture.rgb,
+            fixture.settings,
+            fixture.original_alpha,
+            keep_mask=fixture.keep_mask,
+            remove_mask=fixture.remove_mask,
+            alpha_hint=fixture.alpha_hint,
+        )
         assert np.array_equal(export.rgba, compat), f"{fixture.name}: export wrapper must match low-memory render"
         assert np.array_equal(export.rgba, result.rgba), f"{fixture.name}: preview/debug render must match export RGB cleanup"
         metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, result)
         baseline_metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, baseline)
+        comparison = _transition_unmix_comparison_metrics(fixture, baseline, result)
         known_background, foreground_core, soft_edge = _fixture_masks(fixture)
-        detail_region = soft_edge.copy()
-        if fixture.expected_alpha is not None:
-            detail_region |= (fixture.expected_alpha > 0.0) & ~foreground_core
-        if not np.any(detail_region):
-            detail_region = result.alpha > 0
+        detail_region = _transition_detail_region(fixture, result)
         alpha_delta = result.alpha.astype(np.int16) - baseline.alpha.astype(np.int16)
         assert int(alpha_delta[detail_region].min()) >= 0, (
             f"{fixture.name}: transition alpha recovery must never erode detail alpha"
@@ -2232,11 +2423,18 @@ def run_transition_unmix_baseline_tests() -> None:
         residual = metrics["transition_key_residual"]
         baseline_residual = baseline_metrics["transition_key_residual"]
         recall = metrics["alpha_detail_recall"]
+        baseline_recall = baseline_metrics["alpha_detail_recall"]
         assert transparent["ok"], (
             f"{fixture.name}: transparent output RGB must stay zero, max={transparent['max_rgb_when_transparent']}"
         )
+        assert metrics["transparent_rgb_residual_max"] == 0, f"{fixture.name}: transparent RGB residual must be zero"
         if core_delta["count"]:
             assert core_delta["max_delta"] <= 8, f"{fixture.name}: hard/core RGB drift too high: {core_delta}"
+        foreground_delta = metrics["foreground_core_rgb_delta"]
+        if foreground_delta["count"]:
+            assert foreground_delta["max_delta"] <= 5, (
+                f"{fixture.name}: foreground core RGB delta must stay <=5: {foreground_delta}"
+            )
         if fixture.expected_alpha is not None and fixture.expected_foreground_rgb is not None:
             exact_core = (fixture.expected_alpha >= 0.999) & (result.alpha >= 250)
             expected_rgb = _expected_foreground_array(fixture)
@@ -2246,6 +2444,12 @@ def run_transition_unmix_baseline_tests() -> None:
                 )
                 assert exact_delta <= 5, f"{fixture.name}: exact opaque foreground core drift too high: {exact_delta}"
         assert recall["visible_recall"] >= 0.65, f"{fixture.name}: diagnostic detail recall unexpectedly low: {recall}"
+        assert recall["visible_recall"] >= baseline_recall["visible_recall"], (
+            f"{fixture.name}: detail visible recall decreased: {baseline_recall} -> {recall}"
+        )
+        assert recall["mean_alpha_ratio"] + 1e-6 >= baseline_recall["mean_alpha_ratio"], (
+            f"{fixture.name}: detail alpha recall decreased: {baseline_recall} -> {recall}"
+        )
         assert residual["max_positive_excess"] <= baseline_residual["max_positive_excess"], (
             f"{fixture.name}: transition RGB repair worsened max key residual: {baseline_residual} -> {residual}"
         )
@@ -2258,6 +2462,10 @@ def run_transition_unmix_baseline_tests() -> None:
             or residual["max_positive_excess"] < baseline_residual["max_positive_excess"]
         )
         assert improved, f"{fixture.name}: transition key residual should decrease: {baseline_residual} -> {residual}"
+        assert residual["mean_positive_excess"] < baseline_residual["mean_positive_excess"], (
+            f"{fixture.name}: transition key residual mean must decrease: {baseline_residual} -> {residual}"
+        )
+        _assert_transition_composites_do_not_worsen(fixture, baseline_metrics, metrics)
         improved_residual_count += 1
 
         if fixture.name == "transition_black_tape_edge":
@@ -2274,21 +2482,20 @@ def run_transition_unmix_baseline_tests() -> None:
             assert int(result.rgba[white_pixels, :3].min()) >= 252, f"{fixture.name}: white edges must stay white"
             assert int(result.rgba[black_pixels, :3].max()) <= 3, f"{fixture.name}: black line edges must stay black"
         if fixture.original_alpha is not None:
-            cap_u8 = np.rint(np.clip(fixture.original_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
-            over_cap = int(np.maximum(result.alpha.astype(np.int16) - cap_u8.astype(np.int16), 0).max())
-            assert over_cap <= 1, f"{fixture.name}: output alpha exceeded source-alpha cap by {over_cap}"
-            transparent_source = cap_u8 == 0
-            assert result.rgba[transparent_source, :3].max() == 0, f"{fixture.name}: source-transparent RGB must be zeroed"
+            _assert_transition_source_alpha_cap(fixture, result)
 
         checker = (metrics.get("composite_residuals") or {}).get("checker", {})
         summaries.append(
             f"{fixture.name}: residual_max={baseline_residual['max_positive_excess']}->{residual['max_positive_excess']} "
-            f"core_delta={core_delta['max_delta']} recall={recall['visible_recall']:.3f} "
-            f"bg_leak={leak['max_alpha']} checker_mean={checker.get('mean_abs_error', 0.0):.2f}"
+            f"core_delta={foreground_delta['max_delta']} recall={recall['visible_recall']:.3f} "
+            f"bg_leak={leak['max_alpha']} checker_mean={checker.get('mean_abs_error', 0.0):.2f} "
+            f"recovered={comparison['alpha_recovered_pixel_count']}"
         )
 
     assert improved_residual_count == len(transition_unmix_baseline_fixtures()), "all transition fixtures should improve key residual"
     assert total_recovered_pixels > 0, "v7 alpha recovery should raise plausible transition pixels on diagnostic fixtures"
+    _assert_transition_manual_mask_regressions()
+    _assert_transition_imported_matte_regression()
     _assert_transition_rgb_repair_helper_contract()
     _assert_transition_unmix_mask_helpers()
     _assert_transition_foreground_reference_radius()
@@ -2296,6 +2503,112 @@ def run_transition_unmix_baseline_tests() -> None:
     print("Phase 3 transition-unmix RGB checks:")
     for line in summaries:
         print(f"  {line}")
+
+
+def _assert_transition_composites_do_not_worsen(
+    fixture: DiagnosticFixture,
+    baseline_metrics: dict[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    before = baseline_metrics.get("composite_residuals") or {}
+    after = metrics.get("composite_residuals") or {}
+    for background_name in ("black", "white", "gray", "checker"):
+        before_bg = before.get(background_name)
+        after_bg = after.get(background_name)
+        if not isinstance(before_bg, dict) or not isinstance(after_bg, dict):
+            continue
+        assert after_bg["mean_abs_error"] <= before_bg["mean_abs_error"] + 1e-6, (
+            f"{fixture.name}: {background_name} composite mean residual worsened: {before_bg} -> {after_bg}"
+        )
+        assert after_bg["max_abs_error"] <= before_bg["max_abs_error"], (
+            f"{fixture.name}: {background_name} composite max residual worsened: {before_bg} -> {after_bg}"
+        )
+
+
+def _assert_transition_source_alpha_cap(fixture: DiagnosticFixture, result: KeyResult) -> None:
+    assert fixture.original_alpha is not None
+    cap_u8 = np.rint(np.clip(fixture.original_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    over_cap = int(np.maximum(result.alpha.astype(np.int16) - cap_u8.astype(np.int16), 0).max())
+    assert over_cap <= 1, f"{fixture.name}: output alpha exceeded source-alpha cap by {over_cap}"
+
+    semi_transparent_source = (cap_u8 > 0) & (cap_u8 < 255)
+    assert np.any(semi_transparent_source), f"{fixture.name}: source-alpha fixture must contain semi-transparent pixels"
+    semi_over_cap = int(
+        np.maximum(result.alpha[semi_transparent_source].astype(np.int16) - cap_u8[semi_transparent_source].astype(np.int16), 0).max()
+    )
+    assert semi_over_cap <= 1, f"{fixture.name}: semi-transparent source alpha cap exceeded by {semi_over_cap}"
+
+    transparent_source = cap_u8 == 0
+    assert np.any(transparent_source), f"{fixture.name}: source-alpha fixture must contain fully transparent pixels"
+    assert int(fixture.rgb[transparent_source, :3].max()) > 0, (
+        f"{fixture.name}: transparent-source regression must include nonzero source RGB"
+    )
+    assert int(result.alpha[transparent_source].max()) == 0, f"{fixture.name}: source-transparent alpha must remain zero"
+    assert int(result.rgba[transparent_source, :3].max()) == 0, f"{fixture.name}: source-transparent RGB must be zeroed"
+
+
+def _assert_transition_manual_mask_regressions() -> None:
+    keep_fixture = manual_keep_transition_fixture()
+    keep_result = _process_fixture_result(keep_fixture)
+    keep_baseline = _process_fixture_result(keep_fixture, replace(keep_fixture.settings, transition_unmix=False))
+    keep = keep_fixture.keep_mask.astype(bool)
+    assert np.any(keep), "manual keep transition fixture must contain keep pixels"
+    _, keep_core, keep_soft = _fixture_masks(keep_fixture)
+    keep_core &= keep
+    keep_transition = keep_soft & keep
+    assert np.any(keep_core), "manual keep fixture must cover foreground core"
+    assert np.any(keep_transition), "manual keep fixture must cover transition pixels"
+    assert int(keep_result.alpha[keep].min()) == 255, "manual keep must force kept transition/core alpha to 255"
+    assert int((keep_result.alpha.astype(np.int16) - keep_baseline.alpha.astype(np.int16))[keep].min()) >= 0, (
+        "manual keep must not reduce alpha relative to transition-unmix-disabled baseline"
+    )
+    expected_rgb = _expected_foreground_array(keep_fixture)
+    assert expected_rgb is not None
+    keep_core_delta = int(
+        np.abs(keep_result.rgba[keep_core, :3].astype(np.int16) - expected_rgb[keep_core].astype(np.int16)).max()
+    )
+    assert keep_core_delta <= 5, f"manual keep must protect foreground core color, delta={keep_core_delta}"
+
+    remove_fixture = manual_remove_transition_fixture()
+    remove = remove_fixture.remove_mask.astype(bool)
+    assert np.any(remove), "manual remove transition fixture must contain remove pixels"
+    remove_result = _process_fixture_result(remove_fixture)
+    _, _, remove_soft = _fixture_masks(remove_fixture)
+    remove_transition = remove & remove_soft
+    remove_background = remove & remove_fixture.known_background_mask.astype(bool)
+    assert np.any(remove_transition), "manual remove fixture must cover transition pixels"
+    assert np.any(remove_background), "manual remove fixture must cover background pixels"
+    assert int(remove_result.alpha[remove].max()) == 0, "manual remove must force transition/background alpha to zero"
+    assert int(remove_result.rgba[remove, :3].max()) == 0, "manual remove must force transition/background RGB to zero"
+
+    overlap_fixture = replace(keep_fixture, remove_mask=keep_fixture.keep_mask)
+    overlap_result = _process_fixture_result(overlap_fixture)
+    assert int(overlap_result.alpha[keep].min()) == 255, "manual keep must override overlapping remove mask"
+
+
+def _assert_transition_imported_matte_regression() -> None:
+    fixture = red_slash_blue_transition_fixture()
+    h, w = fixture.rgb.shape[:2]
+    yy, xx = np.indices((h, w))
+    central_band = (xx >= 105) & (xx <= 210) & (yy >= 42) & (yy <= 170)
+    hint_region = fixture.soft_edge_mask.astype(bool) & central_band
+    assert np.any(hint_region), "imported matte transition regression must hint transition pixels"
+    alpha_hint = np.zeros((h, w), dtype=np.uint8)
+    alpha_hint[hint_region] = 255
+    settings = replace(fixture.settings, mode="ImportedMatte", alpha_hint_strength=1.0)
+    control = process_key_image(fixture.rgb, settings)
+    hinted = process_key_image(fixture.rgb, settings, alpha_hint=alpha_hint)
+    assert hinted.alpha_hint is not None and np.array_equal(hinted.alpha_hint, alpha_hint), "imported matte must be returned for debug/UI"
+    assert int((hinted.alpha.astype(np.int16) - control.alpha.astype(np.int16))[hint_region].min()) >= 0, (
+        "imported matte must not reduce hinted transition alpha"
+    )
+    assert int(hinted.alpha[hint_region].min()) == 255, "imported matte must protect hinted transition pixels as foreground"
+    if hinted.background_mask is not None:
+        connected_background = hinted.background_mask > 0
+        if np.any(connected_background):
+            assert int(hinted.alpha[connected_background].max()) == 0, "imported matte must keep connected background alpha zero"
+    transparent = transparent_rgb_zero(hinted.rgba)
+    assert transparent["ok"], f"imported matte path must preserve transparent RGB zeroing: {transparent}"
 
 
 def _assert_transition_rgb_repair_helper_contract() -> None:
@@ -2942,12 +3255,13 @@ def main(argv: list[str] | None = None) -> None:
         "--write-diagnostics",
         "--write-edge-repair-diagnostics",
         "--write-algorithm-baseline",
+        "--write-transition-unmix-diagnostics",
     }
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline]; "
+            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -2975,6 +3289,8 @@ def main(argv: list[str] | None = None) -> None:
         write_edge_repair_diagnostics()
     if "--write-algorithm-baseline" in args:
         write_algorithm_upgrade_baseline()
+    if "--write-transition-unmix-diagnostics" in args:
+        write_transition_unmix_diagnostics()
     print("smoke ok", rgba.shape)
 
 
