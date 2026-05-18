@@ -1,7 +1,7 @@
 # 09 - ImgKey Geometric Benchmark and Default Tuning
 
 Date: 2026-05-18
-Status: In progress
+Status: Completed
 Owner: ImgKey Classical Quality / Benchmarking
 Scope: Build a comprehensive synthetic asset benchmark, tune no-AI classical keyer defaults, and verify CPU/GPU parity.
 
@@ -77,9 +77,6 @@ Status:
 
 Current:
 - No
-
-
-
 
 #### P1.1 - Generate comprehensive ground-truth asset fixtures
 - Add deterministic fixture generator(s) in `smoke_test.py` or a small test helper:
@@ -166,9 +163,6 @@ Status:
 Current:
 - No
 
-
-
-
 #### P2.1 - Add candidate profiles
 - Evaluate at least:
   1. current app default,
@@ -242,9 +236,6 @@ Status:
 Current:
 - No
 
-
-
-
 #### P3.1 - Update default or add named profile
 - If one profile wins robustly, update `APP_DEFAULT_SETTINGS`, reset behavior, and UI smoke expectations.
 - If screenshot strict profile is best only for graphic assets but risky elsewhere, add/rename preset such as `Asset Strict` while keeping safer `High Accuracy` default.
@@ -299,13 +290,10 @@ Isolation:
 - Verification/build only; no new tuning unless fixing failures.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
-
-
-
+- No
 
 #### P4.1 - Verification floor
 - Run:
@@ -330,16 +318,19 @@ python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
 ```
 
 Acceptance:
-- Final branch clean and pushed.
+- Final branch clean and ready for planner push.
 - Benchmark report documents chosen defaults and tradeoffs.
 - EXE sizes/hashes recorded if rebuilt.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- 2026-05-19: Completed the full verification/build floor with no source fixes required: CPU smoke, GPU parity, GPU benchmark, geometric benchmark artifact generation, geometric default tuning report, GPU runtime probe, compile/import checks, dependency/no-AI guards, default-startup no-torch check, compact CUDA native DLL build, default/GPU PyInstaller builds, EXE probe/archive checks, sanitized-PATH GPU probe, GUI lifetime probes, and `git diff --check`. Geometric summary is `.artifact/geometric-benchmark/summary.json`; tuning summary is `.artifact/geometric-benchmark/tuning_summary.json`. Rebuilt EXEs: `dist\ImgKey.exe` 100,128,081 bytes / 95.49 MiB / SHA256 `5D08CB91A218D2EA88ED9A97FD0F4CB334CB1FFFB9EE0BEF68FE66D01EEF7723`; `dist\ImgKey-GPU.exe` 102,043,235 bytes / 97.32 MiB / SHA256 `2929D30DDE473B0C0D182575C55F78A0CA8D1C5F945494303031B5F1E0FD7653`.
 
 
 ---
 
-## 5) Immediate next step
+## 5) Final state
 
-Start Phase 4 with `deep-worker`: run the remaining full verification/build floor, inspect final diffs, and prepare the branch for planner push.
+Phase 4 is complete and committed locally; planner should push the branch.
