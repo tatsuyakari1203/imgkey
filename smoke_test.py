@@ -2299,7 +2299,7 @@ def run_birefnet_adapter_manifest_tests() -> None:
         (snapshot / "birefnet.py").write_text("class BiRefNet: pass\n", encoding="utf-8")
         (snapshot / "model.safetensors").write_bytes(b"placeholder weights for manifest validation only")
         (snapshot / "README.md").write_text("---\nlicense: mit\n---\n", encoding="utf-8")
-        validation = adapter.validate_model_path(snapshot)
+        validation = adapter.validate_model_path(snapshot, verify_hashes=False)
         assert validation["ok"] is True, "validator must consume manifest for local snapshot layout"
         assert validation["config"]["architectures"] == ["BiRefNet"], "validator must check BiRefNet config architecture"
 

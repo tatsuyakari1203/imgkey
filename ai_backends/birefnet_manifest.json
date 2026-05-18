@@ -45,21 +45,21 @@
         "path": "config.json",
         "role": "transformers_config",
         "required": true,
-        "sha256": null,
+        "sha256": "c97ea21569daf66b205491a4635147dd3bc42c7c168b89d7d75b53f67ef548ae",
         "hash_required_for_default_runtime": false
       },
       {
         "path": "BiRefNet_config.py",
         "role": "transformers_remote_config_code",
         "required": true,
-        "sha256": null,
+        "sha256": "e7b8c2a74f6cea6a59553d517f71d47f2c1d90e670a13416af17c25fe2f3dc52",
         "hash_required_for_default_runtime": false
       },
       {
         "path": "birefnet.py",
         "role": "transformers_remote_model_code",
         "required": true,
-        "sha256": null,
+        "sha256": "208771ae626f653d64128fbf2d6ac9f8e645c5cc5e286258a73ec3322bbfe5ef",
         "hash_required_for_default_runtime": false
       },
       {
@@ -67,7 +67,7 @@
         "role": "model_weights",
         "required": true,
         "large_binary": true,
-        "sha256": null,
+        "sha256": "9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154",
         "hash_required_for_default_runtime": false,
         "expected_large_file": true
       },
@@ -75,7 +75,7 @@
         "path": "README.md",
         "role": "model_card_and_license_metadata",
         "required": true,
-        "sha256": null,
+        "sha256": "ceac4a1bb69b807eac5510bff80ff5599f606ef7458bee3b54b68d866e868532",
         "hash_required_for_default_runtime": false,
         "must_contain_any": [
           "license: mit",
@@ -125,8 +125,8 @@
     "notice_files": []
   },
   "hash_validation": {
-    "mode": "optional_until_bundled_snapshot_is_locked",
-    "rule": "At runtime, files with non-empty sha256 fields are verified exactly. Null sha256 fields mean existence/layout validation only. Packaging phases must fill hashes before redistributing a bundled model snapshot.",
+    "mode": "locked_for_bundled_snapshot",
+    "rule": "At runtime, files with non-empty sha256 fields are verified exactly. The selected required BiRefNet snapshot files are locked for bundled local builds; update hashes only after reviewing a new local snapshot.",
     "sha256_placeholder": null,
     "require_hashes_before_public_bundle": true
   },
