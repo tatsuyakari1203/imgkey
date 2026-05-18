@@ -113,6 +113,10 @@ class KeySettings:
     transition_alpha_max: int = 253
     preserve_foreground_luma: float = 0.85
 
+    # Optional no-AI GPU acceleration. Default is CPU/off so library callers and
+    # tests never import heavy tensor runtimes unless they opt in explicitly.
+    gpu_acceleration: str = "Off"
+
 
 @dataclass(slots=True)
 class KeyResult:
@@ -129,6 +133,7 @@ class KeyResult:
     fringe_mask: np.ndarray | None = None
     repaired_edge: np.ndarray | None = None
     foreground_rgb: np.ndarray | None = None
+    gpu_acceleration: dict | None = None
 
 
 @dataclass(slots=True)
@@ -243,6 +248,79 @@ def process_chroma_key(
     ).rgba
 
 
+def _gpu_acceleration_mode(settings: KeySettings) -> str:
+    raw = str(getattr(settings, "gpu_acceleration", "Off") or "Off").strip().lower().replace("_", " ")
+    if raw in {"auto", "automatic"}:
+        return "Auto"
+    if raw in {"force", "force gpu", "forced", "on"}:
+        return "Force GPU"
+    return "Off"
+
+
+def _new_gpu_stats(settings: KeySettings) -> dict:
+    mode = _gpu_acceleration_mode(settings)
+    return {
+        "mode": mode,
+        "status": "off" if mode == "Off" else "not_used",
+        "backend": None,
+        "attempted_tiles": 0,
+        "used_tiles": 0,
+        "fallback_tiles": 0,
+        "error_tiles": 0,
+        "elapsed_ms": 0.0,
+        "last_reason": None,
+        "last_message": "GPU acceleration is off; CPU color path used." if mode == "Off" else None,
+    }
+
+
+def _record_gpu_tile_result(gpu_stats: dict | None, result: dict) -> None:
+    if gpu_stats is None:
+        return
+    gpu_stats["attempted_tiles"] = int(gpu_stats.get("attempted_tiles", 0)) + 1
+    gpu_stats["backend"] = result.get("backend") or gpu_stats.get("backend")
+    elapsed_ms = result.get("elapsed_ms")
+    if elapsed_ms is not None:
+        gpu_stats["elapsed_ms"] = float(gpu_stats.get("elapsed_ms", 0.0)) + float(elapsed_ms)
+    if result.get("used"):
+        gpu_stats["used_tiles"] = int(gpu_stats.get("used_tiles", 0)) + 1
+        gpu_stats["status"] = "used"
+    else:
+        gpu_stats["fallback_tiles"] = int(gpu_stats.get("fallback_tiles", 0)) + 1
+        reason = result.get("reason")
+        if reason in {"torch_import_failed", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
+            gpu_stats["error_tiles"] = int(gpu_stats.get("error_tiles", 0)) + 1
+        if gpu_stats.get("status") != "used":
+            gpu_stats["status"] = "fallback"
+    if result.get("reason"):
+        gpu_stats["last_reason"] = result.get("reason")
+    if result.get("message"):
+        gpu_stats["last_message"] = result.get("message")
+
+
+def _finalize_gpu_stats(settings: KeySettings, gpu_stats: dict | None) -> dict:
+    stats = dict(gpu_stats or _new_gpu_stats(settings))
+    mode = _gpu_acceleration_mode(settings)
+    stats["mode"] = mode
+    if mode == "Off":
+        stats["status"] = "off"
+        stats["message"] = "GPU acceleration is off; CPU color path used."
+        return stats
+    used = int(stats.get("used_tiles", 0))
+    attempted = int(stats.get("attempted_tiles", 0))
+    fallback = int(stats.get("fallback_tiles", 0))
+    if used > 0:
+        backend = stats.get("backend") or "GPU"
+        stats["status"] = "used"
+        stats["message"] = f"{backend} transition repair used on {used} tile(s); CPU remained the reference/fallback for {fallback} tile(s)."
+    elif attempted > 0:
+        stats["status"] = "fallback"
+        stats["message"] = stats.get("last_message") or "GPU acceleration fell back to CPU for all attempted tiles."
+    else:
+        stats["status"] = "fallback"
+        stats["message"] = "No GPU-eligible transition tile was encountered; CPU color path used."
+    return stats
+
+
 def process_key_image(
     rgb_u8: np.ndarray,
     settings: KeySettings | None = None,
@@ -282,6 +360,7 @@ def process_key_image(
     _raise_if_cancelled(cancel_callback)
 
     crop = _normalized_crop(settings.full_res_crop, w, h)
+    gpu_stats = _new_gpu_stats(settings)
     rgba, despill_mask = _render_tiled_rgba(
         rgb,
         settings,
@@ -290,6 +369,7 @@ def process_key_image(
         cancel_callback,
         render_crop=crop,
         include_debug=include_debug,
+        gpu_stats=gpu_stats,
     )
     if include_debug:
         foreground = rgba[:, :, :3].copy()
@@ -328,6 +408,7 @@ def process_key_image(
         screen_color=global_matte.screen_color,
         alpha_hint=hint_out,
         fringe_mask=fringe_mask,
+        gpu_acceleration=_finalize_gpu_stats(settings, gpu_stats),
     )
 
 
@@ -1708,6 +1789,7 @@ def _render_tiled_rgba(
     *,
     render_crop: tuple[int, int, int, int] | None = None,
     include_debug: bool = True,
+    gpu_stats: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     h, w = rgb.shape[:2]
     crop = _normalized_crop(render_crop, w, h)
@@ -1842,6 +1924,7 @@ def _render_tiled_rgba(
             settings,
             transition_nearest_rgb=transition_inner_rgb,
             transition_nearest_valid=transition_inner_valid,
+            gpu_stats=gpu_stats,
         )
         rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
         if despill_mask is not None:
@@ -2124,6 +2207,7 @@ def _process_color_tile(
     settings: KeySettings,
     transition_nearest_rgb: np.ndarray | None = None,
     transition_nearest_valid: np.ndarray | None = None,
+    gpu_stats: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
     alpha = alpha_u8.astype(np.float32) / 255.0
@@ -2180,19 +2264,59 @@ def _process_color_tile(
         rgb_out[changed] = repaired[changed]
 
     if bool(settings.transition_unmix):
-        transition_rgb, transition_mask = _repair_transition_unmix(
-            rgb_tile,
-            alpha_u8,
-            background_mask,
-            edge_mask,
-            probability,
-            fringe_mask,
-            screen_color,
-            screen_tile,
-            nearest_inner_rgb if transition_nearest_rgb is None else transition_nearest_rgb,
-            nearest_inner_valid if transition_nearest_valid is None else transition_nearest_valid,
-            settings,
-        )
+        repair_nearest_rgb = nearest_inner_rgb if transition_nearest_rgb is None else transition_nearest_rgb
+        repair_nearest_valid = nearest_inner_valid if transition_nearest_valid is None else transition_nearest_valid
+        transition_rgb = transition_mask = None
+        gpu_mode = _gpu_acceleration_mode(settings)
+        if gpu_mode != "Off" and _transition_reference_enabled(settings):
+            gpu_result: dict
+            try:
+                import gpu_accel
+
+                gpu_result = gpu_accel.process_color_tile_gpu(
+                    rgb_tile,
+                    alpha_u8,
+                    background_mask,
+                    edge_mask,
+                    probability,
+                    fringe_mask,
+                    screen_tile,
+                    repair_nearest_rgb,
+                    repair_nearest_valid,
+                    screen_color,
+                    settings,
+                    force_gpu=gpu_mode == "Force GPU",
+                )
+            except Exception as exc:  # pragma: no cover - defensive backend boundary
+                gpu_result = {
+                    "ok": False,
+                    "used": False,
+                    "backend": "torch_cuda",
+                    "reason": "gpu_exception",
+                    "message": f"GPU transition repair failed before launch; CPU fallback is required: {type(exc).__name__}: {exc}",
+                    "elapsed_ms": None,
+                }
+            _record_gpu_tile_result(gpu_stats, gpu_result)
+            if gpu_result.get("used") and isinstance(gpu_result.get("rgb"), np.ndarray) and isinstance(gpu_result.get("repair_mask"), np.ndarray):
+                transition_rgb = gpu_result["rgb"]
+                transition_mask = gpu_result["repair_mask"]
+            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"torch_import_failed", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
+                raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but the CUDA backend is unavailable."))
+
+        if transition_rgb is None or transition_mask is None:
+            transition_rgb, transition_mask = _repair_transition_unmix(
+                rgb_tile,
+                alpha_u8,
+                background_mask,
+                edge_mask,
+                probability,
+                fringe_mask,
+                screen_color,
+                screen_tile,
+                repair_nearest_rgb,
+                repair_nearest_valid,
+                settings,
+            )
         transition_changed = live & (transition_mask > 0)
         if np.any(transition_changed):
             rgb_out[transition_changed] = transition_rgb[transition_changed]

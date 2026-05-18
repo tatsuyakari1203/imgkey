@@ -72,6 +72,7 @@ VIEW_MODES = (
 )
 BACKGROUND_MODES = ("Checkerboard", "Black", "White", "Gray", "Transparent")
 OUTPUT_MODES = ("Classical", "Imported Matte")
+GPU_ACCELERATION_MODES = ("Auto", "Off", "Force GPU")
 APP_DIR = Path(__file__).resolve().parent
 FROZEN_APP = bool(getattr(sys, "frozen", False))
 WRITABLE_APP_DIR = Path(sys.executable).resolve().parent if FROZEN_APP else APP_DIR
@@ -106,6 +107,7 @@ APP_DEFAULT_SETTINGS = KeySettings(
     alpha_recover_strength=0.85,
     key_vector_despill=0.75,
     foreground_reference_pull=0.65,
+    gpu_acceleration="Off",
 )
 
 
@@ -1075,12 +1077,21 @@ class MainWindow(QMainWindow):
         self.output_mode_status.setWordWrap(True)
         layout.addWidget(self.output_mode_status)
 
+        self.gpu_acceleration = QComboBox()
+        self.gpu_acceleration.setObjectName("GPUAccelerationCombo")
+        self.gpu_acceleration.addItems(GPU_ACCELERATION_MODES)
+        gpu_default = str(getattr(self.settings, "gpu_acceleration", "Off") or "Off")
+        self.gpu_acceleration.setCurrentText(gpu_default if gpu_default in GPU_ACCELERATION_MODES else "Off")
+        self.gpu_acceleration.setToolTip("Optional classical CUDA tensor acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
+        self.gpu_acceleration.currentTextChanged.connect(self._on_gpu_acceleration_changed)
+        layout.addLayout(label_row("GPU Acceleration", self.gpu_acceleration))
+
         self.gpu_status_btn = QPushButton("GPU Status")
         self.gpu_status_btn.setObjectName("GPUStatusButton")
         self.gpu_status_btn.clicked.connect(self.show_gpu_status)
         layout.addWidget(self.gpu_status_btn)
 
-        self.gpu_probe_status = QLabel("GPU Status: not probed")
+        self.gpu_probe_status = QLabel("GPU Status: acceleration off; CPU path used.")
         self.gpu_probe_status.setObjectName("HintText")
         self.gpu_probe_status.setWordWrap(True)
         layout.addWidget(self.gpu_probe_status)
@@ -1412,6 +1423,7 @@ class MainWindow(QMainWindow):
             alpha_recover_strength=float(self.alpha_recover.value()),
             key_vector_despill=float(self.key_vector_despill.value()),
             foreground_reference_pull=float(self.foreground_reference_pull.value()),
+            gpu_acceleration=self.gpu_acceleration.currentText() if hasattr(self, "gpu_acceleration") else "Off",
             luminance_protect=float(self.luminance_restore.value()),
             preview_scale=float(self.current_display_scale),
             use_tiling=True,
@@ -1588,11 +1600,14 @@ class MainWindow(QMainWindow):
                 self.color_chip.setStyleSheet(f"background: rgb({r}, {g}, {b});")
         engine_text = f" · engine RGB {result.screen_color}" if result.screen_color is not None else ""
         self.statusBar().showMessage(f"Preview ready · {job.label}{engine_text}")
+        self._sync_gpu_usage_status(result.gpu_acceleration)
         self._update_enabled_state()
 
     def on_preview_failed(self, generation: int, message: str) -> None:
         self._preview_jobs.pop(generation, None)
         if generation == self._preview_generation:
+            if hasattr(self, "gpu_probe_status") and self._message_mentions_gpu_backend(message):
+                self.gpu_probe_status.setText(f"GPU Status: error. {message}")
             self.on_failed(message)
 
     def _forget_preview_thread(self, thread: PreviewThread) -> None:
@@ -1659,6 +1674,8 @@ class MainWindow(QMainWindow):
         if "cancel" in message.lower():
             self.statusBar().showMessage("Export cancelled")
         else:
+            if hasattr(self, "gpu_probe_status") and self._message_mentions_gpu_backend(message):
+                self.gpu_probe_status.setText(f"GPU Status: error. {message}")
             self.on_failed(message, title="Export failed")
 
     def _export_finished(self) -> None:
@@ -1772,6 +1789,39 @@ class MainWindow(QMainWindow):
         else:
             text = "Output: Classical mode ignores imported mattes for preview/export."
         self.output_mode_status.setText(text)
+
+    def _on_gpu_acceleration_changed(self, mode: str) -> None:
+        self._sync_gpu_usage_status({"mode": mode, "status": "pending" if mode != "Off" else "off", "message": None})
+        if self.full_rgb is not None:
+            self.schedule_preview()
+
+    def _sync_gpu_usage_status(self, info: dict | None = None) -> None:
+        if not hasattr(self, "gpu_probe_status"):
+            return
+        mode = self.gpu_acceleration.currentText() if hasattr(self, "gpu_acceleration") else "Off"
+        if info is None:
+            if mode == "Off":
+                text = "GPU Status: acceleration off; CPU path used."
+            else:
+                text = f"GPU Status: {mode}; waiting for next preview/export. Use GPU Status to probe CUDA runtime."
+            self.gpu_probe_status.setText(text)
+            return
+        status = str(info.get("status") or "unknown")
+        message = str(info.get("message") or "")
+        backend = info.get("backend")
+        prefix = f"{status}"
+        if backend:
+            prefix += f" · {backend}"
+        if message:
+            self.gpu_probe_status.setText(f"GPU Status: {prefix}. {message}")
+        elif mode == "Off":
+            self.gpu_probe_status.setText("GPU Status: acceleration off; CPU path used.")
+        else:
+            self.gpu_probe_status.setText(f"GPU Status: {mode} · {prefix}; waiting for next preview/export.")
+
+    def _message_mentions_gpu_backend(self, message: str) -> bool:
+        lowered = str(message).lower()
+        return any(token in lowered for token in ("gpu", "cuda", "torch"))
 
     def show_gpu_status(self, checked: bool = False) -> None:
         del checked
@@ -2064,6 +2114,7 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(has_image and not export_running)
         self.export_matte_btn.setEnabled(has_result and not export_running)
         self.output_mode.setEnabled(not export_running)
+        self.gpu_acceleration.setEnabled(not export_running)
         self.import_keep_btn.setEnabled(has_image and not export_running)
         self.import_remove_btn.setEnabled(has_image and not export_running)
         self.import_hint_btn.setEnabled(has_image and not export_running)

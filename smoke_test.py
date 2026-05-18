@@ -11,6 +11,7 @@ import py_compile
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 import numpy as np
@@ -28,12 +29,15 @@ from keyer import (
     _build_tile_local_nearest_inner_rgb,
     _build_transition_repair_mask,
     _compute_key_spill_strength,
+    _compute_screen_probability_block,
     _estimate_screen_tile,
     _foreground_reference_for_slice,
     _guided_filter_gray,
     _linear_f32_to_srgb_u8,
+    _process_color_tile,
     _repair_transition_unmix,
     _srgb_u8_to_linear_f32,
+    _smoothstep,
     _tile_local_nearest_inner_radius,
     checkerboard_composite,
     process_chroma_key,
@@ -45,6 +49,7 @@ ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
 TRANSITION_UNMIX_DIAGNOSTIC_DIR = Path(".artifact") / "transition-unmix-diagnostics"
+GPU_BENCHMARK_DIR = Path(".artifact") / "gpu-benchmarks"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -2985,6 +2990,412 @@ def run_gpu_runtime_probe_tests() -> None:
     assert after_probe == before, f"fake gpu probe tests must not import heavy runtimes: {after_probe - before}"
 
 
+def _gpu_transition_tile(shape: tuple[int, int] = (96, 160)) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[int, int, int],
+    KeySettings,
+]:
+    h, w = shape
+    key_color = (30, 80, 235)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = np.asarray(key_color, dtype=np.uint8)
+    foreground = np.zeros((h, w, 3), dtype=np.uint8)
+    foreground[:, :] = (226, 28, 20)
+    x = np.linspace(0.0, 1.0, w, dtype=np.float32).reshape(1, w)
+    y = np.linspace(-0.10, 0.10, h, dtype=np.float32).reshape(h, 1)
+    alpha_f = np.clip((x + y - 0.10) / 0.78, 0.0, 1.0)
+    alpha_u8 = np.rint(alpha_f * 255.0).astype(np.uint8)
+    rgb = _composite_rgb_linear(background, foreground, alpha_f)
+    background_mask = alpha_u8 == 0
+    edge_mask = (alpha_u8 > 0) & (alpha_u8 < 255)
+    probability = np.rint((1.0 - alpha_f) * 255.0).astype(np.uint8)
+    fringe = np.where(edge_mask, 180, 0).astype(np.uint8)
+    nearest_valid = alpha_u8 > 0
+    settings = KeySettings(
+        key_color=key_color,
+        auto_border_sample=False,
+        clip_foreground=0.0,
+        transition_unmix=True,
+        alpha_recover_strength=0.0,
+        foreground_reference_pull=0.65,
+        key_vector_despill=0.75,
+        transition_reconstruction_error=0.08,
+        gpu_acceleration="Off",
+    )
+    return rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings
+
+
+def run_gpu_accel_backend_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert "torch" not in sys.modules, "gpu_accel backend tests start before torch is imported"
+    gpu_accel = importlib.import_module("gpu_accel")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing gpu_accel must not import heavy runtimes: {after_import - before}"
+
+    def missing_torch_loader() -> object:
+        raise ImportError("No module named 'torch'")
+
+    unavailable = gpu_accel.is_available(torch_loader=missing_torch_loader, refresh=True)
+    assert unavailable["available"] is False
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["reason"] == "torch_import_failed"
+    assert unavailable["backend"] == "torch_cuda"
+
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((32, 48))
+    fallback = gpu_accel.process_color_tile_gpu(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+        force_gpu=False,
+        torch_loader=missing_torch_loader,
+    )
+    assert fallback["ok"] is False and fallback["used"] is False
+    assert fallback["reason"] == "torch_import_failed"
+    assert "CPU" in fallback["message"] or "cpu" in fallback["message"].lower()
+    radius_disabled = gpu_accel.process_color_tile_gpu(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(settings, foreground_reference_radius=0),
+        force_gpu=True,
+        torch_loader=missing_torch_loader,
+    )
+    assert radius_disabled["used"] is False
+    assert radius_disabled["reason"] == "reference_radius_disabled"
+    preview_fallback = gpu_accel.process_preview_gpu()
+    assert preview_fallback["reason"] == "not_implemented"
+    assert preview_fallback["used"] is False
+
+    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_tests == before, f"fake gpu_accel tests must not import heavy runtimes: {after_tests - before}"
+
+
+def run_gpu_parity_tests() -> None:
+    gpu_accel = importlib.import_module("gpu_accel")
+    availability = gpu_accel.is_available(refresh=True)
+    if not availability.get("available"):
+        print(f"gpu parity skipped: {availability.get('reason')} - {availability.get('message')}")
+        return
+
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((128, 192))
+    cpu_rgb, cpu_mask = _repair_transition_unmix(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        key_color,
+        None,
+        foreground,
+        nearest_valid,
+        settings,
+    )
+    gpu = gpu_accel.process_color_tile_gpu(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(settings, gpu_acceleration="Force GPU"),
+        force_gpu=True,
+    )
+    assert gpu["used"] is True, f"GPU parity expected backend use, got {gpu.get('reason')}: {gpu.get('message')}"
+    gpu_rgb = gpu["rgb"]
+    gpu_mask = gpu["repair_mask"]
+    assert gpu_rgb is not None and gpu_mask is not None
+    max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - gpu_rgb.astype(np.int16))))
+    max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - gpu_mask.astype(np.int16))))
+    assert max_rgb_diff <= 2, f"GPU transition RGB parity max diff too high: {max_rgb_diff}"
+    assert max_mask_diff <= 2, f"GPU transition mask parity max diff too high: {max_mask_diff}"
+
+    cpu_tile, cpu_spill = _process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(settings, gpu_acceleration="Off"),
+    )
+    gpu_tile, gpu_spill = _process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(settings, gpu_acceleration="Force GPU"),
+    )
+    max_tile_diff = int(np.max(np.abs(cpu_tile.astype(np.int16) - gpu_tile.astype(np.int16))))
+    max_spill_diff = int(np.max(np.abs(cpu_spill.astype(np.int16) - gpu_spill.astype(np.int16))))
+    assert max_tile_diff <= 2, f"integrated GPU tile RGB parity max diff too high: {max_tile_diff}"
+    assert max_spill_diff <= 2, f"integrated GPU spill mask parity max diff too high: {max_spill_diff}"
+
+    disabled_settings = replace(settings, gpu_acceleration="Force GPU", foreground_reference_radius=0)
+    disabled = gpu_accel.process_color_tile_gpu(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        disabled_settings,
+        force_gpu=True,
+    )
+    assert disabled["used"] is False and disabled["reason"] == "reference_radius_disabled"
+    cpu_disabled, _ = _process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(disabled_settings, gpu_acceleration="Off"),
+    )
+    gpu_disabled, _ = _process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        disabled_settings,
+    )
+    assert np.array_equal(cpu_disabled, gpu_disabled), "Force GPU must honor disabled transition reference radius"
+
+    opaque_alpha = np.full_like(alpha_u8, 255)
+    opaque_background = np.zeros_like(background_mask, dtype=bool)
+    opaque_edge = np.zeros_like(edge_mask, dtype=bool)
+    opaque_probability = np.zeros_like(probability, dtype=np.uint8)
+    opaque_fringe = np.zeros_like(fringe, dtype=np.uint8)
+    opaque_noop = gpu_accel.process_color_tile_gpu(
+        foreground,
+        opaque_alpha,
+        opaque_background,
+        opaque_edge,
+        opaque_probability,
+        opaque_fringe,
+        None,
+        foreground,
+        np.ones_like(nearest_valid, dtype=bool),
+        key_color,
+        replace(settings, gpu_acceleration="Force GPU"),
+        force_gpu=True,
+    )
+    assert opaque_noop["used"] is False and opaque_noop["reason"] == "no_eligible_pixels"
+    print(
+        "gpu parity ok "
+        f"device={availability.get('device')} max_rgb_diff={max_rgb_diff} "
+        f"max_mask_diff={max_mask_diff} max_tile_diff={max_tile_diff}"
+    )
+
+
+def _median_time_ms(callback, *, repeat: int = 5, warmup: int = 1) -> float:
+    for _ in range(max(0, warmup)):
+        callback()
+    samples: list[float] = []
+    for _ in range(max(1, repeat)):
+        start = time.perf_counter()
+        callback()
+        samples.append((time.perf_counter() - start) * 1000.0)
+    return float(np.median(np.asarray(samples, dtype=np.float64)))
+
+
+def write_gpu_benchmarks() -> None:
+    gpu_accel = importlib.import_module("gpu_accel")
+    availability = gpu_accel.is_available(refresh=True)
+    GPU_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+    summary: dict[str, Any] = {
+        "generated_by": "python smoke_test.py --gpu-benchmark",
+        "availability": availability,
+        "benchmarks": {},
+    }
+    if not availability.get("available"):
+        (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"gpu benchmark skipped: {availability.get('reason')} - {availability.get('message')}")
+        return
+
+    torch = importlib.import_module("torch")
+    device_index = int(availability.get("device_index") or 0)
+    device = torch.device(f"cuda:{device_index}")
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((1024, 1024))
+    settings_gpu = replace(settings, gpu_acceleration="Force GPU")
+
+    def sync() -> None:
+        torch.cuda.synchronize(device)
+
+    def transfer_h2d() -> None:
+        _ = torch.from_numpy(rgb).to(device=device, dtype=torch.uint8)
+        sync()
+
+    gpu_rgb_cache = torch.from_numpy(rgb).to(device=device, dtype=torch.uint8)
+    sync()
+
+    def transfer_d2h() -> None:
+        _ = gpu_rgb_cache.detach().cpu().numpy()
+        sync()
+
+    h2d_ms = _median_time_ms(transfer_h2d, repeat=7, warmup=2)
+    d2h_ms = _median_time_ms(transfer_d2h, repeat=7, warmup=2)
+    summary["benchmarks"]["transfer_rgb_u8_1024"] = {"host_to_device_ms": h2d_ms, "device_to_host_ms": d2h_ms}
+
+    def cpu_transition() -> None:
+        _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
+
+    def gpu_transition() -> None:
+        result = gpu_accel.process_color_tile_gpu(
+            rgb,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe,
+            None,
+            foreground,
+            nearest_valid,
+            key_color,
+            settings_gpu,
+            force_gpu=True,
+        )
+        assert result["used"], result.get("message")
+
+    cpu_transition_ms = _median_time_ms(cpu_transition, repeat=5, warmup=1)
+    gpu_transition_ms = _median_time_ms(gpu_transition, repeat=5, warmup=2)
+    cpu_rgb, _ = _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
+    gpu_result = gpu_accel.process_color_tile_gpu(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings_gpu, force_gpu=True)
+    max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - gpu_result["rgb"].astype(np.int16))))
+    summary["benchmarks"]["transition_repair_color_tile_1024"] = {
+        "cpu_ms": cpu_transition_ms,
+        "gpu_ms_including_transfer": gpu_transition_ms,
+        "speedup": cpu_transition_ms / gpu_transition_ms if gpu_transition_ms > 0 else None,
+        "max_rgb_diff": max_rgb_diff,
+    }
+
+    random_prob = np.random.default_rng(7).random((1024, 1024), dtype=np.float32)
+
+    def cpu_alpha_smoothstep() -> None:
+        _smoothstep(0.10, 0.92, random_prob)
+
+    prob_gpu = torch.from_numpy(random_prob).to(device=device, dtype=torch.float32)
+    sync()
+
+    def gpu_alpha_smoothstep() -> None:
+        t = torch.clamp((prob_gpu - 0.10) / 0.82, 0.0, 1.0)
+        _ = t * t * (3.0 - 2.0 * t)
+        sync()
+
+    cpu_alpha_ms = _median_time_ms(cpu_alpha_smoothstep, repeat=9, warmup=2)
+    gpu_alpha_ms = _median_time_ms(gpu_alpha_smoothstep, repeat=9, warmup=2)
+    summary["benchmarks"]["alpha_smoothstep_arithmetic_1024"] = {
+        "cpu_ms": cpu_alpha_ms,
+        "gpu_ms_device_resident": gpu_alpha_ms,
+        "speedup_device_resident": cpu_alpha_ms / gpu_alpha_ms if gpu_alpha_ms > 0 else None,
+        "shipping_decision": "not_shipped_standalone_transfer_cost_and_matte_pipeline_branching",
+    }
+
+    def cpu_screen_probability() -> None:
+        _compute_screen_probability_block(rgb, key_color, settings)
+
+    rgb_gpu = torch.from_numpy(rgb).to(device=device, dtype=torch.float32).div(255.0)
+    key_gpu = torch.tensor(np.asarray(key_color, dtype=np.float32) / 255.0, device=device, dtype=torch.float32)
+    key_chroma = key_gpu / torch.clamp(torch.sum(key_gpu), min=1e-4)
+    luma_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=torch.float32)
+    sync()
+
+    def gpu_screen_probability_arithmetic() -> None:
+        total = torch.clamp(torch.sum(rgb_gpu, dim=2), min=1e-4)
+        chroma = rgb_gpu / total.unsqueeze(2)
+        chroma_dist = torch.linalg.vector_norm(chroma - key_chroma.view(1, 1, 3), dim=2)
+        luma = torch.sum(rgb_gpu * luma_weights.view(1, 1, 3), dim=2)
+        key_luma = torch.sum(key_gpu * luma_weights)
+        _ = chroma_dist + torch.abs(luma - key_luma)
+        sync()
+
+    cpu_screen_ms = _median_time_ms(cpu_screen_probability, repeat=5, warmup=1)
+    gpu_screen_ms = _median_time_ms(gpu_screen_probability_arithmetic, repeat=7, warmup=2)
+    summary["benchmarks"]["screen_probability_arithmetic_1024"] = {
+        "cpu_full_block_ms": cpu_screen_ms,
+        "gpu_chroma_luma_arithmetic_ms_device_resident": gpu_screen_ms,
+        "shipping_decision": "not_shipped_cpu_path_includes_hsv_and_connected_matte_steps",
+    }
+
+    rgba = np.dstack([rgb, alpha_u8]).astype(np.uint8)
+    bg = np.array([31, 35, 42], dtype=np.float32)
+
+    def cpu_preview_composite() -> None:
+        rgb_f = rgba[:, :, :3].astype(np.float32)
+        a = rgba[:, :, 3:4].astype(np.float32) / 255.0
+        _ = np.clip(np.rint(rgb_f * a + bg.reshape(1, 1, 3) * (1.0 - a)), 0, 255).astype(np.uint8)
+
+    rgba_gpu = torch.from_numpy(rgba).to(device=device, dtype=torch.float32)
+    bg_gpu = torch.tensor(bg, device=device, dtype=torch.float32).view(1, 1, 3)
+    sync()
+
+    def gpu_preview_composite() -> None:
+        a = rgba_gpu[:, :, 3:4] / 255.0
+        _ = torch.clamp(torch.round(rgba_gpu[:, :, :3] * a + bg_gpu * (1.0 - a)), 0, 255).to(torch.uint8)
+        sync()
+
+    cpu_preview_ms = _median_time_ms(cpu_preview_composite, repeat=7, warmup=2)
+    gpu_preview_ms = _median_time_ms(gpu_preview_composite, repeat=7, warmup=2)
+    summary["benchmarks"]["preview_composite_1024"] = {
+        "cpu_ms": cpu_preview_ms,
+        "gpu_ms_device_resident": gpu_preview_ms,
+        "shipping_decision": "not_shipped_preview_source_is_cpu_qimage_and_transfer_dominates",
+    }
+
+    (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"gpu benchmark summary written to {GPU_BENCHMARK_DIR / 'summary.json'}")
+
+
 def run_app_ui_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -3000,10 +3411,12 @@ def run_app_ui_tests() -> None:
     try:
         assert window.gpu_status_action.text() == "GPU Status"
         assert window.gpu_status_btn.text() == "GPU Status"
+        assert [window.gpu_acceleration.itemText(i) for i in range(window.gpu_acceleration.count())] == ["Auto", "Off", "Force GPU"]
         assert window.output_mode.findText("Classical") >= 0
         assert window.output_mode.findText("Imported Matte") >= 0
         assert window.alpha_hint_mask is None
         defaults = app_module.APP_DEFAULT_SETTINGS
+        assert window.gpu_acceleration.currentText() == defaults.gpu_acceleration
         assert window.transition_unmix.text() == "Transition Unmix"
         assert window.transition_unmix.isChecked() is bool(defaults.transition_unmix)
         assert abs(float(window.alpha_recover.value()) - defaults.alpha_recover_strength) < 1e-9
@@ -3014,6 +3427,7 @@ def run_app_ui_tests() -> None:
         assert abs(ui_settings.alpha_recover_strength - defaults.alpha_recover_strength) < 1e-9
         assert abs(ui_settings.key_vector_despill - defaults.key_vector_despill) < 1e-9
         assert abs(ui_settings.foreground_reference_pull - defaults.foreground_reference_pull) < 1e-9
+        assert ui_settings.gpu_acceleration == defaults.gpu_acceleration
 
         window.transition_unmix.setChecked(False)
         window.alpha_recover.set_value(0.0, emit=False)
@@ -3040,6 +3454,13 @@ def run_app_ui_tests() -> None:
         window.alpha_recover.set_value(0.84)
         assert window._preview_generation == generation + 1, "transition slider must schedule preview"
         assert window.canvas.transform().m11() == before_zoom, "transition slider must not reset viewer zoom"
+        window._preview_timer.stop()
+        generation = window._preview_generation
+        window.gpu_acceleration.setCurrentText("Auto")
+        assert window._preview_generation == generation + 1, "GPU acceleration mode change must schedule preview"
+        assert "Auto" in window.gpu_probe_status.text(), "GPU status label should reflect selected mode"
+        assert window.current_settings().gpu_acceleration == "Auto"
+        assert window._message_mentions_gpu_backend("torch.cuda unavailable")
         window._preview_timer.stop()
         window.full_rgb = None
         forbidden = ("Bi" + "RefNet", "Corridor" + "Key", "A" + "I Hint", "Hy" + "brid" + " Bi" + "RefNet")
@@ -3224,12 +3645,14 @@ def run_import_compile_tests() -> None:
         "app.py",
         "keyer.py",
         "smoke_test.py",
+        "gpu_accel.py",
         "gpu_runtime.py",
         "screen_analysis.py",
     ):
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
+    importlib.import_module("gpu_accel")
     importlib.import_module("gpu_runtime")
 
 
@@ -3252,6 +3675,7 @@ def run_source_surface_guard() -> None:
         Path("smoke_test.py"),
         Path("README.md"),
         Path("AGENTS.md"),
+        Path("gpu_accel.py"),
         Path("gpu_runtime.py"),
         Path("screen_analysis.py"),
         Path("ImgKey.spec"),
@@ -3295,12 +3719,14 @@ def main(argv: list[str] | None = None) -> None:
         "--write-edge-repair-diagnostics",
         "--write-algorithm-baseline",
         "--write-transition-unmix-diagnostics",
+        "--gpu-parity",
+        "--gpu-benchmark",
     }
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics]; "
+            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--gpu-parity] [--gpu-benchmark]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -3317,6 +3743,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
     run_gpu_runtime_probe_tests()
+    run_gpu_accel_backend_tests()
     run_app_ui_tests()
     run_v6_screen_analysis_tests()
     run_removed_surface_tests()
@@ -3330,6 +3757,10 @@ def main(argv: list[str] | None = None) -> None:
         write_algorithm_upgrade_baseline()
     if "--write-transition-unmix-diagnostics" in args:
         write_transition_unmix_diagnostics()
+    if "--gpu-parity" in args:
+        run_gpu_parity_tests()
+    if "--gpu-benchmark" in args:
+        write_gpu_benchmarks()
     print("smoke ok", rgba.shape)
 
 

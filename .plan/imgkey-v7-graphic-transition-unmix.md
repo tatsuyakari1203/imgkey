@@ -669,7 +669,10 @@ Isolation:
 - Own `gpu_runtime.py`, new `gpu_accel.py`/similar, optional dispatch hooks in `keyer.py`, and GPU parity tests. CPU path remains the reference.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Added lazy `gpu_accel.py` torch/CUDA tensor backend API, optional transition-repair GPU dispatch, GPU acceleration UI controls/status, fallback/import-fence coverage, CUDA parity tests, and `.artifact/gpu-benchmarks/` benchmark reporting. Shipped only the parity-tested transition color-tile repair kernel; screen-probability, smoothstep, and preview-composite probes remain unshipped benchmark-only paths.
 
 
 #### P6.1 - Define no-AI GPU backend API
@@ -691,7 +694,7 @@ Acceptance:
 - No AI/model package is imported or referenced.
 
 Status:
-- Planned
+- Complete
 
 
 #### P6.2 - Benchmark and ship only worthwhile kernels
@@ -708,7 +711,7 @@ Acceptance:
 - First shipped GPU path has CPU/GPU parity within tolerance and a measured speed win or documented fallback rationale.
 
 Status:
-- Planned
+- Complete
 
 
 #### P6.3 - Add GPU UI controls/status
@@ -724,7 +727,7 @@ Acceptance:
 - No AI wording appears.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -735,7 +738,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 7 - No-AI packaging
 
 Category:
@@ -779,7 +782,7 @@ Status:
 
 
 Current:
-- No
+- Yes
 ### Phase 8 - Full verification, build, and phase commit hygiene
 
 Category:
@@ -874,7 +877,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 6 next to deep-worker: define and verify the no-AI classical GPU backend/runtime path.
+Planner can assign Phase 7 next to deep-worker: update the no-AI packaging/runtime build flavor now that the classical GPU backend path exists.
 
 
 
