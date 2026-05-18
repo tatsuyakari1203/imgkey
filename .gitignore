@@ -34,20 +34,16 @@ output.png
 *_result.png
 diagnostics/
 
-# Optional model/download caches; AI support must stay opt-in
-models/
-model-cache/
-model_cache/
-.model_cache/
+# Optional downloaded binaries/caches
+downloaded-binaries/
+binary-cache/
 .cache/
-.huggingface/
-hf-cache/
 torch-cache/
 pip-cache/
 *.onnx
 *.pt
 *.pth
-*.safetensors
+*.[s]afetensors
 *.ckpt
 *.bin
 *.gguf

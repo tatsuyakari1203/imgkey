@@ -6,4 +6,3 @@
 # do not substitute old cu121/cu124 wheels for this flavor.
 --index-url https://download.pytorch.org/whl/cu128
 torch>=2.7
-torchvision>=0.22

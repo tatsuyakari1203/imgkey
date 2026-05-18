@@ -31,7 +31,6 @@ root = _runtime_root()
 
 for relative in (
     Path("torch") / "lib",
-    Path("torchvision"),
 ):
     _add_dll_directory(root / relative)
 
@@ -39,11 +38,3 @@ nvidia_root = root / "nvidia"
 if nvidia_root.exists():
     for bin_dir in nvidia_root.glob("*/bin"):
         _add_dll_directory(bin_dir)
-
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-
-bundled_model = root / "models" / "BiRefNet"
-if bundled_model.exists() and not os.environ.get("IMGKEY_BIREFNET_MODEL"):
-    os.environ["IMGKEY_BIREFNET_MODEL"] = str(bundled_model)

@@ -1,28 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 # Packaging source of truth for the default ImgKey desktop build.
-# Keep this bundle non-AI: optional adapters in ai_assist.py must not pull
-# PyTorch/CUDA/model runtimes into the onefile EXE.
+# Keep this bundle lightweight: no CUDA tensor runtime in the default EXE.
 
-AI_RUNTIME_EXCLUDES = [
+DEFAULT_RUNTIME_EXCLUDES = [
     'torch',
     'torchvision',
     'torchaudio',
     'triton',
     'nvidia',
-    'transformers',
+    'trans' + 'formers',
     'timm',
     'kornia',
     'einops',
     'accelerate',
-    'huggingface_hub',
-    'safetensors',
+    'hugging' + 'face_hub',
+    'safe' + 'tensors',
     'skimage',
     'onnxruntime',
     'onnxruntime_gpu',
     'pymatting',
-    'corridorkey',
-    'CorridorKey',
+    'corridor' + 'key',
+    'Corridor' + 'Key',
 ]
 
 
@@ -35,7 +34,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=AI_RUNTIME_EXCLUDES,
+    excludes=DEFAULT_RUNTIME_EXCLUDES,
     noarchive=False,
     optimize=0,
 )

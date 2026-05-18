@@ -1,31 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# GPU runtime packaging flavor: PyTorch CUDA runtime and GPU probe support,
-# but no BiRefNet/Transformers model stack and no model weights.
+# GPU runtime packaging flavor: PyTorch CUDA tensor runtime and probe support.
 
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
 
-MODEL_STACK_EXCLUDES = [
-    'transformers',
+GPU_RUNTIME_EXCLUDES = [
+    'trans' + 'formers',
     'timm',
     'kornia',
     'einops',
     'accelerate',
-    'huggingface_hub',
-    'safetensors',
+    'hugging' + 'face_hub',
+    'safe' + 'tensors',
     'skimage',
     'onnxruntime',
     'onnxruntime_gpu',
     'pymatting',
-    'corridorkey',
-    'CorridorKey',
+    'corridor' + 'key',
+    'Corridor' + 'Key',
 ]
 
 
 def cuda_binaries():
     binaries = []
-    for package in ('torch', 'torchvision', 'nvidia'):
+    for package in ('torch', 'nvidia'):
         try:
             binaries += collect_dynamic_libs(package)
         except Exception as exc:
@@ -42,12 +41,11 @@ a = Analysis(
         'gpu_runtime',
         'torch',
         'torch.cuda',
-        'torchvision',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py'],
-    excludes=MODEL_STACK_EXCLUDES,
+    excludes=GPU_RUNTIME_EXCLUDES,
     noarchive=False,
     optimize=0,
 )

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-import os
 from pathlib import Path
 import sys
-from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -45,14 +43,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ai_assist import BIREFNET_MODEL_ENV, BiRefNetAlphaAssist, CorridorKeyPlugin
 from keyer import (
     KeyResult,
     KeySettings,
     checkerboard_composite,
     process_key_image,
-    read_alpha_hint_mask,
     read_grayscale_mask,
+    read_imported_matte_mask,
     read_image_rgb,
     resize_for_preview,
     write_grayscale_mask,
@@ -64,8 +61,7 @@ VIEW_MODES = (
     "Result",
     "Source",
     "Alpha",
-    "AI Hint",
-    "BiRefNet Alpha",
+    "Imported Matte",
     "Background Mask",
     "Edge Mask",
     "Fringe Mask",
@@ -74,13 +70,10 @@ VIEW_MODES = (
     "Split Compare",
 )
 BACKGROUND_MODES = ("Checkerboard", "Black", "White", "Gray", "Transparent")
-OUTPUT_MODES = ("Classical", "Manual AI Hint", "Hybrid BiRefNet")
+OUTPUT_MODES = ("Classical", "Imported Matte")
 APP_DIR = Path(__file__).resolve().parent
 FROZEN_APP = bool(getattr(sys, "frozen", False))
-FROZEN_BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
-BUNDLED_BIREFNET_MODEL_DIR = FROZEN_BUNDLE_DIR / "models" / "BiRefNet"
 WRITABLE_APP_DIR = Path(sys.executable).resolve().parent if FROZEN_APP else APP_DIR
-AI_UI_ARTIFACT_DIR = WRITABLE_APP_DIR / ".artifact" / "ai-ui"
 APP_DEFAULT_KEY_MODE = "Blue"
 APP_DEFAULT_EDGE_RADIUS = 32
 APP_DEFAULT_SETTINGS = KeySettings(
@@ -165,13 +158,6 @@ def app_default_settings() -> KeySettings:
     return replace(APP_DEFAULT_SETTINGS)
 
 
-def ai_worker_subprocess_command(request_path: Path) -> tuple[str, list[str]]:
-    args = ["--request", str(request_path), "--json"]
-    if FROZEN_APP:
-        return sys.executable, ["--imgkey-ai-worker", *args]
-    return sys.executable, [str(APP_DIR / "ai_worker.py"), *args]
-
-
 def gpu_probe_subprocess_command() -> tuple[str, list[str]]:
     if FROZEN_APP:
         return sys.executable, ["--gpu-probe", "--json"]
@@ -182,12 +168,6 @@ def dispatch_headless_cli(argv: list[str]) -> int | None:
     args = list(argv[1:])
     if not args:
         return None
-
-    if "--imgkey-ai-worker" in args:
-        worker_args = [arg for arg in args if arg != "--imgkey-ai-worker"]
-        from ai_worker import main as ai_worker_main
-
-        return ai_worker_main(worker_args)
 
     if "--gpu-probe" in args or "--imgkey-gpu-probe" in args:
         probe_args = [arg for arg in args if arg != "--imgkey-gpu-probe"]
@@ -207,7 +187,6 @@ class PreviewJob:
     keep_mask: np.ndarray | None
     remove_mask: np.ndarray | None
     alpha_hint: np.ndarray | None
-    biref_alpha: np.ndarray | None
     settings: KeySettings
     display_rgb: np.ndarray
     display_alpha: np.ndarray | None
@@ -243,7 +222,6 @@ class ImageCanvas(QGraphicsView):
 
         self.source_rgb: np.ndarray | None = None
         self.result: KeyResult | None = None
-        self.biref_alpha: np.ndarray | None = None
         self.display_scale = 1.0
         self.crop_origin = (0, 0)
         self.view_mode = "Result"
@@ -264,12 +242,10 @@ class ImageCanvas(QGraphicsView):
         *,
         display_scale: float,
         crop_origin: tuple[int, int],
-        biref_alpha: np.ndarray | None = None,
         reset_view: bool = True,
     ) -> None:
         self.source_rgb = source_rgb
         self.result = result
-        self.biref_alpha = biref_alpha
         self.display_scale = max(float(display_scale), 1e-6)
         self.crop_origin = crop_origin
         self._refresh_pixmap(reset_view=reset_view)
@@ -277,11 +253,6 @@ class ImageCanvas(QGraphicsView):
     def set_result(self, result: KeyResult | None) -> None:
         self.result = result
         self._refresh_pixmap(reset_view=False)
-
-    def set_biref_alpha(self, alpha: np.ndarray | None) -> None:
-        self.biref_alpha = alpha
-        if self.view_mode == "BiRefNet Alpha":
-            self._refresh_pixmap(reset_view=False)
 
     def set_view_mode(self, mode: str) -> None:
         if mode not in VIEW_MODES:
@@ -402,15 +373,13 @@ class ImageCanvas(QGraphicsView):
             return None
         mode = self.view_mode
         result = self.result
-        if mode == "BiRefNet Alpha":
-            return mask_to_qimage(self.biref_alpha, self.source_rgb.shape[:2])
         if mode == "Source" or result is None:
             return rgb_to_qimage(self.source_rgb)
         if mode == "Result":
             return rgba_to_qimage(result.rgba)
         if mode == "Alpha":
             return mask_to_qimage(result.alpha, self.source_rgb.shape[:2])
-        if mode == "AI Hint":
+        if mode == "Imported Matte":
             return mask_to_qimage(result.alpha_hint, self.source_rgb.shape[:2])
         if mode == "Background Mask":
             return mask_to_qimage(result.background_mask, self.source_rgb.shape[:2])
@@ -696,7 +665,6 @@ class PreviewThread(QThread):
                 keep_mask=self.job.keep_mask,
                 remove_mask=self.job.remove_mask,
                 alpha_hint=self.job.alpha_hint,
-                biref_alpha=self.job.biref_alpha,
                 progress_callback=lambda value, stage: None
                 if self._cancel_requested
                 else self.progress.emit(self.generation, value, stage),
@@ -725,7 +693,6 @@ class ExportThread(QThread):
         keep_mask: np.ndarray | None,
         remove_mask: np.ndarray | None,
         alpha_hint: np.ndarray | None,
-        biref_alpha: np.ndarray | None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -735,7 +702,6 @@ class ExportThread(QThread):
         self.keep_mask = keep_mask
         self.remove_mask = remove_mask
         self.alpha_hint = alpha_hint
-        self.biref_alpha = biref_alpha
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -750,7 +716,6 @@ class ExportThread(QThread):
                 keep_mask=self.keep_mask,
                 remove_mask=self.remove_mask,
                 alpha_hint=self.alpha_hint,
-                biref_alpha=self.biref_alpha,
                 progress_callback=lambda value, stage: self.progress.emit(value, stage),
                 cancel_callback=lambda: self._cancel_requested,
                 include_debug=False,
@@ -786,13 +751,9 @@ class MainWindow(QMainWindow):
         self.keep_mask: np.ndarray | None = None
         self.remove_mask: np.ndarray | None = None
         self.alpha_hint_mask: np.ndarray | None = None
-        self.biref_alpha_mask: np.ndarray | None = None
-        self.biref_alpha_source: str | None = None
         self.last_sample_rgb: tuple[int, int, int] | None = None
         self.last_cursor_rgb: tuple[int, int, int] | None = None
         self.settings = app_default_settings()
-        self.birefnet_capability = BiRefNetAlphaAssist.from_environment().capability()
-        self.corridorkey_capability = CorridorKeyPlugin.from_environment().capability()
 
         self._preview_generation = 0
         self._preview_jobs: dict[int, PreviewJob] = {}
@@ -802,14 +763,7 @@ class MainWindow(QMainWindow):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._start_preview)
         self.export_thread: ExportThread | None = None
-        self.ai_worker_process: QProcess | None = None
-        self.ai_worker_generation = 0
-        self.ai_cancel_requested = False
-        self.ai_worker_request_path: Path | None = None
-        self.ai_worker_cancel_path: Path | None = None
-        self.ai_worker_temp_input_path: Path | None = None
         self.gpu_probe_process: QProcess | None = None
-        self.birefnet_state = "ready"
         self.last_gpu_probe: dict | None = None
         self._closing = False
 
@@ -819,8 +773,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self)
         self._sync_key_chip()
-        self._sync_ai_hint_status()
-        self._sync_birefnet_status()
+        self._sync_imported_matte_status()
         self._sync_output_mode_status()
         self._update_enabled_state()
 
@@ -935,16 +888,6 @@ class MainWindow(QMainWindow):
             export_tool_button.setObjectName("ToolbarPrimaryButton")
 
         toolbar.addSeparator()
-        self.generate_biref_action = QAction("Generate BiRefNet Hint", self)
-        self.generate_biref_action.setObjectName("GenerateBiRefNetHintAction")
-        self.generate_biref_action.triggered.connect(self.generate_birefnet_hint)
-        toolbar.addAction(self.generate_biref_action)
-
-        self.cancel_ai_action = QAction("Cancel AI", self)
-        self.cancel_ai_action.setObjectName("CancelAIAction")
-        self.cancel_ai_action.triggered.connect(self.cancel_ai)
-        toolbar.addAction(self.cancel_ai_action)
-
         self.gpu_status_action = QAction("GPU Status", self)
         self.gpu_status_action.setObjectName("GPUStatusAction")
         self.gpu_status_action.triggered.connect(self.show_gpu_status)
@@ -981,7 +924,6 @@ class MainWindow(QMainWindow):
         self._add_edge_section(layout)
         self._add_color_section(layout)
         self._add_output_section(layout)
-        self._add_ai_section(layout)
         layout.addStretch(1)
 
         scroll.setWidget(panel)
@@ -1096,86 +1038,12 @@ class MainWindow(QMainWindow):
             layout.addWidget(row)
         parent.addWidget(section)
 
-    def _add_ai_section(self, parent: QVBoxLayout) -> None:
-        section, layout = self._section("Optional AI Adapters")
-        info = QLabel("BiRefNet generation is opt-in. It creates a separate alpha hint; select Hybrid BiRefNet output mode to apply it. Classical and manual-hint modes remain isolated.")
-        info.setObjectName("HintText")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        biref_row = QHBoxLayout()
-        biref_row.setSpacing(8)
-        self.generate_birefnet_btn = QPushButton("Generate BiRefNet Hint")
-        self.generate_birefnet_btn.setObjectName("GenerateBiRefNetHintButton")
-        self.generate_birefnet_btn.clicked.connect(self.generate_birefnet_hint)
-        self.cancel_ai_btn = QPushButton("Cancel AI")
-        self.cancel_ai_btn.setObjectName("CancelAIButton")
-        self.cancel_ai_btn.clicked.connect(self.cancel_ai)
-        self.gpu_status_btn = QPushButton("GPU Status")
-        self.gpu_status_btn.setObjectName("GPUStatusButton")
-        self.gpu_status_btn.clicked.connect(self.show_gpu_status)
-        biref_row.addWidget(self.generate_birefnet_btn)
-        biref_row.addWidget(self.cancel_ai_btn)
-        biref_row.addWidget(self.gpu_status_btn)
-        layout.addLayout(biref_row)
-
-        self.birefnet_status = QLabel("BiRefNet: model status unknown")
-        self.birefnet_status.setObjectName("HintText")
-        self.birefnet_status.setWordWrap(True)
-        layout.addWidget(self.birefnet_status)
-
-        self.gpu_probe_status = QLabel("GPU Status: not probed")
-        self.gpu_probe_status.setObjectName("HintText")
-        self.gpu_probe_status.setWordWrap(True)
-        layout.addWidget(self.gpu_probe_status)
-
-        toggle = QPushButton("Show legacy adapter status")
-        toggle.setObjectName("SecondaryToggleButton")
-        toggle.setCheckable(True)
-        layout.addWidget(toggle)
-
-        content = QFrame()
-        content.setObjectName("SecondaryPanel")
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(10, 10, 10, 10)
-        content_layout.setSpacing(8)
-
-        assist_row = QHBoxLayout()
-        assist_row.setSpacing(8)
-        self.birefnet_btn = QPushButton("Legacy BiRefNet Assist")
-        self.corridorkey_btn = QPushButton("CorridorKey Plugin")
-        self.birefnet_btn.setEnabled(False)
-        self.corridorkey_btn.setEnabled(False)
-        self.birefnet_btn.setToolTip(self.birefnet_capability.message)
-        self.corridorkey_btn.setToolTip(self.corridorkey_capability.message)
-        assist_row.addWidget(self.birefnet_btn)
-        assist_row.addWidget(self.corridorkey_btn)
-        content_layout.addLayout(assist_row)
-
-        self.ai_runtime_status = QLabel(
-            f"BiRefNet: {'ready' if self.birefnet_capability.available else 'disabled'} · "
-            f"CorridorKey: {'ready' if self.corridorkey_capability.available else 'disabled'}"
-        )
-        self.ai_runtime_status.setObjectName("HintText")
-        self.ai_runtime_status.setWordWrap(True)
-        self.ai_runtime_status.setToolTip(self.birefnet_capability.message + "\n\n" + self.corridorkey_capability.message)
-        content_layout.addWidget(self.ai_runtime_status)
-        content.setVisible(False)
-        layout.addWidget(content)
-
-        def toggle_content(checked: bool) -> None:
-            content.setVisible(checked)
-            toggle.setText("Hide legacy adapter status" if checked else "Show legacy adapter status")
-
-        toggle.toggled.connect(toggle_content)
-        parent.addWidget(section)
-
     def _add_output_section(self, parent: QVBoxLayout) -> None:
         section, layout = self._section("Masks & Export")
         self.output_mode = QComboBox()
         self.output_mode.setObjectName("OutputModeCombo")
         self.output_mode.addItems(OUTPUT_MODES)
-        self.output_mode.setToolTip("Classical ignores AI hints; Manual AI Hint uses an imported alpha hint; Hybrid BiRefNet uses the generated BiRefNet alpha as a hybrid detail hint.")
+        self.output_mode.setToolTip("Classical ignores imported mattes; Imported Matte uses a grayscale matte as foreground protection and alpha guidance.")
         self.output_mode.currentTextChanged.connect(self._on_output_mode_changed)
         layout.addLayout(label_row("Output Mode", self.output_mode))
 
@@ -1183,6 +1051,16 @@ class MainWindow(QMainWindow):
         self.output_mode_status.setObjectName("HintText")
         self.output_mode_status.setWordWrap(True)
         layout.addWidget(self.output_mode_status)
+
+        self.gpu_status_btn = QPushButton("GPU Status")
+        self.gpu_status_btn.setObjectName("GPUStatusButton")
+        self.gpu_status_btn.clicked.connect(self.show_gpu_status)
+        layout.addWidget(self.gpu_status_btn)
+
+        self.gpu_probe_status = QLabel("GPU Status: not probed")
+        self.gpu_probe_status.setObjectName("HintText")
+        self.gpu_probe_status.setWordWrap(True)
+        layout.addWidget(self.gpu_probe_status)
 
         self.preview_quality = QComboBox()
         self.preview_quality.addItems(("Proxy", "Full Crop"))
@@ -1198,22 +1076,22 @@ class MainWindow(QMainWindow):
         mask_row.addWidget(self.import_remove_btn)
         layout.addLayout(mask_row)
 
-        hint_info = QLabel("Optional alpha hints can protect foreground/core areas during preview and export.")
+        hint_info = QLabel("Optional imported mattes can protect foreground/core areas during preview and export.")
         hint_info.setObjectName("HintText")
         hint_info.setWordWrap(True)
         layout.addWidget(hint_info)
 
         hint_row = QHBoxLayout()
         hint_row.setSpacing(8)
-        self.import_hint_btn = QPushButton("Import AI Hint")
-        self.clear_hint_btn = QPushButton("Clear Hint")
-        self.import_hint_btn.clicked.connect(self.import_alpha_hint)
-        self.clear_hint_btn.clicked.connect(self.clear_alpha_hint)
+        self.import_hint_btn = QPushButton("Import Matte")
+        self.clear_hint_btn = QPushButton("Clear Matte")
+        self.import_hint_btn.clicked.connect(self.import_imported_matte)
+        self.clear_hint_btn.clicked.connect(self.clear_imported_matte)
         hint_row.addWidget(self.import_hint_btn)
         hint_row.addWidget(self.clear_hint_btn)
         layout.addLayout(hint_row)
 
-        self.alpha_hint_status = QLabel("Hint: none")
+        self.alpha_hint_status = QLabel("Imported matte: none")
         self.alpha_hint_status.setObjectName("HintText")
         self.alpha_hint_status.setWordWrap(True)
         layout.addWidget(self.alpha_hint_status)
@@ -1426,8 +1304,6 @@ class MainWindow(QMainWindow):
             self.load_image(Path(path))
 
     def load_image(self, path: Path) -> None:
-        if self._ai_worker_running():
-            self.cancel_ai(silent=True)
         try:
             full_rgb, full_alpha = read_image_rgb(path)
         except Exception as exc:
@@ -1440,9 +1316,6 @@ class MainWindow(QMainWindow):
         self.keep_mask = None
         self.remove_mask = None
         self.alpha_hint_mask = None
-        self.biref_alpha_mask = None
-        self.biref_alpha_source = None
-        self.birefnet_state = "ready"
         if hasattr(self, "output_mode"):
             self.output_mode.blockSignals(True)
             self.output_mode.setCurrentText("Classical")
@@ -1460,8 +1333,7 @@ class MainWindow(QMainWindow):
         h, w = self.full_rgb.shape[:2]
         self.resolution_status.setText(f"{w}×{h}")
         self.statusBar().showMessage(f"Loaded {path.name}")
-        self._sync_ai_hint_status()
-        self._sync_birefnet_status()
+        self._sync_imported_matte_status()
         self._sync_output_mode_status()
         self._update_enabled_state()
         self.schedule_preview()
@@ -1470,8 +1342,7 @@ class MainWindow(QMainWindow):
         key_mode = self.key_mode.currentText()
         output_mode = self.output_mode.currentText() if hasattr(self, "output_mode") else "Classical"
         engine_mode = {
-            "Manual AI Hint": "AIHint",
-            "Hybrid BiRefNet": "HybridBiRefNet",
+            "Imported Matte": "ImportedMatte",
         }.get(output_mode, "GraphicExact")
         radius = int(self.edge_radius.value())
         return KeySettings(
@@ -1505,14 +1376,10 @@ class MainWindow(QMainWindow):
             use_tiling=True,
         )
 
-    def _processing_alpha_inputs(self, settings: KeySettings, shape: tuple[int, int]) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if settings.mode == "AIHint":
-            return resize_alpha_hint_mask(self.alpha_hint_mask, shape), None
-        if settings.mode == "HybridBiRefNet":
-            if self.biref_alpha_mask is None:
-                raise ValueError("Hybrid BiRefNet output mode requires a generated BiRefNet Alpha hint first")
-            return None, resize_alpha_hint_mask(self.biref_alpha_mask, shape)
-        return None, None
+    def _processing_alpha_input(self, settings: KeySettings, shape: tuple[int, int]) -> np.ndarray | None:
+        if settings.mode == "ImportedMatte":
+            return resize_alpha_hint_mask(self.alpha_hint_mask, shape)
+        return None
 
     def schedule_preview(self) -> None:
         if self.full_rgb is None:
@@ -1577,7 +1444,7 @@ class MainWindow(QMainWindow):
                 self._full_crop_rect = self._current_full_crop()
             crop = self._full_crop_rect
             x0, y0, x1, y1 = crop
-            alpha_hint, biref_alpha = self._processing_alpha_inputs(settings, self.full_rgb.shape[:2])
+            alpha_hint = self._processing_alpha_input(settings, self.full_rgb.shape[:2])
             settings.full_res_crop = crop
             settings.preview_scale = 1.0
             settings.use_tiling = True
@@ -1589,7 +1456,6 @@ class MainWindow(QMainWindow):
                 keep_mask=self.keep_mask,
                 remove_mask=self.remove_mask,
                 alpha_hint=alpha_hint,
-                biref_alpha=biref_alpha,
                 settings=settings,
                 display_rgb=display_rgb,
                 display_alpha=display_alpha,
@@ -1603,14 +1469,13 @@ class MainWindow(QMainWindow):
         self._full_crop_rect = None
         settings.preview_scale = self.proxy_scale
         shape = self.proxy_rgb.shape[:2]
-        alpha_hint, biref_alpha = self._processing_alpha_inputs(settings, shape)
+        alpha_hint = self._processing_alpha_input(settings, shape)
         return PreviewJob(
             input_rgb=self.proxy_rgb,
             original_alpha=self.proxy_alpha,
             keep_mask=resize_mask(self.keep_mask, shape),
             remove_mask=resize_mask(self.remove_mask, shape),
             alpha_hint=alpha_hint,
-            biref_alpha=biref_alpha,
             settings=settings,
             display_rgb=self.proxy_rgb,
             display_alpha=self.proxy_alpha,
@@ -1658,7 +1523,6 @@ class MainWindow(QMainWindow):
             self.current_result,
             display_scale=self.current_display_scale,
             crop_origin=crop_origin,
-            biref_alpha=self._biref_alpha_for_display(source_rgb.shape[:2], crop_origin, self.current_display_scale),
             reset_view=reset_view,
         )
         self.scale_status.setText(f"{label} · {self.current_display_scale * 100:.1f}%")
@@ -1711,7 +1575,7 @@ class MainWindow(QMainWindow):
         settings.preview_scale = 1.0
         settings.use_tiling = True
         try:
-            alpha_hint, biref_alpha = self._processing_alpha_inputs(settings, self.full_rgb.shape[:2])
+            alpha_hint = self._processing_alpha_input(settings, self.full_rgb.shape[:2])
         except Exception as exc:
             self.on_failed(str(exc), title="Export setup failed")
             return
@@ -1723,7 +1587,6 @@ class MainWindow(QMainWindow):
             self.keep_mask,
             self.remove_mask,
             alpha_hint,
-            biref_alpha,
         )
         self.export_thread.progress.connect(self.on_export_progress)
         self.export_thread.done.connect(self.on_export_done)
@@ -1805,50 +1668,50 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Imported remove mask {Path(path).name}")
         self.schedule_preview()
 
-    def import_alpha_hint(self) -> None:
+    def import_imported_matte(self) -> None:
         if self.full_rgb is None:
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import AI alpha hint",
+            "Import matte",
             "",
             "Grayscale mask (*.png *.tif *.tiff *.jpg *.jpeg *.bmp);;All files (*.*)",
         )
         if not path:
             return
         try:
-            self.alpha_hint_mask = read_alpha_hint_mask(path, self.full_rgb.shape[:2])
+            self.alpha_hint_mask = read_imported_matte_mask(path, self.full_rgb.shape[:2])
         except Exception as exc:
-            QMessageBox.critical(self, "AI hint import failed", str(exc))
+            QMessageBox.critical(self, "Matte import failed", str(exc))
             return
-        self.output_mode.setCurrentText("Manual AI Hint")
-        self._sync_ai_hint_status(Path(path).name)
+        self.output_mode.setCurrentText("Imported Matte")
+        self._sync_imported_matte_status(Path(path).name)
         self._sync_output_mode_status()
-        self.statusBar().showMessage(f"Imported AI alpha hint {Path(path).name}")
+        self.statusBar().showMessage(f"Imported matte {Path(path).name}")
         self._update_enabled_state()
         self.schedule_preview()
 
-    def clear_alpha_hint(self) -> None:
+    def clear_imported_matte(self) -> None:
         if self.alpha_hint_mask is None:
             return
         self.alpha_hint_mask = None
-        if self.output_mode.currentText() == "Manual AI Hint":
+        if self.output_mode.currentText() == "Imported Matte":
             self.output_mode.setCurrentText("Classical")
-        self._sync_ai_hint_status()
+        self._sync_imported_matte_status()
         self._sync_output_mode_status()
-        self.statusBar().showMessage("Cleared AI alpha hint")
+        self.statusBar().showMessage("Cleared imported matte")
         self._update_enabled_state()
         self.schedule_preview()
 
-    def _sync_ai_hint_status(self, filename: str | None = None) -> None:
+    def _sync_imported_matte_status(self, filename: str | None = None) -> None:
         if not hasattr(self, "alpha_hint_status"):
             return
         if self.alpha_hint_mask is None:
-            self.alpha_hint_status.setText("Manual hint: none. Import a grayscale mask to protect foreground/core regions before preview/export.")
+            self.alpha_hint_status.setText("Imported matte: none. Import a grayscale mask to protect foreground/core regions before preview/export.")
         else:
             h, w = self.alpha_hint_mask.shape[:2]
             name = f" · {filename}" if filename else ""
-            self.alpha_hint_status.setText(f"Manual hint: loaded {w}×{h}{name}; high values protect foreground, low values do not remove background by themselves.")
+            self.alpha_hint_status.setText(f"Imported matte: loaded {w}×{h}{name}; high values protect foreground, low values do not remove background by themselves.")
 
     def _on_output_mode_changed(self, mode: str) -> None:
         self._sync_output_mode_status()
@@ -1859,87 +1722,15 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "output_mode_status"):
             return
         mode = self.output_mode.currentText() if hasattr(self, "output_mode") else "Classical"
-        if mode == "Hybrid BiRefNet":
-            if self.biref_alpha_mask is None:
-                text = "Output: final HybridBiRefNet selected, but no generated BiRefNet Alpha is loaded yet. Generate a hint before preview/export."
-            else:
-                h, w = self.biref_alpha_mask.shape[:2]
-                text = f"Output: final HybridBiRefNet result uses generated BiRefNet Alpha {w}×{h}; manual AI hint is not reused as BiRefNet input."
-        elif mode == "Manual AI Hint":
+        if mode == "Imported Matte":
             if self.alpha_hint_mask is None:
-                text = "Output: Manual AI Hint mode selected, but no imported hint is loaded; processing falls back to classical alpha decisions."
+                text = "Output: Imported Matte selected, but no matte is loaded; processing falls back to classical alpha decisions."
             else:
                 h, w = self.alpha_hint_mask.shape[:2]
-                text = f"Output: Manual AI Hint uses imported alpha hint {w}×{h}; generated BiRefNet Alpha remains separate."
+                text = f"Output: Imported Matte uses grayscale matte {w}×{h} as foreground protection and alpha guidance."
         else:
-            text = "Output: Classical mode ignores manual and generated AI hints for preview/export."
+            text = "Output: Classical mode ignores imported mattes for preview/export."
         self.output_mode_status.setText(text)
-
-    def generate_birefnet_hint(self, checked: bool = False) -> None:
-        del checked
-        if self.full_rgb is None:
-            return
-        if self._ai_worker_running():
-            self.statusBar().showMessage("BiRefNet is already running")
-            return
-        model_path = self._current_birefnet_model_path()
-        if model_path is None or not model_path.exists():
-            self._sync_birefnet_status(
-                "failed",
-                f"failed - model not ready. Set {BIREFNET_MODEL_ENV} to an existing local BiRefNet snapshot before generating an alpha hint.",
-            )
-            self._update_enabled_state()
-            return
-
-        self.ai_worker_generation += 1
-        generation = self.ai_worker_generation
-        self.ai_cancel_requested = False
-        try:
-            request_path = self._prepare_birefnet_worker_request(model_path)
-        except Exception as exc:
-            self._cleanup_ai_worker_files()
-            self._sync_birefnet_status("failed", f"failed - could not prepare BiRefNet worker request: {exc}")
-            self._update_enabled_state()
-            return
-
-        process = QProcess(self)
-        process.setObjectName("BiRefNetAIWorkerProcess")
-        process.setWorkingDirectory(str(WRITABLE_APP_DIR))
-        process.setProcessChannelMode(QProcess.SeparateChannels)
-        process.finished.connect(
-            lambda exit_code, exit_status, gen=generation, proc=process: self._on_ai_worker_finished(gen, proc, exit_code, exit_status)
-        )
-        process.errorOccurred.connect(lambda error, gen=generation, proc=process: self._on_ai_worker_error(gen, proc, error))
-        self.ai_worker_process = process
-        self._sync_birefnet_status(
-            "running",
-            "running - BiRefNet worker is generating a separate alpha hint. Select Hybrid BiRefNet output mode to apply it after generation.",
-        )
-        self.statusBar().showMessage("BiRefNet alpha hint generation started…")
-        self._update_enabled_state()
-        command, arguments = ai_worker_subprocess_command(request_path)
-        process.start(command, arguments)
-
-    def cancel_ai(self, checked: bool = False, *, silent: bool = False) -> None:
-        del checked
-        if not self._ai_worker_running():
-            return
-        self.ai_cancel_requested = True
-        if self.ai_worker_cancel_path is not None:
-            try:
-                self.ai_worker_cancel_path.parent.mkdir(parents=True, exist_ok=True)
-                self.ai_worker_cancel_path.write_text("cancel\n", encoding="utf-8")
-            except Exception:
-                pass
-        self._sync_birefnet_status(
-            "running",
-            "running - cancellation requested. ImgKey will stop the AI subprocess and discard any BiRefNet output from this run.",
-        )
-        if not silent:
-            self.statusBar().showMessage("Cancelling BiRefNet worker…")
-        QTimer.singleShot(1500, self._terminate_ai_worker_if_running)
-        QTimer.singleShot(5000, self._kill_ai_worker_if_running)
-        self._update_enabled_state()
 
     def show_gpu_status(self, checked: bool = False) -> None:
         del checked
@@ -1959,119 +1750,6 @@ class MainWindow(QMainWindow):
         self._update_enabled_state()
         command, arguments = gpu_probe_subprocess_command()
         process.start(command, arguments)
-
-    def _prepare_birefnet_worker_request(self, model_path: Path) -> Path:
-        assert self.full_rgb is not None
-        token = uuid4().hex
-        output_dir = AI_UI_ARTIFACT_DIR / "outputs"
-        temp_dir = AI_UI_ARTIFACT_DIR / "temp"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        input_path, wrote_temp_input = self._birefnet_worker_input_path(output_dir, token)
-        cancel_path = AI_UI_ARTIFACT_DIR / f"cancel-{token}.flag"
-        if cancel_path.exists():
-            cancel_path.unlink()
-        request = {
-            "backend": "birefnet",
-            "input_image_path": str(input_path),
-            "model_path": str(model_path),
-            "device": "cuda",
-            "mode": "global_plus_roi",
-            "max_side": 1536,
-            "tile_size": 1024,
-            "tile_overlap": 192,
-            "precision": "fp16",
-            "output_dir": str(output_dir),
-            "temp_dir": str(temp_dir),
-            "cancel_file_path": str(cancel_path),
-        }
-        request_path = AI_UI_ARTIFACT_DIR / f"request-{token}.json"
-        request_path.write_text(json.dumps(request, indent=2, sort_keys=True), encoding="utf-8")
-        self.ai_worker_request_path = request_path
-        self.ai_worker_cancel_path = cancel_path
-        self.ai_worker_temp_input_path = input_path if wrote_temp_input else None
-        return request_path
-
-    def _birefnet_worker_input_path(self, output_dir: Path, token: str) -> tuple[Path, bool]:
-        if self.image_path is not None and self.image_path.exists() and self.image_path.is_file():
-            return self.image_path, False
-        assert self.full_rgb is not None
-        input_path = output_dir / f"birefnet_source_{token}.png"
-        rgb = np.ascontiguousarray(self.full_rgb[:, :, :3], dtype=np.uint8)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        ok, encoded = cv2.imencode(".png", bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        if not ok:
-            raise ValueError("Could not encode source image for BiRefNet worker")
-        encoded.tofile(str(input_path))
-        return input_path, True
-
-    def _on_ai_worker_error(self, generation: int, process: QProcess, error) -> None:
-        if generation != self.ai_worker_generation or process is not self.ai_worker_process:
-            return
-        if process.state() != QProcess.NotRunning:
-            return
-        message = process.errorString() or str(error)
-        self.ai_worker_process = None
-        self.ai_cancel_requested = False
-        self._cleanup_ai_worker_files()
-        self._sync_birefnet_status("failed", f"failed - could not start BiRefNet worker subprocess: {message}")
-        self.statusBar().showMessage("BiRefNet worker failed to start")
-        self._update_enabled_state()
-        process.deleteLater()
-
-    def _on_ai_worker_finished(self, generation: int, process: QProcess, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
-        stdout = self._process_stdout(process)
-        stderr = self._process_stderr(process)
-        if generation != self.ai_worker_generation or process is not self.ai_worker_process:
-            process.deleteLater()
-            return
-
-        was_cancelled = self.ai_cancel_requested
-        self.ai_worker_process = None
-        self.ai_cancel_requested = False
-        response = self._json_object_from_text(stdout)
-        self._cleanup_ai_worker_files()
-
-        cancelled_response = isinstance(response, dict) and response.get("error_code") == "cancelled"
-        if was_cancelled or cancelled_response:
-            self._sync_birefnet_status("cancelled", "cancelled - no BiRefNet alpha hint was stored from the cancelled run.")
-            self.statusBar().showMessage("BiRefNet worker cancelled")
-            self._update_enabled_state()
-            process.deleteLater()
-            return
-
-        if isinstance(response, dict) and response.get("ok"):
-            alpha_path = response.get("alpha_hint_path")
-            try:
-                if not alpha_path:
-                    raise ValueError("worker did not return alpha_hint_path")
-                assert self.full_rgb is not None
-                self.biref_alpha_mask = read_alpha_hint_mask(alpha_path, self.full_rgb.shape[:2])
-                self.biref_alpha_source = str(alpha_path)
-            except Exception as exc:
-                self._sync_birefnet_status("failed", f"failed - worker completed but alpha hint could not be loaded: {exc}")
-                self.statusBar().showMessage("BiRefNet alpha load failed")
-            else:
-                self._refresh_biref_alpha_display()
-                if self.view_combo.currentText() != "BiRefNet Alpha":
-                    self.view_combo.setCurrentText("BiRefNet Alpha")
-                h, w = self.biref_alpha_mask.shape[:2]
-                self._sync_birefnet_status(
-                    "done",
-                    f"done - generated {w}×{h} BiRefNet alpha hint. Stored separately as BiRefNet Alpha; select Hybrid BiRefNet output mode for final hybrid preview/export.",
-                )
-                self._sync_output_mode_status()
-                if self.output_mode.currentText() == "Hybrid BiRefNet":
-                    self.schedule_preview()
-                self.statusBar().showMessage("BiRefNet alpha hint ready; Hybrid BiRefNet output mode can apply it")
-        else:
-            detail = self._worker_failure_detail(response, stderr, exit_code, exit_status)
-            self._sync_birefnet_status("failed", f"failed - {detail}")
-            self.statusBar().showMessage("BiRefNet worker failed")
-
-        self._update_enabled_state()
-        process.deleteLater()
 
     def _on_gpu_probe_error(self, process: QProcess, error) -> None:
         if process is not self.gpu_probe_process:
@@ -2110,94 +1788,8 @@ class MainWindow(QMainWindow):
         self._update_enabled_state()
         process.deleteLater()
 
-    def _current_birefnet_model_path(self) -> Path | None:
-        text = os.environ.get(BIREFNET_MODEL_ENV, "").strip()
-        if not text:
-            if FROZEN_APP and BUNDLED_BIREFNET_MODEL_DIR.exists():
-                return BUNDLED_BIREFNET_MODEL_DIR
-            return None
-        return Path(text).expanduser().resolve(strict=False)
-
-    def _ai_worker_running(self) -> bool:
-        return self.ai_worker_process is not None and self.ai_worker_process.state() != QProcess.NotRunning
-
     def _gpu_probe_running(self) -> bool:
         return self.gpu_probe_process is not None and self.gpu_probe_process.state() != QProcess.NotRunning
-
-    def _terminate_ai_worker_if_running(self) -> None:
-        if self.ai_cancel_requested and self._ai_worker_running() and self.ai_worker_process is not None:
-            self.ai_worker_process.terminate()
-
-    def _kill_ai_worker_if_running(self) -> None:
-        if self.ai_cancel_requested and self._ai_worker_running() and self.ai_worker_process is not None:
-            self.ai_worker_process.kill()
-
-    def _cleanup_ai_worker_files(self) -> None:
-        for path in (self.ai_worker_request_path, self.ai_worker_cancel_path, self.ai_worker_temp_input_path):
-            if path is None:
-                continue
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
-        self.ai_worker_request_path = None
-        self.ai_worker_cancel_path = None
-        self.ai_worker_temp_input_path = None
-
-    def _sync_birefnet_status(self, state: str | None = None, message: str | None = None) -> None:
-        if state is not None:
-            self.birefnet_state = state
-        if not hasattr(self, "birefnet_status"):
-            return
-        model_path = self._current_birefnet_model_path()
-        model_ready = model_path is not None and model_path.exists()
-        phase_note = "BiRefNet Alpha is a generated hint. Classical/manual modes ignore it; Hybrid BiRefNet preview/export produces the final hybrid result from it."
-        if message is None:
-            if self.birefnet_state == "running":
-                message = "running - worker subprocess is active."
-            elif self.birefnet_state == "done" and self.biref_alpha_mask is not None:
-                h, w = self.biref_alpha_mask.shape[:2]
-                source = f" · {Path(self.biref_alpha_source).name}" if self.biref_alpha_source else ""
-                message = f"done - generated {w}×{h} alpha hint{source}."
-            elif self.birefnet_state == "failed":
-                message = "failed - see status bar for the last worker error."
-            elif self.birefnet_state == "cancelled":
-                message = "cancelled - no generated alpha hint was stored from the cancelled run."
-            elif model_ready:
-                message = f"model ready - local snapshot {model_path}."
-            else:
-                message = f"model not ready - set {BIREFNET_MODEL_ENV} to a local BiRefNet snapshot before generating."
-        self.birefnet_status.setText(f"BiRefNet: {message}\n{phase_note}")
-        self.birefnet_status.setToolTip(str(model_path) if model_path is not None else f"Set {BIREFNET_MODEL_ENV} to a local model snapshot")
-
-    def _refresh_biref_alpha_display(self) -> None:
-        if self.current_source_rgb is None:
-            return
-        alpha = self._biref_alpha_for_display(self.current_source_rgb.shape[:2], self.current_crop_origin, self.current_display_scale)
-        self.canvas.set_biref_alpha(alpha)
-
-    def _biref_alpha_for_display(
-        self,
-        shape: tuple[int, int],
-        crop_origin: tuple[int, int],
-        display_scale: float,
-    ) -> np.ndarray | None:
-        if self.biref_alpha_mask is None:
-            return None
-        mask = self.biref_alpha_mask
-        if mask.shape == shape and crop_origin == (0, 0):
-            return mask.copy()
-        if crop_origin != (0, 0) or (abs(display_scale - 1.0) <= 1e-6 and mask.shape != shape):
-            x0, y0 = crop_origin
-            h, w = shape
-            x1 = min(mask.shape[1], x0 + w)
-            y1 = min(mask.shape[0], y0 + h)
-            if x0 >= 0 and y0 >= 0 and x1 > x0 and y1 > y0:
-                cropped = mask[y0:y1, x0:x1]
-                if cropped.shape == shape:
-                    return cropped.copy()
-        return resize_alpha_hint_mask(mask, shape)
 
     def _process_stdout(self, process: QProcess) -> str:
         return bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
@@ -2221,19 +1813,6 @@ class MainWindow(QMainWindow):
             except json.JSONDecodeError:
                 return None
         return parsed if isinstance(parsed, dict) else None
-
-    def _worker_failure_detail(self, response: dict | None, stderr: str, exit_code: int, exit_status: QProcess.ExitStatus) -> str:
-        if isinstance(response, dict):
-            message = str(response.get("message") or "BiRefNet worker returned an error.")
-            error = response.get("error")
-            if isinstance(error, dict) and error.get("code"):
-                message = f"{error.get('code')}: {message}"
-        else:
-            message = f"BiRefNet worker exited with code {exit_code}, status {exit_status}."
-        stderr_text = stderr.strip()
-        if stderr_text:
-            message += f" stderr: {stderr_text[:800]}"
-        return message
 
     def _format_gpu_probe_summary(self, result: dict) -> str:
         status = result.get("status", "unknown")
@@ -2426,10 +2005,7 @@ class MainWindow(QMainWindow):
         has_image = self.full_rgb is not None
         has_result = self.current_result is not None
         export_running = self.export_thread is not None and self.export_thread.isRunning()
-        ai_running = self._ai_worker_running()
         gpu_running = self._gpu_probe_running()
-        model_path = self._current_birefnet_model_path()
-        model_ready = model_path is not None and model_path.exists()
         self.export_btn.setEnabled(has_image and not export_running)
         self.export_action.setEnabled(has_image and not export_running)
         self.export_matte_btn.setEnabled(has_result and not export_running)
@@ -2438,17 +2014,8 @@ class MainWindow(QMainWindow):
         self.import_remove_btn.setEnabled(has_image and not export_running)
         self.import_hint_btn.setEnabled(has_image and not export_running)
         self.clear_hint_btn.setEnabled(has_image and self.alpha_hint_mask is not None and not export_running)
-        self.generate_biref_action.setEnabled(has_image and model_ready and not ai_running)
-        self.cancel_ai_action.setEnabled(ai_running)
         self.gpu_status_action.setEnabled(not gpu_running)
-        self.generate_birefnet_btn.setEnabled(has_image and model_ready and not ai_running)
-        self.cancel_ai_btn.setEnabled(ai_running)
         self.gpu_status_btn.setEnabled(not gpu_running)
-        model_tip = f"Local BiRefNet model: {model_path}" if model_ready else f"Set {BIREFNET_MODEL_ENV} to an existing local BiRefNet snapshot."
-        self.generate_biref_action.setToolTip(model_tip)
-        self.generate_birefnet_btn.setToolTip(model_tip)
-        self.birefnet_btn.setEnabled(False)
-        self.corridorkey_btn.setEnabled(False)
         self.fit_action.setEnabled(has_image)
         self.actual_action.setEnabled(has_image)
         self.pick_action.setEnabled(has_image)
@@ -2468,17 +2035,6 @@ class MainWindow(QMainWindow):
         for thread in list(self._preview_threads):
             thread.request_cancel()
             thread.wait(3000)
-        if self._ai_worker_running() and self.ai_worker_process is not None:
-            process = self.ai_worker_process
-            self.cancel_ai(silent=True)
-            process.terminate()
-            if not process.waitForFinished(3000):
-                process.kill()
-                process.waitForFinished(3000)
-            self.ai_worker_process = None
-            self.ai_cancel_requested = False
-            self._cleanup_ai_worker_files()
-            process.deleteLater()
         if self._gpu_probe_running() and self.gpu_probe_process is not None:
             process = self.gpu_probe_process
             process.terminate()

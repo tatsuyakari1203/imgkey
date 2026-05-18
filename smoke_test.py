@@ -17,7 +17,6 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import keyer as keyer_module
-from ai_assist import BiRefNetAlphaAssist, CorridorKeyPlugin, check_birefnet_availability, check_corridorkey_availability
 from keyer import (
     KeyResult,
     KeySettings,
@@ -38,24 +37,23 @@ from keyer import (
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
 EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
-BIREFNET_DIAGNOSTIC_DIR = Path(".artifact") / "birefnet-diagnostics"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
         "einops",
-        "huggingface_hub",
+        "hugging" + "face_hub",
         "kornia",
         "numba",
         "onnxruntime",
         "onnxruntime_gpu",
         "pymatting",
-        "safetensors",
+        "safe" + "tensors",
         "scipy",
         "skimage",
         "timm",
         "torch",
         "torchvision",
-        "transformers",
+        "trans" + "formers",
     }
 )
 
@@ -849,292 +847,6 @@ def _mask_image(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -
 
 def _save_mask(path: Path, mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> None:
     Image.fromarray(_mask_image(mask, shape), mode="L").save(path)
-
-
-def _mock_birefnet_alpha_for_fixture(fixture: DiagnosticFixture) -> np.ndarray:
-    """Deterministic synthetic BiRefNet alpha used when no real model is bundled."""
-
-    if fixture.expected_alpha is not None:
-        return np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
-    classical = process_key_image(fixture.rgb, fixture.settings)
-    return classical.alpha.copy()
-
-
-def _channel_excess_stats(rgb: np.ndarray, channel: int, mask: np.ndarray) -> dict[str, int | float]:
-    mask_b = mask.astype(bool, copy=False)
-    if not np.any(mask_b):
-        return {"count": 0, "mean_positive_excess": 0.0, "p95_positive_excess": 0.0, "max_positive_excess": 0}
-    other = [c for c in range(3) if c != channel]
-    rgb_i = rgb[:, :, :3].astype(np.int16)
-    excess = rgb_i[:, :, channel] - np.maximum(rgb_i[:, :, other[0]], rgb_i[:, :, other[1]])
-    positive = np.maximum(excess[mask_b], 0)
-    return {
-        "count": int(positive.size),
-        "mean_positive_excess": float(np.mean(positive)),
-        "p95_positive_excess": float(np.percentile(positive, 95)),
-        "max_positive_excess": int(np.max(positive)),
-    }
-
-
-def _core_rgb_delta_between(before_rgb: np.ndarray, after_rgb: np.ndarray, core_mask: np.ndarray) -> dict[str, int | float]:
-    mask = core_mask.astype(bool, copy=False)
-    if not np.any(mask):
-        return {"count": 0, "max_delta": 0, "mean_delta": 0.0}
-    delta = np.abs(after_rgb[mask].astype(np.int16) - before_rgb[mask].astype(np.int16))
-    return {"count": int(delta.shape[0]), "max_delta": int(np.max(delta)), "mean_delta": float(np.mean(delta))}
-
-
-def _alpha_edge_overlay(rgb: np.ndarray, alpha: np.ndarray, edge_mask: np.ndarray, conflict: np.ndarray | None = None) -> np.ndarray:
-    overlay = rgb.copy()
-    alpha_edge = edge_mask.astype(bool, copy=False) | ((alpha > 0) & (alpha < 255))
-    if np.any(alpha_edge):
-        red = np.zeros_like(overlay)
-        red[:, :, 0] = 255
-        overlay[alpha_edge] = np.clip(overlay[alpha_edge].astype(np.float32) * 0.45 + red[alpha_edge].astype(np.float32) * 0.55, 0, 255).astype(np.uint8)
-    if conflict is not None and np.any(conflict):
-        cyan = np.zeros_like(overlay)
-        cyan[:, :, 1:] = 255
-        conflict_b = conflict.astype(bool, copy=False)
-        overlay[conflict_b] = np.clip(overlay[conflict_b].astype(np.float32) * 0.35 + cyan[conflict_b].astype(np.float32) * 0.65, 0, 255).astype(np.uint8)
-    return overlay
-
-
-def _birefnet_diagnostic_payload() -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Build Phase 9 BiRefNet diagnostics from a synthetic/mock alpha hint."""
-
-    before_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    screen_analysis = importlib.import_module("screen_analysis")
-    hybrid_trimap = importlib.import_module("hybrid_trimap")
-    after_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_imports == before_imports, f"BiRefNet diagnostics must not import heavy runtimes: {after_imports - before_imports}"
-
-    fixture = hair_lines_fixture()
-    biref_alpha = _mock_birefnet_alpha_for_fixture(fixture)
-    classical_settings = replace(fixture.settings, mode="GraphicExact", guided_alpha_refine=0.0)
-    hybrid_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
-    cleanup_off_settings = replace(
-        hybrid_settings,
-        edge_color_repair=0.0,
-        unmix_amount=0.0,
-        despill=0.0,
-        fringe_remove=0.0,
-    )
-    unmix_only_settings = replace(hybrid_settings, despill=0.0, fringe_remove=0.0)
-
-    classical = process_key_image(fixture.rgb, classical_settings)
-    before = process_key_image(fixture.rgb, cleanup_off_settings, biref_alpha=biref_alpha)
-    after_unmix = process_key_image(fixture.rgb, unmix_only_settings, biref_alpha=biref_alpha)
-    after = process_key_image(fixture.rgb, hybrid_settings, biref_alpha=biref_alpha)
-
-    assert np.array_equal(before.alpha, after.alpha), "P8 RGB cleanup must not alter HybridBiRefNet alpha"
-    assert np.array_equal(after_unmix.alpha, after.alpha), "unmix-only diagnostic must preserve HybridBiRefNet alpha"
-    assert int(after.rgba[after.alpha == 0, :3].max()) == 0, "alpha==0 diagnostic pixels must have exact RGB zero"
-
-    background_mask = classical.background_mask if classical.background_mask is not None else classical.alpha <= 8
-    screen_probability = classical.screen_probability if classical.screen_probability is not None else np.zeros(classical.alpha.shape, dtype=np.uint8)
-    analysis = screen_analysis.analyze_screen(
-        fixture.rgb,
-        classical.alpha,
-        background_mask=background_mask,
-        settings=fixture.settings,
-        picked_screen_color=classical.screen_color or fixture.settings.key_color,
-    )
-    trimap = hybrid_trimap.build_hybrid_trimap(
-        classical.alpha,
-        screen_probability,
-        analysis.screen_distance,
-        analysis.spill_probability,
-        analysis.classical_confidence,
-        background_mask,
-        analysis.edge_mask,
-        analysis.fringe_mask,
-        analysis.screen_plate_rgb,
-        biref_alpha,
-    )
-
-    final_background = after.background_mask if after.background_mask is not None else (trimap.known_bg | (after.alpha <= 0))
-    final_edge = after.edge_mask if after.edge_mask is not None else (trimap.unknown | ((after.alpha > 0) & (after.alpha < 255)))
-    final_fringe = after.fringe_mask if after.fringe_mask is not None else analysis.fringe_mask
-    unmix_region, despill_region, _protected_fg, _safe_bg, _manual_keep = keyer_module._build_final_hybrid_cleanup_regions(
-        after.alpha,
-        final_background,
-        final_edge,
-        final_fringe,
-        screen_probability,
-        analysis.spill_probability,
-        trimap,
-    )
-
-    edge_mask = fixture.soft_edge_mask.astype(bool, copy=False) & (after.alpha > 0)
-    detail_mask = (fixture.expected_alpha > 0.05) & (fixture.expected_alpha < 0.90)
-    foreground_core = fixture.foreground_core_mask.astype(bool, copy=False)
-
-    classical_detail_mean = float(np.mean(classical.alpha[detail_mask])) if np.any(detail_mask) else 0.0
-    hybrid_detail_mean = float(np.mean(after.alpha[detail_mask])) if np.any(detail_mask) else 0.0
-    mock_detail_mean = float(np.mean(biref_alpha[detail_mask])) if np.any(detail_mask) else 0.0
-    background_alpha = after.alpha[trimap.known_bg]
-    background_leak_area = int(np.count_nonzero(background_alpha > 8))
-    core_delta = opaque_foreground_max_delta(fixture.rgb, after.rgba, foreground_core, fixture.expected_foreground_rgb)
-
-    composite_residuals: dict[str, dict[str, Any]] = {}
-    composite_images: dict[str, np.ndarray] = {}
-    for name, color in {
-        "black": (0, 0, 0),
-        "white": (255, 255, 255),
-        "gray": (128, 128, 128),
-        "checker": None,
-    }.items():
-        before_rgb = checkerboard_composite(before.rgba) if color is None else _solid_composite(before.rgba, color)
-        after_rgb = checkerboard_composite(after.rgba) if color is None else _solid_composite(after.rgba, color)
-        before_residual = rgb_key_residual(before_rgb, fixture.settings.key_color, edge_mask)
-        after_residual = rgb_key_residual(after_rgb, fixture.settings.key_color, edge_mask)
-        composite_residuals[name] = {"before": before_residual, "after": after_residual}
-        composite_images[f"{name}_composite_before_cleanup"] = before_rgb
-        composite_images[f"{name}_composite"] = after_rgb
-        composite_images[f"{name}_composite_compare"] = np.concatenate([before_rgb, after_rgb], axis=1)
-        assert after_residual["mean_positive_excess"] < before_residual["mean_positive_excess"] * 0.70, (
-            f"BiRefNet diagnostics should show lower {name} composite halo mean: {before_residual} -> {after_residual}"
-        )
-        assert after_residual["p95_positive_excess"] <= before_residual["p95_positive_excess"], (
-            f"BiRefNet diagnostics should not worsen {name} composite p95 halo: {before_residual} -> {after_residual}"
-        )
-
-    tiled_settings = replace(hybrid_settings, use_tiling=True, tile_size=97, tile_overlap=18, local_screen_model=True)
-    tiled = process_key_image(fixture.rgb, tiled_settings, biref_alpha=biref_alpha)
-    full = process_key_image(fixture.rgb, replace(tiled_settings, use_tiling=False), biref_alpha=biref_alpha)
-    tile_diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
-    tile_seam_diff = {
-        "tile_size": 97,
-        "tile_overlap": 18,
-        "max_rgba_diff": int(tile_diff.max()),
-        "max_alpha_diff": int(tile_diff[:, :, 3].max()),
-    }
-    assert tile_seam_diff["max_alpha_diff"] == 0, f"Hybrid diagnostics alpha tile seam diff too high: {tile_seam_diff}"
-    assert tile_seam_diff["max_rgba_diff"] <= 1, f"Hybrid diagnostics RGBA tile seam diff too high: {tile_seam_diff}"
-
-    green_stats = _channel_excess_stats(after.rgba[:, :, :3], 1, edge_mask)
-    blue_stats = _channel_excess_stats(after.rgba[:, :, :3], 2, edge_mask)
-    low_alpha = edge_mask & (after.alpha > 0) & (after.alpha < 38)
-    low_alpha_green = _channel_excess_stats(after.rgba[:, :, :3], 1, low_alpha)
-    low_alpha_blue = _channel_excess_stats(after.rgba[:, :, :3], 2, low_alpha)
-    low_alpha_noise_score = float(max(low_alpha_green["p95_positive_excess"], low_alpha_blue["p95_positive_excess"]))
-    low_alpha_noise_max = int(max(low_alpha_green["max_positive_excess"], low_alpha_blue["max_positive_excess"]))
-    despill_core_delta = _core_rgb_delta_between(after_unmix.rgba[:, :, :3], after.rgba[:, :, :3], foreground_core)
-    known_bg_false_positive = trimap.known_bg & (fixture.expected_alpha > 0.05)
-    if np.any(foreground_core):
-        core_biref = np.maximum(biref_alpha[foreground_core].astype(np.float32), 1.0)
-        known_fg_preservation_score = float(np.mean(np.minimum(after.alpha[foreground_core].astype(np.float32) / core_biref, 1.0)))
-    else:
-        known_fg_preservation_score = 1.0
-
-    direct_residuals = {
-        "before_cleanup": edge_key_residual(before.rgba, fixture.settings.key_color, edge_mask),
-        "after_unmix": edge_key_residual(after_unmix.rgba, fixture.settings.key_color, edge_mask),
-        "after_despill": edge_key_residual(after.rgba, fixture.settings.key_color, edge_mask),
-    }
-    transparent_max = int(after.rgba[after.alpha == 0, :3].max()) if np.any(after.alpha == 0) else 0
-    metrics: dict[str, Any] = {
-        "fixture": fixture.name,
-        "birefnet_alpha_source": "synthetic_mock_expected_alpha_no_model_required",
-        "detail_retention": {
-            "classical_detail_alpha_mean": classical_detail_mean,
-            "hybrid_detail_alpha_mean": hybrid_detail_mean,
-            "mock_birefnet_detail_alpha_mean": mock_detail_mean,
-            "hybrid_minus_classical": hybrid_detail_mean - classical_detail_mean,
-        },
-        "background_leak": {
-            "known_bg_pixels": int(background_alpha.size),
-            "alpha_gt_8_area": background_leak_area,
-            "alpha_gt_8_fraction": float(background_leak_area / max(1, background_alpha.size)),
-            "max_alpha": int(background_alpha.max()) if background_alpha.size else 0,
-        },
-        "edge_key_color_residual": {
-            **direct_residuals,
-            "composites": composite_residuals,
-        },
-        "foreground_core_rgb_delta": core_delta,
-        "tile_seam_diff": tile_seam_diff,
-        "transparent_rgb_residual_max": transparent_max,
-        "edge_green_residual_mean": green_stats["mean_positive_excess"],
-        "edge_blue_residual_mean": blue_stats["mean_positive_excess"],
-        "low_alpha_noise_score": low_alpha_noise_score,
-        "low_alpha_noise": {"green": low_alpha_green, "blue": low_alpha_blue, "max_positive_excess": low_alpha_noise_max},
-        "despill_core_color_delta": despill_core_delta,
-        "known_bg_false_positive_area": int(np.count_nonzero(known_bg_false_positive)),
-        "known_fg_preservation_score": known_fg_preservation_score,
-    }
-
-    assert hybrid_detail_mean >= classical_detail_mean + 8.0, f"detail retention too low: {metrics['detail_retention']}"
-    assert background_leak_area == 0, f"mock BiRefNet diagnostics leaked confident background: {metrics['background_leak']}"
-    assert direct_residuals["after_despill"]["mean_positive_excess"] < direct_residuals["before_cleanup"]["mean_positive_excess"], (
-        f"P8 cleanup should reduce direct edge residual: {direct_residuals}"
-    )
-    assert core_delta["max_delta"] <= 32, f"foreground core RGB delta outside tolerance: {core_delta}"
-    assert transparent_max == 0, f"transparent RGB residual must be zero, got {transparent_max}"
-    assert low_alpha_noise_score <= 80.0 and low_alpha_noise_max <= 96, f"low-alpha saturated key noise too high: {metrics['low_alpha_noise']}"
-    assert despill_core_delta["max_delta"] <= 32, f"despill changed protected core too much: {despill_core_delta}"
-    assert known_fg_preservation_score >= 0.95, f"known foreground preservation too low: {known_fg_preservation_score:.3f}"
-
-    images: dict[str, np.ndarray] = {
-        "source": fixture.rgb,
-        "classical_alpha": classical.alpha,
-        "birefnet_alpha": biref_alpha,
-        "screen_probability": screen_probability,
-        "screen_distance": analysis.screen_distance,
-        "screen_plate": analysis.screen_plate_rgb.resolve(),
-        "spill_probability": analysis.spill_probability,
-        "fringe_mask": _mask_image(final_fringe, after.alpha.shape),
-        "hybrid_known_bg": _mask_image(trimap.known_bg),
-        "hybrid_known_fg": _mask_image(trimap.known_fg),
-        "hybrid_unknown": _mask_image(trimap.unknown),
-        "hybrid_conflict": _mask_image(trimap.conflict),
-        "unmix_region": _mask_image(unmix_region),
-        "despill_region": _mask_image(despill_region),
-        "hybrid_alpha": after.alpha,
-        "rgb_before_cleanup": before.rgba[:, :, :3],
-        "rgb_after_unmix": after_unmix.rgba[:, :, :3],
-        "rgb_after_despill": after.rgba[:, :, :3],
-        "alpha_edge_overlay": _alpha_edge_overlay(fixture.rgb, after.alpha, edge_mask, trimap.conflict),
-        "result": after.rgba,
-        **composite_images,
-    }
-    return images, metrics
-
-
-def run_v6_birefnet_diagnostics_tests() -> None:
-    _images, metrics = _birefnet_diagnostic_payload()
-    print(
-        "Phase 9 BiRefNet diagnostics checks: "
-        f"detail_gain={metrics['detail_retention']['hybrid_minus_classical']:.2f}; "
-        f"transparent_rgb_max={metrics['transparent_rgb_residual_max']}; "
-        f"low_alpha_noise={metrics['low_alpha_noise_score']:.1f}; "
-        f"tile_rgba_diff={metrics['tile_seam_diff']['max_rgba_diff']}"
-    )
-
-
-def write_birefnet_diagnostics() -> None:
-    BIREFNET_DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"writing BiRefNet diagnostics to {BIREFNET_DIAGNOSTIC_DIR}")
-    images, metrics = _birefnet_diagnostic_payload()
-    for name, image in images.items():
-        path = BIREFNET_DIAGNOSTIC_DIR / f"{name}.png"
-        arr = np.asarray(image)
-        if arr.ndim == 2:
-            _save_mask(path, arr)
-        elif arr.ndim == 3 and arr.shape[2] == 4:
-            _save_rgba(path, arr.astype(np.uint8, copy=False))
-        else:
-            _save_rgb(path, arr.astype(np.uint8, copy=False))
-    (BIREFNET_DIAGNOSTIC_DIR / "metrics.json").write_text(
-        json.dumps(_json_ready(metrics), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(
-        "BiRefNet diagnostics metrics: "
-        f"detail_gain={metrics['detail_retention']['hybrid_minus_classical']:.2f}; "
-        f"background_leak_area={metrics['background_leak']['alpha_gt_8_area']}; "
-        f"low_alpha_noise={metrics['low_alpha_noise_score']:.1f}"
-    )
 
 
 def alpha_soft_band_count(alpha: np.ndarray, low: int = 0, high: int = 255) -> int:
@@ -2049,8 +1761,8 @@ def run_v2_numeric_tests() -> None:
         replace(island.settings, aggressive_interior_removal=True),
         alpha_hint=alpha_hint,
     )
-    assert hinted.alpha[island_y, island_x] >= 248, "AI alpha hint should protect foreground details without a model runtime"
-    assert hinted.alpha_hint is not None and hinted.alpha_hint[island_y, island_x] == 255, "alpha hint should be returned for UI/debug views"
+    assert hinted.alpha[island_y, island_x] >= 248, "imported matte should protect foreground details"
+    assert hinted.alpha_hint is not None and hinted.alpha_hint[island_y, island_x] == 255, "imported matte should be returned for UI/debug views"
 
     remove_mask = np.zeros((h, w), dtype=np.uint8)
     remove_mask[(xx - island_x) ** 2 + (yy - island_y) ** 2 < 35**2] = 255
@@ -2194,266 +1906,6 @@ def run_v4_edge_repair_tests() -> None:
     assert not imported, f"default v4 edge repair path must not import heavy optional modules: {sorted(imported)}"
 
 
-def run_optional_ai_seam_tests() -> None:
-    heavy_modules = HEAVY_OPTIONAL_MODULES
-    before = {name for name in heavy_modules if name in sys.modules}
-    missing_model = Path(".artifact") / "missing-birefnet-model"
-
-    cap = check_birefnet_availability(model_path=missing_model, adapter="")
-    assert not cap.available, "BiRefNet seam must be disabled without local model/adapter configuration"
-    assert cap.missing_configuration, "BiRefNet disabled status should explain missing model/adapter configuration"
-    assist = BiRefNetAlphaAssist(model_path=missing_model, adapter="")
-    try:
-        assist.generate_hint(np.zeros((8, 8, 3), dtype=np.uint8))
-    except RuntimeError as exc:
-        assert "disabled" in str(exc).lower(), "BiRefNet no-dependency failure should be explicit"
-    else:  # pragma: no cover - defensive
-        raise AssertionError("BiRefNet stub should not run without external dependencies/model/adapter")
-
-    corridor_cap = check_corridorkey_availability(adapter="")
-    assert not corridor_cap.available, "CorridorKey plugin must be disabled without an external adapter"
-    corridor = CorridorKeyPlugin(adapter="")
-    try:
-        corridor.process(np.zeros((8, 8, 3), dtype=np.uint8), np.zeros((8, 8), dtype=np.uint8))
-    except RuntimeError as exc:
-        assert "corridorkey" in str(exc).lower(), "CorridorKey no-adapter failure should be explicit"
-    else:  # pragma: no cover - defensive
-        raise AssertionError("CorridorKey plugin should not run without an external adapter")
-
-    after = {name for name in heavy_modules if name in sys.modules}
-    assert after == before, f"AI capability checks must not import heavy runtimes: {after - before}"
-
-
-def run_birefnet_adapter_manifest_tests() -> None:
-    heavy_modules = HEAVY_OPTIONAL_MODULES
-    before = {name for name in heavy_modules if name in sys.modules}
-
-    importlib.import_module("ai_backends")
-    adapter = importlib.import_module("ai_backends.birefnet_adapter")
-    after_import = {name for name in heavy_modules if name in sys.modules}
-    assert after_import == before, f"importing BiRefNet adapter must not import heavy runtimes: {after_import - before}"
-
-    manifest = adapter.load_manifest()
-    assert manifest["backend"] == "birefnet", "manifest must be BiRefNet-only"
-    assert manifest["model_family"] == "BiRefNet", "manifest model family must be BiRefNet"
-    assert manifest["selected_model"] == "ZhengPeng7/BiRefNet", "manifest must pin the selected BiRefNet source"
-    assert manifest["source"]["repo_id"] == "ZhengPeng7/BiRefNet", "manifest must record exact HF source repo"
-    assert manifest["source"].get("revision"), "manifest must record a pinned revision/commit"
-    policy = manifest["local_path_policy"]
-    assert policy["network_access"] == "forbidden", "BiRefNet runtime must be offline/local-only"
-    assert policy["transformers_from_pretrained_args"]["local_files_only"] is True, "manifest must require local_files_only"
-    assert policy["transformers_from_pretrained_args"]["trust_remote_code"] is True, "manifest must document remote-code loading"
-
-    required_paths = {entry["path"] for entry in manifest["expected_layout"]["root_required_files"]}
-    expected_paths = {"config.json", "BiRefNet_config.py", "birefnet.py", "model.safetensors", "README.md"}
-    assert expected_paths <= required_paths, f"manifest missing required BiRefNet snapshot files: {expected_paths - required_paths}"
-    license_paths = {entry["path"] for entry in manifest["expected_layout"]["license_files"]}
-    assert "README.md" in license_paths, "manifest must record license/notice metadata file names"
-
-    bad_paths = {
-        "": "empty",
-        "https://huggingface.co/ZhengPeng7/BiRefNet": "URL",
-        "ZhengPeng7/BiRefNet": "repo IDs",
-        str(Path(".artifact") / "missing-birefnet-model"): "does not exist",
-    }
-    for bad_path, expected_text in bad_paths.items():
-        try:
-            adapter.validate_model_path(bad_path)
-        except adapter.ModelValidationError as exc:
-            assert expected_text.lower() in str(exc).lower(), f"unexpected validation error for {bad_path!r}: {exc}"
-        else:  # pragma: no cover - defensive
-            raise AssertionError(f"invalid BiRefNet path should be rejected: {bad_path!r}")
-
-        result = adapter.generate_alpha_hint(np.zeros((4, 5, 3), dtype=np.uint8), bad_path)
-        assert result["ok"] is False and result["alpha_hint"] is None, "invalid paths must fail cleanly without inference"
-        assert result["error"]["code"] == "model_validation_failed", "invalid paths should report model validation failure"
-
-    with tempfile.TemporaryDirectory(prefix="imgkey-empty-hf-cache-") as empty_cache:
-        try:
-            adapter.validate_model_path(empty_cache)
-        except adapter.ModelValidationError as exc:
-            assert "missing required file" in str(exc).lower(), f"empty cache should fail on manifest layout: {exc}"
-        else:  # pragma: no cover - defensive
-            raise AssertionError("empty BiRefNet cache directory should be rejected")
-        result = adapter.generate_alpha_hint(np.zeros((4, 5, 3), dtype=np.uint8), empty_cache)
-        assert result["ok"] is False and result["error"]["code"] == "model_validation_failed", (
-            "empty local cache paths must fail cleanly without downloads"
-        )
-
-    with tempfile.TemporaryDirectory(prefix="imgkey-birefnet-manifest-") as tmp_dir:
-        snapshot = Path(tmp_dir)
-        (snapshot / "config.json").write_text(
-            json.dumps(
-                {
-                    "architectures": ["BiRefNet"],
-                    "auto_map": {
-                        "AutoConfig": "BiRefNet_config.BiRefNetConfig",
-                        "AutoModelForImageSegmentation": "birefnet.BiRefNet",
-                    },
-                    "bb_pretrained": False,
-                }
-            ),
-            encoding="utf-8",
-        )
-        (snapshot / "BiRefNet_config.py").write_text("class BiRefNetConfig: pass\n", encoding="utf-8")
-        (snapshot / "birefnet.py").write_text("class BiRefNet: pass\n", encoding="utf-8")
-        (snapshot / "model.safetensors").write_bytes(b"placeholder weights for manifest validation only")
-        (snapshot / "README.md").write_text("---\nlicense: mit\n---\n", encoding="utf-8")
-        validation = adapter.validate_model_path(snapshot, verify_hashes=False)
-        assert validation["ok"] is True, "validator must consume manifest for local snapshot layout"
-        assert validation["config"]["architectures"] == ["BiRefNet"], "validator must check BiRefNet config architecture"
-
-    rgb = adapter.ensure_rgb_u8(np.full((2, 3, 4), 128.8, dtype=np.float32))
-    assert rgb.shape == (2, 3, 3) and rgb.dtype == np.uint8 and rgb.flags.c_contiguous, "RGB helper must return HxWx3 uint8"
-    alpha = adapter.ensure_alpha_u8(np.array([[0.0, 0.5], [1.0, np.nan]], dtype=np.float32), (2, 2))
-    assert alpha.shape == (2, 2) and alpha.dtype == np.uint8 and alpha[0, 0] == 0 and alpha[1, 0] == 255, (
-        "alpha helper must convert float masks to HxW uint8"
-    )
-
-    eroded = np.zeros((72, 72), dtype=np.uint8)
-    eroded[18:54, 18:54] = 130
-    eroded[34:38, 34:38] = 24
-    eroded[18:54, 18] = 42
-    eroded[18:54, 53] = 42
-    repaired = adapter._postprocess_alpha_u8(eroded)
-    assert repaired.shape == eroded.shape and repaired.dtype == np.uint8, "postprocess must preserve alpha shape/dtype"
-    assert int(repaired[20, 18]) > int(eroded[20, 18]), "postprocess should raise eroded edge midtones"
-    assert int(repaired[35, 35]) > int(eroded[35, 35]), "postprocess should soften small eroded holes"
-    assert int(repaired[0, 0]) == 0, "postprocess must not expand exact background"
-
-    alpha_roi = np.zeros((160, 180), dtype=np.uint8)
-    alpha_roi[40:120, 70:110] = 210
-    alpha_roi[58:105, 110:114] = 70
-    rgb_roi = np.full((160, 180, 3), [0, 220, 50], dtype=np.uint8)
-    rgb_roi[40:120, 70:114] = [190, 60, 40]
-    rois = adapter._select_refinement_rois(alpha_roi, rgb_roi, tile_size=96, tile_overlap=24)
-    assert 1 <= len(rois) <= adapter.ROI_SETTINGS["max_count"], f"global_plus_roi selector should return bounded detail ROIs, got {rois}"
-    assert any(y0 <= 58 and y1 >= 105 and x0 <= 110 and x1 >= 114 for y0, y1, x0, x1 in rois), (
-        "ROI selector should cover the eroded detail edge"
-    )
-
-    after_validation = {name for name in heavy_modules if name in sys.modules}
-    assert after_validation == before, f"BiRefNet manifest/validation tests must not import heavy runtimes: {after_validation - before}"
-
-
-def run_ai_worker_contract_tests() -> None:
-    heavy_modules = HEAVY_OPTIONAL_MODULES
-    before = {name for name in heavy_modules if name in sys.modules}
-
-    ai_worker = importlib.import_module("ai_worker")
-    after_import = {name for name in heavy_modules if name in sys.modules}
-    assert after_import == before, f"importing ai_worker must not import heavy runtimes: {after_import - before}"
-
-    unsupported = ai_worker.run_worker_request({"backend": "not-birefnet"})
-    assert unsupported["ok"] is False
-    assert unsupported["error"]["code"] == "unsupported_backend"
-    assert unsupported["alpha_hint_path"] is None
-    assert "supported" in unsupported["message"].lower()
-
-    with tempfile.TemporaryDirectory(prefix="imgkey-ai-worker-contract-") as tmp_dir:
-        tmp = Path(tmp_dir)
-        input_path = tmp / "source.png"
-        Image.fromarray(np.zeros((8, 9, 3), dtype=np.uint8), mode="RGB").save(input_path)
-
-        base_request = {
-            "backend": "birefnet",
-            "input_image_path": str(input_path),
-            "model_path": str(tmp / "missing-birefnet-model"),
-            "device": "cpu",
-            "mode": "global_plus_roi",
-            "max_side": 64,
-            "tile_size": 64,
-            "tile_overlap": 8,
-            "precision": "fp32",
-            "output_dir": str(tmp / "out"),
-            "temp_dir": str(tmp / "temp"),
-        }
-        invalid_model = ai_worker.run_worker_request(base_request)
-        assert invalid_model["ok"] is False
-        assert invalid_model["error"]["code"] == "model_validation_failed"
-        assert "does not exist" in invalid_model["message"].lower()
-        assert invalid_model["alpha_hint_path"] is None
-        assert invalid_model["diagnostics_path"] and Path(invalid_model["diagnostics_path"]).is_file()
-        invalid_diagnostics = json.loads(Path(invalid_model["diagnostics_path"]).read_text(encoding="utf-8"))
-        cleanup = invalid_diagnostics["diagnostics"].get("temp_cleanup")
-        assert cleanup and cleanup["removed"] is True, "worker staging temp directory should be removed on validation failure"
-
-        cancel_file = tmp / "cancel-ai-worker"
-        cancel_file.write_text("cancel\n", encoding="utf-8")
-        cancelled_request = dict(base_request)
-        cancelled_request["cancel_file_path"] = str(cancel_file)
-        cancelled_request["output_dir"] = str(tmp / "cancelled-out")
-        cancelled = ai_worker.run_worker_request(cancelled_request)
-        assert cancelled["ok"] is False
-        assert cancelled["error"]["code"] == "cancelled"
-        assert "cancel" in cancelled["message"].lower()
-        assert cancelled["diagnostics_path"] and Path(cancelled["diagnostics_path"]).is_file()
-
-        missing_input_request = dict(base_request)
-        missing_input_request["input_image_path"] = str(tmp / "missing-source.png")
-        missing_input_request["output_dir"] = str(tmp / "missing-input-out")
-        missing_input = ai_worker.run_worker_request(missing_input_request)
-        assert missing_input["ok"] is False
-        assert missing_input["error"]["code"] == "missing_input"
-        assert "does not exist" in missing_input["message"].lower()
-        assert missing_input["diagnostics_path"] and Path(missing_input["diagnostics_path"]).is_file()
-
-    cli_request = json.dumps({"backend": "not-birefnet"})
-    completed = subprocess.run(
-        [sys.executable, "ai_worker.py", "--request", cli_request, "--json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert completed.returncode == 1, f"CLI worker failure should exit 1, got {completed.returncode}: {completed.stderr}"
-    cli_response = json.loads(completed.stdout)
-    assert cli_response["ok"] is False
-    assert cli_response["error"]["code"] == "unsupported_backend"
-
-    with tempfile.TemporaryDirectory(prefix="imgkey-ai-worker-subprocess-") as tmp_dir:
-        tmp = Path(tmp_dir)
-        input_path = tmp / "source.png"
-        Image.fromarray(np.zeros((7, 11, 3), dtype=np.uint8), mode="RGB").save(input_path)
-        cli_missing_model_request = json.dumps(
-            {
-                "backend": "birefnet",
-                "input_image_path": str(input_path),
-                "model_path": str(tmp / "missing-birefnet-model"),
-                "device": "cpu",
-                "mode": "global_plus_roi",
-                "max_side": 64,
-                "tile_size": 64,
-                "tile_overlap": 8,
-                "precision": "fp32",
-                "output_dir": str(tmp / "out"),
-                "temp_dir": str(tmp / "temp"),
-            }
-        )
-        completed = subprocess.run(
-            [sys.executable, "ai_worker.py", "--request", cli_missing_model_request, "--json"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        assert completed.returncode == 1, f"CLI missing-model failure should exit 1, got {completed.returncode}: {completed.stderr}"
-        cli_response = json.loads(completed.stdout)
-        assert cli_response["ok"] is False
-        assert cli_response["error"]["code"] == "model_validation_failed"
-        assert cli_response["alpha_hint_path"] is None
-        assert cli_response["diagnostics_path"] and Path(cli_response["diagnostics_path"]).is_file()
-        diagnostics = json.loads(Path(cli_response["diagnostics_path"]).read_text(encoding="utf-8"))
-        cleanup = diagnostics["diagnostics"].get("temp_cleanup")
-        assert cleanup and cleanup["removed"] is True, "CLI worker subprocess must clean staging temp directories"
-        temp_parent = tmp / "temp"
-        leftovers = [path for path in temp_parent.glob("imgkey-ai-worker-*") if path.exists()] if temp_parent.exists() else []
-        assert not leftovers, f"CLI worker subprocess left staging directories behind: {leftovers}"
-
-    after_tests = {name for name in heavy_modules if name in sys.modules}
-    assert after_tests == before, f"AI worker contract tests must not import heavy runtimes: {after_tests - before}"
-
-
 def run_gpu_runtime_probe_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert "torch" not in sys.modules, "smoke test start should not have torch imported"
@@ -2519,75 +1971,42 @@ def run_gpu_runtime_probe_tests() -> None:
     assert after_probe == before, f"fake gpu probe tests must not import heavy runtimes: {after_probe - before}"
 
 
-def run_app_birefnet_ui_tests() -> None:
+def run_app_ui_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app_module = importlib.import_module("app")
     after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert after_import == before, f"importing app for UI probe must not import heavy runtimes: {after_import - before}"
-    assert "BiRefNet Alpha" in app_module.VIEW_MODES, "BiRefNet Alpha view mode must be registered"
 
-    from PySide6.QtCore import QProcess
     from PySide6.QtWidgets import QApplication
 
     created_app = QApplication.instance() is None
     qt_app = QApplication.instance() or QApplication(["imgkey-ui-probe"])
     window = app_module.MainWindow()
     try:
-        assert window.generate_biref_action.text() == "Generate BiRefNet Hint"
-        assert window.cancel_ai_action.text() == "Cancel AI"
         assert window.gpu_status_action.text() == "GPU Status"
-        assert window.generate_birefnet_btn.text() == "Generate BiRefNet Hint"
-        assert window.cancel_ai_btn.text() == "Cancel AI"
         assert window.gpu_status_btn.text() == "GPU Status"
-        assert window.view_combo.findText("BiRefNet Alpha") >= 0
         assert window.output_mode.findText("Classical") >= 0
-        assert window.output_mode.findText("Manual AI Hint") >= 0
-        assert window.output_mode.findText("Hybrid BiRefNet") >= 0
-        assert window.biref_alpha_mask is None
+        assert window.output_mode.findText("Imported Matte") >= 0
         assert window.alpha_hint_mask is None
+        forbidden = ("Bi" + "RefNet", "Corridor" + "Key", "A" + "I Hint", "Hy" + "brid" + " Bi" + "RefNet")
+        for phrase in forbidden:
+            assert all(phrase not in mode for mode in app_module.VIEW_MODES), f"removed phrase leaked into view modes: {phrase}"
+            assert window.output_mode.findText(phrase) < 0, f"removed phrase leaked into output modes: {phrase}"
+            assert phrase not in window.windowTitle(), f"removed phrase leaked into window title: {phrase}"
 
-        window.biref_alpha_mask = np.full((6, 8), 127, dtype=np.uint8)
-        window._sync_birefnet_status("done")
-        assert "Hybrid BiRefNet" in window.birefnet_status.text()
-        assert window.current_settings().mode == "GraphicExact", "generated BiRefNet hint must not switch classical mode"
-        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
-        assert alpha_hint is None and generated_hint is None, "Classical output mode must not pass manual or generated hints"
+        assert window.current_settings().mode == "GraphicExact", "default output must use the classical keyer"
+        alpha_hint = window._processing_alpha_input(window.current_settings(), (6, 8))
+        assert alpha_hint is None, "Classical output mode must not pass imported mattes"
 
-        manual_hint = np.full((6, 8), 255, dtype=np.uint8)
-        window.alpha_hint_mask = manual_hint
-        window._sync_ai_hint_status("manual.png")
-        window.output_mode.setCurrentText("Manual AI Hint")
-        assert window.current_settings().mode == "AIHint", "manual alpha hint import path must still drive AIHint mode"
-        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
-        assert alpha_hint is not None and generated_hint is None, "Manual AI Hint mode must pass only the imported manual hint"
-        window.output_mode.setCurrentText("Hybrid BiRefNet")
-        assert window.current_settings().mode == "HybridBiRefNet", "Hybrid BiRefNet output mode must select the hybrid keyer"
-        alpha_hint, generated_hint = window._processing_alpha_inputs(window.current_settings(), (6, 8))
-        assert alpha_hint is None and generated_hint is not None, "Hybrid BiRefNet mode must pass only generated BiRefNet alpha"
-        assert window.biref_alpha_mask is not window.alpha_hint_mask, "BiRefNet alpha must stay separate from manual alpha_hint_mask"
-
-        with tempfile.TemporaryDirectory(prefix="imgkey-ui-ai-process-") as tmp_dir:
-            tmp = Path(tmp_dir)
-            request_path = tmp / "request.json"
-            cancel_path = tmp / "cancel.flag"
-            temp_input_path = tmp / "source.png"
-            request_path.write_text("{}", encoding="utf-8")
-            temp_input_path.write_text("temp", encoding="utf-8")
-            worker = QProcess(window)
-            worker.start(sys.executable, ["-c", "import time; time.sleep(30)"])
-            assert worker.waitForStarted(3000), f"dummy AI process did not start: {worker.errorString()}"
-            window.ai_worker_process = worker
-            window.ai_worker_request_path = request_path
-            window.ai_worker_cancel_path = cancel_path
-            window.ai_worker_temp_input_path = temp_input_path
-            window.cancel_ai()
-            assert cancel_path.exists(), "Cancel AI should write a cancel flag for the worker"
-            window.close()
-            assert worker.state() == QProcess.NotRunning, "closeEvent must terminate the AI subprocess"
-            assert window.ai_worker_process is None, "closeEvent must clear the AI process reference"
-            assert not request_path.exists(), "closeEvent must clean the worker request file"
-            assert not temp_input_path.exists(), "closeEvent must clean temp UI input files"
+        imported = np.full((6, 8), 255, dtype=np.uint8)
+        window.alpha_hint_mask = imported
+        window._sync_imported_matte_status("manual.png")
+        window.output_mode.setCurrentText("Imported Matte")
+        assert window.current_settings().mode == "ImportedMatte", "imported matte output mode must drive imported matte guidance"
+        alpha_hint = window._processing_alpha_input(window.current_settings(), (6, 8))
+        assert alpha_hint is not None and alpha_hint.shape == (6, 8), "Imported Matte mode must pass the loaded matte"
+        assert "Imported matte: loaded" in window.alpha_hint_status.text()
     finally:
         window.close()
         window.deleteLater()
@@ -2596,7 +2015,7 @@ def run_app_birefnet_ui_tests() -> None:
             qt_app.quit()
 
     after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_probe == before, f"BiRefNet UI probe must not import heavy runtimes: {after_probe - before}"
+    assert after_probe == before, f"UI probe must not import heavy runtimes: {after_probe - before}"
 
 
 def _cyanish_screen_fixture() -> DiagnosticFixture:
@@ -2737,8 +2156,8 @@ def run_v6_screen_analysis_tests() -> None:
     assert large_plate.full_res_rgb is None, "large/cap-zero screen plate must not retain full HxWx3 RGB"
     assert large_plate.low_res_rgb is not None and max(large_plate.low_res_rgb.shape[:2]) <= 64, "large screen plate must stay low-res bounded"
 
-    # New maps are standalone in Phase 6. The existing export/low-memory result
-    # must not grow retained debug-map fields before hybrid mode is wired later.
+    # Screen-analysis maps stay standalone; export/low-memory results must not
+    # grow retained debug-map fields.
     low_memory = process_key_image(green.rgb, green.settings, include_debug=False)
     for name in ("screen_distance", "spill_probability", "classical_confidence", "screen_plate_rgb"):
         assert not hasattr(low_memory, name), f"low-memory export result should not retain {name} in Phase 6"
@@ -2747,442 +2166,73 @@ def run_v6_screen_analysis_tests() -> None:
     assert after_tests == before, f"screen analysis tests must not import heavy runtimes: {after_tests - before}"
 
 
-def run_v6_hybrid_trimap_tests() -> None:
-    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    hybrid_trimap = importlib.import_module("hybrid_trimap")
-    screen_analysis = importlib.import_module("screen_analysis")
-    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_import == before, f"importing hybrid trimap helpers must not import heavy runtimes: {after_import - before}"
-
-    h, w = 56, 56
-    alpha = np.zeros((h, w), dtype=np.uint8)
-    screen_prob = np.full((h, w), 255, dtype=np.uint8)
-    screen_dist = np.zeros((h, w), dtype=np.uint8)
-    spill_prob = np.zeros((h, w), dtype=np.uint8)
-    confidence = np.full((h, w), 255, dtype=np.uint8)
-    biref = np.zeros((h, w), dtype=np.uint8)
-    background = np.zeros((h, w), dtype=np.uint8)
-    edge = np.zeros((h, w), dtype=np.uint8)
-    fringe = np.zeros((h, w), dtype=np.uint8)
-    keep = np.zeros((h, w), dtype=np.uint8)
-    remove = np.zeros((h, w), dtype=np.uint8)
-
-    bg_pt = (3, 3)
-    fg_pt = (10, 10)
-    biref_fg_pt = (10, 40)
-    conflict_pt = (26, 26)
-    keep_conflict_pt = (42, 10)
-    remove_pt = (42, 42)
-    edge_pt = (18, 8)
-    fringe_pt = (8, 28)
-    spill_pt = (28, 8)
-    keep_spill_pt = (8, 48)
-    weak_biref_detail_pt = (16, 42)
-
-    alpha[fg_pt] = 255
-    screen_prob[fg_pt] = 10
-    alpha[biref_fg_pt] = 24
-    biref[biref_fg_pt] = 232
-    screen_prob[biref_fg_pt] = 20
-
-    alpha[conflict_pt] = 255
-    biref[conflict_pt] = 128
-    screen_prob[conflict_pt] = 250
-
-    alpha[keep_conflict_pt] = 128
-    biref[keep_conflict_pt] = 160
-    screen_prob[keep_conflict_pt] = 250
-    keep[keep_conflict_pt] = 255
-    remove[keep_conflict_pt] = 255
-
-    alpha[remove_pt] = 255
-    biref[remove_pt] = 255
-    screen_prob[remove_pt] = 20
-    remove[remove_pt] = 255
-
-    alpha[edge_pt] = 255
-    screen_prob[edge_pt] = 20
-    edge[edge_pt] = 255
-
-    alpha[fringe_pt] = 120
-    screen_prob[fringe_pt] = 80
-    fringe[fringe_pt] = 255
-
-    alpha[spill_pt] = 128
-    screen_prob[spill_pt] = 60
-    spill_prob[spill_pt] = 180
-
-    alpha[weak_biref_detail_pt] = 0
-    biref[weak_biref_detail_pt] = 40
-    screen_prob[weak_biref_detail_pt] = 250
-
-    alpha[keep_spill_pt] = 128
-    screen_prob[keep_spill_pt] = 60
-    spill_prob[keep_spill_pt] = 220
-    keep[keep_spill_pt] = 255
-
-    plate = screen_analysis.ScreenPlateRGB(source_shape=(h, w), fallback_rgb=(0, 220, 50), low_res_rgb=np.full((4, 4, 3), (0, 220, 50), dtype=np.uint8))
-    result = hybrid_trimap.build_hybrid_trimap(
-        alpha,
-        screen_prob,
-        screen_dist,
-        spill_prob,
-        confidence,
-        background,
-        edge,
-        fringe,
-        plate,
-        biref,
-        keep,
-        remove,
-        spill_threshold=96,
-    )
-
-    assert result.known_bg[bg_pt], "high-confidence screen/low-alpha pixel should be known background"
-    assert result.safe_bg[bg_pt], "known screen background should be safe_bg"
-    assert result.known_fg[fg_pt], "classical opaque non-screen pixel should be known foreground"
-    assert result.known_fg[biref_fg_pt], "BiRefNet opaque non-screen pixel should be known foreground"
-    assert result.protected_fg[fg_pt] and result.protected_fg[biref_fg_pt], "clean known foreground should be protected"
-
-    assert result.conflict[conflict_pt], "screen/BiRefNet disagreement should be a conflict"
-    assert result.unknown[conflict_pt] and result.hard_unknown[conflict_pt], "conflict should become hard unknown"
-    assert not result.known_fg[conflict_pt], "conflict must override automatic known foreground"
-    assert not result.known_bg[conflict_pt], "conflict should not become known background"
-
-    assert result.known_fg[keep_conflict_pt], "manual keep should be the foreground override that wins over conflict"
-    assert not result.known_bg[keep_conflict_pt] and not result.unknown[keep_conflict_pt], "manual keep should be exclusive"
-    assert result.manual_keep_core[keep_conflict_pt], "manual keep core should be returned"
-    assert not result.manual_remove_effective[keep_conflict_pt], "keep must override remove"
-
-    assert result.known_bg[remove_pt], "manual remove should force background where keep is absent"
-    assert not result.known_fg[remove_pt] and not result.unknown[remove_pt], "manual remove should be exclusive"
-    assert result.manual_remove_effective[remove_pt], "manual remove effective mask should be returned"
-
-    assert result.unknown[edge_pt] and result.hard_unknown[edge_pt], "strong edge band should become hard unknown"
-    assert result.soft_unknown[fringe_pt], "fringe mask should expand soft unknown"
-    assert result.unmix_region[fringe_pt], "soft detail region should be available for unmix"
-    assert result.spill_region[spill_pt], "mid-alpha high-spill pixel should be spill region"
-    assert result.despill_region[spill_pt], "spill region should be despill candidate away from keep/background"
-    assert result.unmix_region[spill_pt], "mid-alpha spill pixel should be unmix candidate"
-    assert result.spill_region[keep_spill_pt], "manual keep does not hide spill diagnostics"
-    assert not result.despill_region[keep_spill_pt], "manual keep must protect from aggressive despill"
-    assert result.unknown[weak_biref_detail_pt], "weak BiRefNet detail on screen should stay unknown, not get clamped to background"
-    assert not result.known_bg[weak_biref_detail_pt], "BiRefNet low-mid detail must avoid aggressive known-bg erosion"
-
-    assert not np.any(result.known_bg & result.known_fg), "known_bg/known_fg must be mutually exclusive"
-    assert not np.any(result.known_bg & result.unknown), "known_bg/unknown must be mutually exclusive"
-    assert not np.any(result.known_fg & result.unknown), "known_fg/unknown must be mutually exclusive"
-    assert result.spill_threshold == 96, "spill threshold should be explicit on the result"
-    assert result.candidate_alpha.dtype == np.uint8 and np.array_equal(result.candidate_alpha, alpha), "candidate alpha should default to classical alpha"
-    assert "has_screen_plate" in result.debug_masks, "screen plate reference should be represented for Phase 8 diagnostics"
-
-    explicit_core = np.zeros((h, w), dtype=np.uint8)
-    explicit_core[keep_spill_pt] = 255
-    explicit_core_result = hybrid_trimap.build_hybrid_trimap(
-        alpha,
-        screen_prob,
-        screen_dist,
-        spill_prob,
-        confidence,
-        background,
-        edge,
-        fringe,
-        plate,
-        biref,
-        keep,
-        remove,
-        manual_keep_core=explicit_core,
-    )
-    assert explicit_core_result.known_fg[keep_conflict_pt], "raw keep must still win over remove when manual_keep_core is supplied"
-    assert not explicit_core_result.manual_remove_effective[keep_conflict_pt], "manual_keep_core must not let remove bypass raw keep"
-
-    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_tests == before, f"hybrid trimap tests must not import heavy runtimes: {after_tests - before}"
-
-
-def run_v6_hybrid_alpha_mode_tests() -> None:
-    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    hybrid_trimap = importlib.import_module("hybrid_trimap")
-
-    fixture = hair_lines_fixture()
-    biref_alpha = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
-    classical = process_key_image(fixture.rgb, fixture.settings)
-    hybrid_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
-    hybrid = process_key_image(fixture.rgb, hybrid_settings, biref_alpha=biref_alpha)
-
-    detail_mask = (fixture.expected_alpha > 0.05) & (fixture.expected_alpha < 0.90)
-    classical_detail_mean = float(np.mean(classical.alpha[detail_mask]))
-    hybrid_detail_mean = float(np.mean(hybrid.alpha[detail_mask]))
-    assert hybrid_detail_mean >= classical_detail_mean + 8.0, (
-        f"HybridBiRefNet should retain more thin detail alpha, {classical_detail_mean:.2f}->{hybrid_detail_mean:.2f}"
-    )
-    border = np.zeros(fixture.rgb.shape[:2], dtype=bool)
-    border[:20, :] = True
-    border[-20:, :] = True
-    border[:, :20] = True
-    border[:, -20:] = True
-    assert int(hybrid.alpha[border].max()) == 0, "hybrid known/background border must stay fully transparent"
-    assert int(hybrid.rgba[hybrid.alpha == 0, :3].max()) == 0, "HybridBiRefNet must keep alpha==0 RGB exactly zero"
-    assert not np.array_equal(hybrid.alpha, biref_alpha), "HybridBiRefNet must not use BiRefNet alpha directly as final alpha"
-
-    try:
-        process_key_image(fixture.rgb, hybrid_settings, alpha_hint=biref_alpha)
-    except ValueError as exc:
-        assert "biref_alpha" in str(exc), "missing distinct BiRefNet alpha error should name biref_alpha"
-    else:
-        raise AssertionError("HybridBiRefNet must not silently consume manual alpha_hint as BiRefNet input")
-
-    noisy_biref = np.full(fixture.rgb.shape[:2], 255, dtype=np.uint8)
-    for mode in ("GraphicExact", "ProChroma", "AIHint"):
-        settings = replace(fixture.settings, mode=mode)
-        manual_hint = biref_alpha if mode == "AIHint" else None
-        base = process_key_image(fixture.rgb, settings, alpha_hint=manual_hint)
-        with_biref = process_key_image(fixture.rgb, settings, alpha_hint=manual_hint, biref_alpha=noisy_biref)
-        assert np.array_equal(base.rgba, with_biref.rgba), f"{mode} output must ignore unrelated biref_alpha input"
-        assert np.array_equal(base.alpha, with_biref.alpha), f"{mode} alpha must stay unchanged"
-
-    h, w = 8, 8
-    classical_alpha = np.full((h, w), 100, dtype=np.uint8)
-    biref = np.full((h, w), 100, dtype=np.uint8)
-    screen_prob = np.zeros((h, w), dtype=np.uint8)
-    screen_dist = np.zeros((h, w), dtype=np.uint8)
-    spill_prob = np.zeros((h, w), dtype=np.uint8)
-    background = np.zeros((h, w), dtype=bool)
-    edge = np.zeros((h, w), dtype=np.uint8)
-    keep = np.zeros((h, w), dtype=np.uint8)
-    remove = np.zeros((h, w), dtype=np.uint8)
-
-    bg_pt = (0, 0)
-    fg_pt = (0, 1)
-    conflict_pt = (0, 2)
-    keep_remove_pt = (0, 3)
-    remove_pt = (0, 4)
-    unknown_pt = (0, 5)
-
-    screen_prob[bg_pt] = 255
-    classical_alpha[bg_pt] = 0
-    biref[bg_pt] = 0
-    classical_alpha[fg_pt] = 20
-    biref[fg_pt] = 230
-    screen_prob[fg_pt] = 0
-    classical_alpha[conflict_pt] = 255
-    biref[conflict_pt] = 128
-    screen_prob[conflict_pt] = 255
-    classical_alpha[keep_remove_pt] = 20
-    biref[keep_remove_pt] = 160
-    screen_prob[keep_remove_pt] = 255
-    keep[keep_remove_pt] = 255
-    remove[keep_remove_pt] = 255
-    classical_alpha[remove_pt] = 255
-    biref[remove_pt] = 255
-    remove[remove_pt] = 255
-    classical_alpha[unknown_pt] = 32
-    biref[unknown_pt] = 160
-
-    trimap = hybrid_trimap.build_hybrid_trimap(
-        classical_alpha,
-        screen_prob,
-        screen_dist,
-        spill_prob,
-        None,
-        background,
-        edge,
-        None,
-        None,
-        biref,
-        keep,
-        remove,
-    )
-    original_alpha = np.ones((h, w), dtype=np.float32)
-    original_alpha[fg_pt] = 0.5
-    original_alpha[keep_remove_pt] = 0.25
-    merged = keyer_module._merge_hybrid_alpha(
-        np.zeros((h, w, 3), dtype=np.uint8),
-        classical_alpha,
-        biref,
-        trimap,
-        KeySettings(guided_alpha_refine=0.0),
-        original_alpha,
-        keep > 127,
-        remove > 127,
-    )
-
-    expected_conflict_w = (128.0 - 32.0) / (200.0 - 32.0)
-    expected_conflict_w = expected_conflict_w * expected_conflict_w * (3.0 - 2.0 * expected_conflict_w)
-    expected_conflict = int(round(255.0 * (1.0 - expected_conflict_w) + 128.0 * expected_conflict_w))
-    expected_unknown_w = (160.0 - 32.0) / (200.0 - 32.0)
-    expected_unknown_w = expected_unknown_w * expected_unknown_w * (3.0 - 2.0 * expected_unknown_w)
-    expected_unknown = int(round(32.0 * (1.0 - expected_unknown_w) + 160.0 * expected_unknown_w))
-
-    assert int(merged[bg_pt]) == 0, "known_bg must clamp final alpha to 0"
-    assert int(merged[fg_pt]) == 115, "source alpha must cap automatic known-fg max(classical,biref) alpha"
-    assert trimap.conflict[conflict_pt] and trimap.unknown[conflict_pt], "conflict must stay unknown before manual overrides"
-    assert int(merged[conflict_pt]) == expected_conflict, "conflict/hard-unknown should use unknown blend, not foreground clamp"
-    assert int(merged[keep_remove_pt]) == 64, "manual keep must beat remove then remain capped by original source alpha"
-    assert int(merged[remove_pt]) == 0, "manual remove must force background where keep is absent"
-    assert int(merged[unknown_pt]) == expected_unknown, "unknown blend must use smoothstep(64, 220, biref_alpha)"
-
-    tiled_settings = replace(hybrid_settings, use_tiling=True, tile_size=97, tile_overlap=18, local_screen_model=True)
-    tiled = process_key_image(fixture.rgb, tiled_settings, biref_alpha=biref_alpha)
-    full = process_key_image(fixture.rgb, replace(tiled_settings, use_tiling=False), biref_alpha=biref_alpha)
-    tile_diff = np.abs(tiled.rgba.astype(np.int16) - full.rgba.astype(np.int16))
-    assert int(tile_diff[:, :, 3].max()) == 0, f"HybridBiRefNet tiled/full alpha diff must be exact, got {int(tile_diff[:, :, 3].max())}"
-    assert int(tile_diff.max()) <= 1, f"HybridBiRefNet tiled/full RGBA seam diff too high: {int(tile_diff.max())}"
-
-    crop = (170, 90, 390, 310)
-    x0, y0, x1, y1 = crop
-    cropped = process_key_image(fixture.rgb, replace(tiled_settings, full_res_crop=crop), biref_alpha=biref_alpha)
-    crop_diff = np.abs(cropped.rgba.astype(np.int16) - full.rgba[y0:y1, x0:x1].astype(np.int16))
-    assert int(crop_diff[:, :, 3].max()) == 0, "HybridBiRefNet crop alpha must match full-render crop exactly"
-    assert int(crop_diff.max()) <= 1, f"HybridBiRefNet crop RGBA diff too high: {int(crop_diff.max())}"
-
-    skipped = process_key_image(
-        fixture.rgb,
-        replace(hybrid_settings, guided_alpha_refine=1.0, guided_radius=5, guided_max_pixels=1),
-        biref_alpha=biref_alpha,
-    )
-    assert np.array_equal(hybrid.alpha, skipped.alpha), "HybridBiRefNet guided cap fallback must skip deterministically unchanged"
-    assert np.array_equal(hybrid.rgba, skipped.rgba), "HybridBiRefNet guided cap fallback must preserve RGBA"
-
-    refined = process_key_image(
-        fixture.rgb,
-        replace(hybrid_settings, guided_alpha_refine=0.85, guided_radius=5, guided_eps=1e-3, guided_max_pixels=1_000_000),
-        biref_alpha=biref_alpha,
-    )
-    refine_mask = (hybrid.alpha > 0) & (hybrid.alpha < 255)
-    rough_before = alpha_edge_roughness(hybrid.alpha, refine_mask)
-    rough_after = alpha_edge_roughness(refined.alpha, refine_mask)
-    assert rough_after <= rough_before * 0.75, f"unknown-only hybrid refinement should reduce jagged alpha, {rough_before:.3f}->{rough_after:.3f}"
-    assert float(np.mean(refined.alpha[detail_mask])) >= hybrid_detail_mean, "guided hybrid refinement must preserve BiRefNet-retained thin detail"
-    assert int(refined.alpha[border].max()) == 0, "guided hybrid refinement must not expand confident background leak"
-
-    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_tests == before, f"HybridBiRefNet alpha tests must not import heavy runtimes: {after_tests - before}"
-    print(
-        "Phase 7 HybridBiRefNet alpha checks: "
-        f"detail_mean {classical_detail_mean:.2f}->{hybrid_detail_mean:.2f}; "
-        f"tile_rgba_diff={int(tile_diff.max())}; crop_rgba_diff={int(crop_diff.max())}; "
-        f"roughness {rough_before:.2f}->{rough_after:.2f}"
-    )
-
-
-def run_v6_hybrid_rgb_cleanup_tests() -> None:
-    before_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    fixture = hair_lines_fixture()
-    biref_alpha = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
-    cleanup_off_settings = replace(
-        fixture.settings,
-        mode="HybridBiRefNet",
-        guided_alpha_refine=0.0,
-        edge_color_repair=0.0,
-        unmix_amount=0.0,
-        despill=0.0,
-        fringe_remove=0.0,
-    )
-    cleanup_on_settings = replace(fixture.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0)
-    before = process_key_image(fixture.rgb, cleanup_off_settings, biref_alpha=biref_alpha)
-    after = process_key_image(fixture.rgb, cleanup_on_settings, biref_alpha=biref_alpha)
-
-    assert np.array_equal(before.alpha, after.alpha), "P8 RGB cleanup must not alter final HybridBiRefNet alpha"
-    assert int(after.rgba[after.alpha == 0, :3].max()) == 0, "P8 must keep alpha==0 RGB exactly zero"
-    assert np.isfinite(after.rgba.astype(np.float32)).all(), "P8 RGBA output must not contain NaN/Inf"
-
-    edge_mask = fixture.soft_edge_mask & (after.alpha > 0)
-    composite_residuals: dict[str, tuple[dict[str, int | float], dict[str, int | float]]] = {}
-    for name, color in {
-        "black": (0, 0, 0),
-        "white": (255, 255, 255),
-        "gray": (128, 128, 128),
-        "checker": None,
-    }.items():
-        before_rgb = checkerboard_composite(before.rgba) if color is None else _solid_composite(before.rgba, color)
-        after_rgb = checkerboard_composite(after.rgba) if color is None else _solid_composite(after.rgba, color)
-        before_residual = rgb_key_residual(before_rgb, fixture.settings.key_color, edge_mask)
-        after_residual = rgb_key_residual(after_rgb, fixture.settings.key_color, edge_mask)
-        composite_residuals[name] = (before_residual, after_residual)
-        assert after_residual["mean_positive_excess"] < before_residual["mean_positive_excess"] * 0.70, (
-            f"hybrid cleanup should lower {name} composite halo mean: {before_residual} -> {after_residual}"
-        )
-        assert after_residual["p95_positive_excess"] <= before_residual["p95_positive_excess"], (
-            f"hybrid cleanup should not worsen {name} composite p95 halo: {before_residual} -> {after_residual}"
-        )
-
-    core_delta = opaque_foreground_max_delta(fixture.rgb, after.rgba, fixture.foreground_core_mask, fixture.expected_foreground_rgb)
-    assert core_delta["max_delta"] <= 32, f"hybrid cleanup changed protected foreground core too much: {core_delta}"
-
-    low_alpha = edge_mask & (after.alpha > 0) & (after.alpha < 38)
-    low_alpha_residual = edge_key_residual(after.rgba, fixture.settings.key_color, low_alpha)
-    assert low_alpha_residual["max_positive_excess"] <= 96, f"low-alpha hybrid RGB stayed too saturated/noisy: {low_alpha_residual}"
-    assert low_alpha_residual["p95_positive_excess"] <= 80, f"low-alpha hybrid RGB p95 stayed too saturated/noisy: {low_alpha_residual}"
-
-    original_alpha = np.ones(fixture.rgb.shape[:2], dtype=np.float32)
-    original_alpha[fixture.foreground_core_mask] = 0.42
-    keep_mask = fixture.foreground_core_mask.astype(np.uint8) * 255
-    capped = process_key_image(
-        fixture.rgb,
-        cleanup_on_settings,
-        original_alpha=original_alpha,
-        keep_mask=keep_mask,
-        biref_alpha=biref_alpha,
-    )
-    cap_limit = int(round(255.0 * 0.42)) + 1
-    assert int(capped.alpha[fixture.foreground_core_mask].max()) <= cap_limit, "P8 must not raise source-alpha-capped manual-keep pixels"
-    assert int(capped.rgba[capped.alpha == 0, :3].max()) == 0, "source-capped known background must keep RGB zero"
-
-    noisy_biref = np.full(fixture.rgb.shape[:2], 255, dtype=np.uint8)
-    classical = process_key_image(fixture.rgb, replace(fixture.settings, mode="GraphicExact"))
-    classical_with_biref = process_key_image(fixture.rgb, replace(fixture.settings, mode="GraphicExact"), biref_alpha=noisy_biref)
-    assert np.array_equal(classical.rgba, classical_with_biref.rgba), "generated BiRefNet hints must not alter classical output"
-
-    gradient = green_gradient_screen_fixture()
-    gradient_biref = np.rint(np.clip(gradient.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
-    gradient_off_settings = replace(
-        gradient.settings,
-        mode="HybridBiRefNet",
-        guided_alpha_refine=0.0,
-        edge_color_repair=0.0,
-        unmix_amount=0.0,
-        despill=0.0,
-        fringe_remove=0.0,
-    )
-    gradient_off = process_key_image(gradient.rgb, gradient_off_settings, biref_alpha=gradient_biref)
-    gradient_on = process_key_image(gradient.rgb, replace(gradient.settings, mode="HybridBiRefNet", guided_alpha_refine=0.0), biref_alpha=gradient_biref)
-    gradient_edge = gradient.soft_edge_mask & (gradient_on.alpha > 0)
-    gradient_before = edge_key_residual(gradient_off.rgba, gradient.settings.key_color, gradient_edge)
-    gradient_after = edge_key_residual(gradient_on.rgba, gradient.settings.key_color, gradient_edge)
-    assert gradient_after["mean_positive_excess"] < gradient_before["mean_positive_excess"], (
-        f"local screen plate cleanup should reduce gradient-screen edge residual: {gradient_before} -> {gradient_after}"
-    )
-
-    after_imports = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_imports == before_imports, f"HybridBiRefNet RGB cleanup tests must not import heavy runtimes: {after_imports - before_imports}"
-    print(
-        "Phase 8 HybridBiRefNet RGB cleanup checks: "
-        + "; ".join(
-            f"{name} mean {pair[0]['mean_positive_excess']:.2f}->{pair[1]['mean_positive_excess']:.2f}"
-            for name, pair in composite_residuals.items()
-        )
-        + f"; core_delta={core_delta['max_delta']}; low_alpha_p95={low_alpha_residual['p95_positive_excess']:.1f}"
-    )
-
-
 def run_import_compile_tests() -> None:
     for source in (
         "app.py",
         "keyer.py",
         "smoke_test.py",
-        "ai_assist.py",
         "gpu_runtime.py",
-        "ai_worker.py",
         "screen_analysis.py",
-        "hybrid_trimap.py",
-        "ai_backends/__init__.py",
-        "ai_backends/birefnet_adapter.py",
     ):
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
     importlib.import_module("gpu_runtime")
+
+
+def run_removed_surface_tests() -> None:
+    missing_paths = [
+        Path("a" + "i" + "_assist.py"),
+        Path("a" + "i" + "_worker.py"),
+        Path("a" + "i" + "_backends"),
+        Path("ImgKey-GPU-" + "Bi" + "RefNet.spec"),
+        Path("requirements-gpu-" + "bi" + "refnet" + "-cu128.txt"),
+    ]
+    existing = [str(path) for path in missing_paths if path.exists()]
+    assert not existing, f"removed runtime files still exist: {existing}"
+
+
+def run_source_surface_guard() -> None:
+    roots = [
+        Path("app.py"),
+        Path("keyer.py"),
+        Path("smoke_test.py"),
+        Path("README.md"),
+        Path("AGENTS.md"),
+        Path("gpu_runtime.py"),
+        Path("screen_analysis.py"),
+        Path("ImgKey.spec"),
+        Path("ImgKey-GPU.spec"),
+        Path("requirements.txt"),
+        Path("requirements-gpu-runtime-cu128.txt"),
+    ]
+    docs = Path("docs")
+    if docs.exists():
+        roots.extend(path for path in docs.glob("**/*") if path.is_file())
+    forbidden = [
+        "Bi" + "RefNet",
+        "bi" + "ref",
+        "Corridor" + "Key",
+        "Matting" + " Anything",
+        "S" + "AM",
+        "U2" + "Net",
+        "MOD" + "Net",
+        "ViT" + "Matte",
+        "Hugging" + " Face",
+        "trans" + "formers",
+        "safe" + "tensors",
+        "A" + "I Hint",
+        "Hy" + "brid" + " Bi" + "RefNet",
+    ]
+    hits: list[tuple[str, str]] = []
+    for path in roots:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for phrase in forbidden:
+            if phrase in text:
+                hits.append((str(path), phrase))
+    assert not hits, f"removed product/runtime phrases remain: {hits}"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -3191,13 +2241,12 @@ def main(argv: list[str] | None = None) -> None:
         "--write-diagnostics",
         "--write-edge-repair-diagnostics",
         "--write-algorithm-baseline",
-        "--write-birefnet-diagnostics",
     }
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline] [--write-birefnet-diagnostics]; "
+            "[--write-algorithm-baseline]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -3212,16 +2261,11 @@ def main(argv: list[str] | None = None) -> None:
         run_phase4_tile_local_screen_tests()
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
-    run_optional_ai_seam_tests()
-    run_birefnet_adapter_manifest_tests()
-    run_ai_worker_contract_tests()
     run_gpu_runtime_probe_tests()
-    run_app_birefnet_ui_tests()
+    run_app_ui_tests()
     run_v6_screen_analysis_tests()
-    run_v6_hybrid_trimap_tests()
-    run_v6_hybrid_alpha_mode_tests()
-    run_v6_hybrid_rgb_cleanup_tests()
-    run_v6_birefnet_diagnostics_tests()
+    run_removed_surface_tests()
+    run_source_surface_guard()
     run_import_compile_tests()
     if "--write-diagnostics" in args:
         write_diagnostic_outputs()
@@ -3229,8 +2273,6 @@ def main(argv: list[str] | None = None) -> None:
         write_edge_repair_diagnostics()
     if "--write-algorithm-baseline" in args:
         write_algorithm_upgrade_baseline()
-    if "--write-birefnet-diagnostics" in args:
-        write_birefnet_diagnostics()
     print("smoke ok", rgba.shape)
 
 

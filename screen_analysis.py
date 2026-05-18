@@ -10,7 +10,7 @@ import numpy as np
 DEFAULT_SCREEN_COLOR_RGB = (0, 220, 50)
 DEFAULT_MAX_FULL_RES_SCREEN_PLATE_PIXELS = 4_000_000
 DEFAULT_LOW_RES_MAX_SIDE = 512
-_MAX_SCREEN_SAMPLE_PIXELS = 200_000
+_MAX_SCREEN_PICK_PIXELS = 200_000
 
 
 @dataclass(slots=True)
@@ -111,7 +111,7 @@ def analyze_screen(
     max_full_res_screen_plate_pixels: int | None = None,
     low_res_max_side: int = DEFAULT_LOW_RES_MAX_SIDE,
 ) -> ScreenAnalysisResult:
-    """Build deterministic screen-analysis maps for later hybrid keying.
+    """Build deterministic screen-analysis maps for later classical cleanup.
 
     The function intentionally keeps retained maps compact: scalar maps are
     uint8, masks are uint8, and full-resolution RGB screen plates are retained
@@ -234,8 +234,8 @@ def _estimate_screen_color(
     samples = rgb[eligible]
     if samples.size == 0:
         return fallback
-    if len(samples) > _MAX_SCREEN_SAMPLE_PIXELS:
-        step = max(1, len(samples) // _MAX_SCREEN_SAMPLE_PIXELS)
+    if len(samples) > _MAX_SCREEN_PICK_PIXELS:
+        step = max(1, len(samples) // _MAX_SCREEN_PICK_PIXELS)
         samples = samples[::step]
 
     hsv = cv2.cvtColor(samples.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)

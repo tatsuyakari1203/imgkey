@@ -1,9 +1,11 @@
 # 05 - ImgKey v6 BiRefNet Detail Keyer
 
 Date: 2026-05-18
-Status: Completed
+Status: Superseded / historical
 Owner: ImgKey AI/GPU Detail Keyer
 Scope: Integrate BiRefNet as the only AI model path for detail-preserving alpha hints, then merge it with the classical chroma keyer and keep classical RGB cleanup.
+
+Superseded by: `.plan/imgkey-v7-graphic-transition-unmix.md` Phase 0. This plan is retained only as historical context; do not resume or implement it.
 
 ---
 

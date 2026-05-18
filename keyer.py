@@ -20,7 +20,7 @@ _MAX_TILE_LOCAL_NEAREST_INNER_RADIUS = 256
 
 @dataclass(slots=True)
 class KeySettings:
-    """Settings for the non-AI ImgKey v2 keying pipeline.
+    """Settings for the ImgKey classical keying pipeline.
 
     The original app still constructs this class with only
     ``key_color/tolerance/softness/edge_blur/cleanup/despill``. Those fields
@@ -35,7 +35,7 @@ class KeySettings:
     cleanup: int = 1
     despill: float = 0.70
 
-    # v2 sampling/model controls.
+    # v2 sampling controls.
     mode: str = "GraphicExact"
     sample_size: int = 5
     auto_border_sample: bool = True
@@ -64,9 +64,9 @@ class KeySettings:
     aggressive_threshold: float = 0.84
     aggressive_min_area: int = 0
 
-    # Optional AI/manual alpha hint seam. A grayscale hint is not an AI runtime;
-    # it is a coarse protection matte imported from any external tool and merged
-    # conservatively into the classical connected-background pipeline.
+    # Optional imported matte. A grayscale matte is merged conservatively into
+    # the classical connected-background pipeline as foreground protection and
+    # alpha guidance.
     alpha_hint_foreground_threshold: int = 192
     alpha_hint_minimum_alpha: int = 48
     alpha_hint_strength: float = 1.0
@@ -128,10 +128,6 @@ class _GlobalMatte:
     fringe_mask: np.ndarray
     inner_labels: np.ndarray | None
     inner_label_to_flat: np.ndarray | None
-    screen_plate_rgb: object | None = None
-    hybrid_unmix_region: np.ndarray | None = None
-    hybrid_despill_region: np.ndarray | None = None
-    hybrid_protected_fg: np.ndarray | None = None
 
 
 def read_image_rgb(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
@@ -158,7 +154,7 @@ def write_png_rgba(path: str | Path, rgba: np.ndarray) -> None:
 
 
 def read_grayscale_mask(path: str | Path, shape: tuple[int, int] | None = None) -> np.ndarray:
-    """Read a manual keep/remove matte or AI alpha hint as uint8 grayscale.
+    """Read a manual keep/remove/imported matte as uint8 grayscale.
 
     If ``shape`` is supplied, the mask is resized with nearest-neighbor
     interpolation so brush/import tools can pass it directly to the engine.
@@ -173,15 +169,16 @@ def read_grayscale_mask(path: str | Path, shape: tuple[int, int] | None = None) 
     return mask
 
 
-def read_alpha_hint_mask(path: str | Path, shape: tuple[int, int] | None = None) -> np.ndarray:
-    """Read an externally generated coarse alpha hint as uint8 grayscale.
-
-    ImgKey does not generate this with bundled AI. The mask can come from a
-    user, future BiRefNet assist, or another external tool and is interpreted as
-    foreground protection/alpha guidance for the classical v2 pipeline.
-    """
+def read_imported_matte_mask(path: str | Path, shape: tuple[int, int] | None = None) -> np.ndarray:
+    """Read an imported foreground-protection matte as uint8 grayscale."""
 
     return read_grayscale_mask(path, shape)
+
+
+def read_alpha_hint_mask(path: str | Path, shape: tuple[int, int] | None = None) -> np.ndarray:
+    """Backward-compatible alias for imported matte loading."""
+
+    return read_imported_matte_mask(path, shape)
 
 
 def write_grayscale_mask(path: str | Path, mask: np.ndarray) -> None:
@@ -211,7 +208,6 @@ def process_chroma_key(
     keep_mask: np.ndarray | None = None,
     remove_mask: np.ndarray | None = None,
     alpha_hint: np.ndarray | None = None,
-    biref_alpha: np.ndarray | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
 ) -> np.ndarray:
@@ -224,7 +220,6 @@ def process_chroma_key(
         keep_mask=keep_mask,
         remove_mask=remove_mask,
         alpha_hint=alpha_hint,
-        biref_alpha=biref_alpha,
         progress_callback=progress_callback,
         cancel_callback=cancel_callback,
         include_debug=False,
@@ -239,7 +234,6 @@ def process_key_image(
     keep_mask: np.ndarray | None = None,
     remove_mask: np.ndarray | None = None,
     alpha_hint: np.ndarray | None = None,
-    biref_alpha: np.ndarray | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
     include_debug: bool = True,
@@ -261,15 +255,12 @@ def process_key_image(
     keep = _mask_to_bool(keep_mask, (h, w), "keep_mask")
     remove = _mask_to_bool(remove_mask, (h, w), "remove_mask")
     hint = _mask_to_u8(alpha_hint, (h, w), "alpha_hint")
-    biref = _mask_to_u8(biref_alpha, (h, w), "biref_alpha")
 
-    if settings.mode not in {"GraphicExact", "ProChroma", "AIHint", "HybridBiRefNet"}:
+    if settings.mode not in {"GraphicExact", "ProChroma", "ImportedMatte"}:
         raise ValueError(f"Unsupported keying mode: {settings.mode}")
-    if settings.mode == "HybridBiRefNet" and biref is None:
-        raise ValueError("HybridBiRefNet mode requires a distinct biref_alpha input")
 
     _raise_if_cancelled(cancel_callback)
-    global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, biref, progress_callback, cancel_callback)
+    global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, progress_callback, cancel_callback)
     _report(progress_callback, 0.18, "global matte")
     _raise_if_cancelled(cancel_callback)
 
@@ -381,12 +372,10 @@ def _build_global_matte(
     keep_mask: np.ndarray | None,
     remove_mask: np.ndarray | None,
     alpha_hint: np.ndarray | None,
-    biref_alpha: np.ndarray | None,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
 ) -> _GlobalMatte:
     h, w = rgb.shape[:2]
-    is_hybrid = settings.mode == "HybridBiRefNet"
     screen_color = _sample_screen_color(rgb, settings)
     _report(progress_callback, 0.02, "sample screen")
     _raise_if_cancelled(cancel_callback)
@@ -414,8 +403,19 @@ def _build_global_matte(
             aggressive = _remove_small_components(aggressive, int(settings.aggressive_min_area), protect_border=False)
         background |= aggressive
 
-    hint_foreground = None if is_hybrid else _alpha_hint_foreground_mask(alpha_hint, settings)
-    if not is_hybrid:
+    hint_foreground = _alpha_hint_foreground_mask(alpha_hint, settings)
+    if hint_foreground is not None:
+        background &= ~hint_foreground
+    if keep_mask is not None:
+        background &= ~keep_mask
+    if remove_mask is not None:
+        remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+        background |= remove_effective
+
+    min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
+    if min_area > 0:
+        background = _remove_small_components(background, min_area, protect_border=True)
+        background = _fill_small_holes(background, min_area)
         if hint_foreground is not None:
             background &= ~hint_foreground
         if keep_mask is not None:
@@ -424,40 +424,9 @@ def _build_global_matte(
             remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
             background |= remove_effective
 
-    min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
-    if min_area > 0:
-        background = _remove_small_components(background, min_area, protect_border=True)
-        background = _fill_small_holes(background, min_area)
-        if not is_hybrid:
-            if hint_foreground is not None:
-                background &= ~hint_foreground
-            if keep_mask is not None:
-                background &= ~keep_mask
-            if remove_mask is not None:
-                remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
-                background |= remove_effective
-
     edge_mask, alpha = _build_alpha_from_trimap(background, probability, fg_threshold, bg_threshold, settings)
     _report(progress_callback, 0.15, "trimap")
     _raise_if_cancelled(cancel_callback)
-    if is_hybrid:
-        if biref_alpha is None:
-            raise ValueError("HybridBiRefNet mode requires a distinct biref_alpha input")
-        return _build_hybrid_global_matte(
-            rgb,
-            settings,
-            original_alpha,
-            keep_mask,
-            remove_mask,
-            biref_alpha,
-            screen_color,
-            probability,
-            background,
-            edge_mask,
-            alpha,
-            progress_callback,
-            cancel_callback,
-        )
     if keep_mask is not None:
         alpha[keep_mask] = 255
         edge_mask[keep_mask] = False
@@ -532,307 +501,6 @@ def _apply_alpha_hint(
     core = allowed & (alpha_hint >= int(np.clip(int(settings.alpha_hint_foreground_threshold), 1, 255)))
     alpha[core] = np.maximum(alpha[core], alpha_hint[core])
     edge_mask[core & (alpha >= 248)] = False
-
-
-def _build_hybrid_global_matte(
-    rgb: np.ndarray,
-    settings: KeySettings,
-    original_alpha: np.ndarray | None,
-    keep_mask: np.ndarray | None,
-    remove_mask: np.ndarray | None,
-    biref_alpha: np.ndarray,
-    screen_color: tuple[int, int, int],
-    screen_probability: np.ndarray,
-    classical_background: np.ndarray,
-    classical_edge_mask: np.ndarray,
-    classical_alpha: np.ndarray,
-    progress_callback: ProgressCallback | None,
-    cancel_callback: CancelCallback | None,
-) -> _GlobalMatte:
-    """Build final alpha for HybridBiRefNet without changing classical modes."""
-
-    from hybrid_trimap import build_hybrid_trimap
-    from screen_analysis import analyze_screen
-
-    _report(progress_callback, 0.155, "hybrid screen analysis")
-    analysis = analyze_screen(
-        rgb,
-        classical_alpha,
-        background_mask=classical_background,
-        settings=settings,
-        picked_screen_color=screen_color,
-        keep_mask=keep_mask,
-        remove_mask=remove_mask,
-    )
-    _raise_if_cancelled(cancel_callback)
-
-    trimap = build_hybrid_trimap(
-        classical_alpha,
-        screen_probability,
-        analysis.screen_distance,
-        analysis.spill_probability,
-        analysis.classical_confidence,
-        classical_background,
-        analysis.edge_mask,
-        analysis.fringe_mask,
-        analysis.screen_plate_rgb,
-        biref_alpha,
-        keep_mask,
-        remove_mask,
-    )
-    _report(progress_callback, 0.162, "hybrid trimap")
-    _raise_if_cancelled(cancel_callback)
-
-    alpha = _merge_hybrid_alpha(
-        rgb,
-        classical_alpha,
-        biref_alpha,
-        trimap,
-        settings,
-        original_alpha,
-        keep_mask,
-        remove_mask,
-    )
-    _report(progress_callback, 0.168, "hybrid alpha")
-    _raise_if_cancelled(cancel_callback)
-
-    background = (trimap.known_bg | trimap.manual_remove_effective | (alpha <= 0)).astype(bool, copy=True)
-    if keep_mask is not None:
-        background &= ~(keep_mask & (alpha > 0))
-    background[alpha <= 0] = True
-    hybrid_edge = (
-        trimap.unknown
-        | trimap.soft_unknown
-        | (classical_edge_mask.astype(bool, copy=False) & (alpha > 0))
-        | ((alpha > 0) & (alpha < 255))
-    )
-    hybrid_edge &= ~background
-    screen_map = None
-    _report(progress_callback, 0.17, "screen model")
-    _raise_if_cancelled(cancel_callback)
-
-    fringe_mask = _build_fringe_mask(rgb, alpha, hybrid_edge, screen_probability, screen_color, settings, progress_callback, cancel_callback)
-    _report(progress_callback, 0.175, "fringe map")
-    _raise_if_cancelled(cancel_callback)
-    cleanup_unmix, cleanup_despill, cleanup_protected, cleanup_safe_bg, _cleanup_manual_keep = _build_final_hybrid_cleanup_regions(
-        alpha,
-        background,
-        hybrid_edge,
-        fringe_mask,
-        screen_probability,
-        analysis.spill_probability,
-        trimap,
-    )
-    screen_plate = _build_hybrid_screen_plate(rgb, screen_color, analysis.screen_plate_rgb, cleanup_safe_bg, settings)
-    inner_labels, inner_label_to_flat = _build_nearest_inner_label_map(alpha, background, screen_probability, fringe_mask, settings)
-    _report(progress_callback, 0.18, "inner color map")
-    return _GlobalMatte(
-        screen_color=screen_color,
-        screen_probability=screen_probability,
-        screen_map=screen_map,
-        background_mask=background,
-        edge_mask=hybrid_edge.astype(bool, copy=False),
-        alpha=alpha,
-        alpha_hint=None,
-        fringe_mask=fringe_mask,
-        inner_labels=inner_labels,
-        inner_label_to_flat=inner_label_to_flat,
-        screen_plate_rgb=screen_plate,
-        hybrid_unmix_region=cleanup_unmix,
-        hybrid_despill_region=cleanup_despill,
-        hybrid_protected_fg=cleanup_protected,
-    )
-
-
-def _merge_hybrid_alpha(
-    rgb: np.ndarray,
-    classical_alpha: np.ndarray,
-    biref_alpha: np.ndarray,
-    trimap: object,
-    settings: KeySettings,
-    original_alpha: np.ndarray | None,
-    keep_mask: np.ndarray | None,
-    remove_mask: np.ndarray | None,
-) -> np.ndarray:
-    classical = _mask_to_u8(classical_alpha, classical_alpha.shape, "classical_alpha")
-    biref = _mask_to_u8(biref_alpha, classical.shape, "biref_alpha")
-    known_bg = np.asarray(getattr(trimap, "known_bg"), dtype=bool)
-    known_fg = np.asarray(getattr(trimap, "known_fg"), dtype=bool)
-    unknown = np.asarray(getattr(trimap, "unknown"), dtype=bool) & ~(known_bg | known_fg)
-
-    alpha = classical.copy()
-    alpha[known_bg] = 0
-    fg = known_fg & ~known_bg
-    if np.any(fg):
-        alpha[fg] = np.maximum(classical, biref)[fg]
-    if np.any(unknown):
-        # BiRefNet can be conservative/eroded on high-detail foreground edges,
-        # especially after a global downscale. Start the unknown-region blend
-        # earlier than the original 64/220 ramp so useful midtones survive, but
-        # keep known_bg clamps authoritative to avoid broad screen leakage.
-        w = _smoothstep(32.0, 200.0, biref.astype(np.float32))
-        blended = classical.astype(np.float32) * (1.0 - w) + biref.astype(np.float32) * w
-        alpha[unknown] = np.rint(np.clip(blended[unknown], 0.0, 255.0)).astype(np.uint8)
-    _apply_hybrid_automatic_clamps(alpha, classical, biref, trimap)
-
-    alpha = _refine_hybrid_alpha_unknown_only(rgb, alpha, classical, biref, trimap, settings)
-    _apply_hybrid_automatic_clamps(alpha, classical, biref, trimap)
-
-    keep = _bool_mask_for_shape(keep_mask, classical.shape, "keep_mask")
-    remove = _bool_mask_for_shape(remove_mask, classical.shape, "remove_mask")
-    if remove is not None:
-        alpha[remove] = 0
-    if keep is not None:
-        alpha[keep] = 255
-    return _apply_original_alpha(alpha, original_alpha)
-
-
-def _build_final_hybrid_cleanup_regions(
-    alpha_u8: np.ndarray,
-    background: np.ndarray,
-    edge_mask: np.ndarray,
-    fringe_mask: np.ndarray,
-    screen_probability: np.ndarray,
-    spill_probability: np.ndarray | None,
-    trimap: object,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Recompute hybrid RGB cleanup regions from the final capped alpha.
-
-    Phase 6 trimap regions are useful structural hints, but their candidate
-    alpha may predate HybridBiRefNet blending, manual overrides, and source
-    alpha capping.  The masks returned here are therefore gated by the final
-    P7 alpha/background decisions before any RGB repair uses them.
-    """
-
-    alpha = _mask_to_u8(alpha_u8, alpha_u8.shape, "alpha_u8")
-    shape = alpha.shape
-    bg = np.asarray(background, dtype=bool)
-    edge = np.asarray(edge_mask, dtype=bool)
-    fringe = _mask_to_u8(fringe_mask, shape, "fringe_mask") > 0
-    screen_prob = _mask_to_u8(screen_probability, shape, "screen_probability")
-    spill_prob = _mask_to_u8(spill_probability, shape, "spill_probability") if spill_probability is not None else np.zeros(shape, dtype=np.uint8)
-
-    known_bg = np.asarray(getattr(trimap, "known_bg", np.zeros(shape, dtype=bool)), dtype=bool)
-    hard_unknown = np.asarray(getattr(trimap, "hard_unknown", np.zeros(shape, dtype=bool)), dtype=bool)
-    soft_unknown = np.asarray(getattr(trimap, "soft_unknown", np.zeros(shape, dtype=bool)), dtype=bool)
-    protected_fg = np.asarray(getattr(trimap, "protected_fg", np.zeros(shape, dtype=bool)), dtype=bool)
-    manual_keep = np.asarray(getattr(trimap, "manual_keep_core", np.zeros(shape, dtype=bool)), dtype=bool)
-
-    live = (alpha > 0) & ~bg
-    semi = (alpha > 0) & (alpha < 250)
-    final_detail = (semi | fringe | edge | hard_unknown | soft_unknown) & live
-    protected_core = (protected_fg | manual_keep | ((alpha >= 250) & (screen_prob < 128))) & live
-
-    unmix_region = final_detail & ~known_bg
-    unmix_region &= ~(protected_core & (alpha >= 250))
-
-    spill_threshold = int(np.clip(int(getattr(trimap, "spill_threshold", 96)), 0, 255))
-    spill_region = (spill_prob > spill_threshold) & live & (semi | fringe | edge | hard_unknown | soft_unknown)
-    despill_region = spill_region & ~known_bg & ~manual_keep
-
-    safe_bg = ((known_bg | bg) & (alpha <= 0) & (screen_prob >= 245)).astype(bool, copy=False)
-    protected = protected_core.astype(bool, copy=False)
-    return (
-        np.ascontiguousarray(unmix_region.astype(bool, copy=False)),
-        np.ascontiguousarray(despill_region.astype(bool, copy=False)),
-        np.ascontiguousarray(protected),
-        np.ascontiguousarray(safe_bg),
-        np.ascontiguousarray(manual_keep.astype(bool, copy=False)),
-    )
-
-
-def _build_hybrid_screen_plate(
-    rgb: np.ndarray,
-    screen_color: tuple[int, int, int],
-    phase6_plate: object | None,
-    safe_bg: np.ndarray | None,
-    settings: KeySettings,
-) -> object | None:
-    """Return a bounded low-frequency clean plate for hybrid RGB cleanup."""
-
-    candidates = None if safe_bg is None else np.asarray(safe_bg, dtype=bool)
-    enough_safe_bg = candidates is not None and np.count_nonzero(candidates) >= max(32, candidates.size // 2000)
-    if enough_safe_bg:
-        try:
-            from screen_analysis import build_screen_plate_rgb
-
-            cap = min(max(0, int(settings.max_local_screen_model_pixels)), 4_000_000)
-            return build_screen_plate_rgb(rgb, candidates, screen_color, max_full_res_pixels=cap)
-        except Exception:
-            pass
-    return phase6_plate
-
-
-def _bool_mask_for_shape(mask: np.ndarray | None, shape: tuple[int, int], name: str) -> np.ndarray | None:
-    if mask is None:
-        return None
-    arr = np.asarray(mask)
-    if arr.dtype == bool and arr.shape == shape:
-        return arr
-    return _mask_to_bool(mask, shape, name)
-
-
-def _apply_hybrid_automatic_clamps(
-    alpha: np.ndarray,
-    classical_alpha: np.ndarray,
-    biref_alpha: np.ndarray,
-    trimap: object,
-) -> None:
-    known_bg = np.asarray(getattr(trimap, "known_bg"), dtype=bool)
-    known_fg = np.asarray(getattr(trimap, "known_fg"), dtype=bool) & ~known_bg
-    alpha[known_bg] = 0
-    if np.any(known_fg):
-        alpha[known_fg] = np.maximum(classical_alpha, biref_alpha)[known_fg]
-
-
-def _refine_hybrid_alpha_unknown_only(
-    rgb: np.ndarray,
-    alpha_u8: np.ndarray,
-    classical_alpha: np.ndarray,
-    biref_alpha: np.ndarray,
-    trimap: object,
-    settings: KeySettings,
-) -> np.ndarray:
-    strength = _clip01(settings.guided_alpha_refine)
-    if strength <= 0.0:
-        return alpha_u8
-
-    radius = max(1, int(settings.guided_radius))
-    max_pixels = max(0, int(settings.guided_max_pixels))
-    known = np.asarray(getattr(trimap, "known_bg"), dtype=bool) | np.asarray(getattr(trimap, "known_fg"), dtype=bool)
-    refine_region = (
-        (np.asarray(getattr(trimap, "unknown"), dtype=bool) | np.asarray(getattr(trimap, "soft_unknown"), dtype=bool))
-        & ~known
-        & (alpha_u8 > 0)
-        & (alpha_u8 < 255)
-    )
-    if max_pixels <= 0 or not np.any(refine_region):
-        return alpha_u8
-
-    y0, y1, x0, x1 = _expanded_mask_bounds(refine_region, margin=radius * 2 + 2, shape=alpha_u8.shape)
-    if (y1 - y0) * (x1 - x0) > max_pixels:
-        return alpha_u8
-
-    roi_y = slice(y0, y1)
-    roi_x = slice(x0, x1)
-    guide = _linear_luma_from_rgb_u8(rgb[roi_y, roi_x])
-    src = alpha_u8[roi_y, roi_x].astype(np.float32) / 255.0
-    refined = _guided_filter_gray(guide, src, radius, settings.guided_eps)
-    blended = src * (1.0 - strength) + refined * strength
-
-    target = refine_region[roi_y, roi_x]
-    if not np.any(target):
-        return alpha_u8
-
-    # Where BiRefNet raised thin detail above the classical matte, filtering may
-    # smooth surrounding unknown alpha but must not erode the retained detail.
-    detail_prior = (biref_alpha[roi_y, roi_x] > classical_alpha[roi_y, roi_x]) & (biref_alpha[roi_y, roi_x] >= 96)
-    blended = np.where(detail_prior, np.maximum(blended, src), blended)
-
-    out = alpha_u8.copy()
-    out_roi = out[roi_y, roi_x]
-    out_roi[target] = np.rint(np.clip(blended[target], 0.0, 1.0) * 255.0).astype(np.uint8)
-    return out
 
 
 def _sample_screen_color(rgb: np.ndarray, settings: KeySettings) -> tuple[int, int, int]:
@@ -1506,8 +1174,7 @@ def _render_tiled_rgba(
     rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
     rgba[:, :, 3] = alpha_out
     despill_mask = np.zeros((out_h, out_w), dtype=np.uint8) if include_debug else None
-    has_screen_plate = matte.screen_plate_rgb is not None and hasattr(matte.screen_plate_rgb, "resolve_tile")
-    screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None and not has_screen_plate else 0
+    screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
     local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
     extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
     tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=extra_overlap))
@@ -1533,9 +1200,7 @@ def _render_tiled_rgba(
         out_y = slice(write_y0 - out_y0, write_y1 - out_y0)
         out_x = slice(write_x0 - out_x0, write_x1 - out_x0)
         rgb_read = rgb[read_y, read_x]
-        if has_screen_plate:
-            screen_tile = matte.screen_plate_rgb.resolve_tile(read_y, read_x)
-        elif matte.screen_map is not None:
+        if matte.screen_map is not None:
             screen_tile = matte.screen_map[read_y, read_x]
         elif settings.local_screen_model:
             screen_tile = _estimate_screen_tile(
@@ -1575,35 +1240,18 @@ def _render_tiled_rgba(
                 )
             else:
                 nearest_inner_rgb, nearest_inner_valid = None, None
-        if matte.hybrid_unmix_region is not None or matte.hybrid_despill_region is not None:
-            rgb_tile, spill_tile = _process_hybrid_color_tile(
-                rgb_read,
-                matte.alpha[read_y, read_x],
-                matte.edge_mask[read_y, read_x],
-                matte.screen_probability[read_y, read_x],
-                matte.fringe_mask[read_y, read_x],
-                screen_tile,
-                nearest_inner_rgb,
-                nearest_inner_valid,
-                matte.screen_color,
-                settings,
-                None if matte.hybrid_unmix_region is None else matte.hybrid_unmix_region[read_y, read_x],
-                None if matte.hybrid_despill_region is None else matte.hybrid_despill_region[read_y, read_x],
-                None if matte.hybrid_protected_fg is None else matte.hybrid_protected_fg[read_y, read_x],
-            )
-        else:
-            rgb_tile, spill_tile = _process_color_tile(
-                rgb_read,
-                matte.alpha[read_y, read_x],
-                matte.edge_mask[read_y, read_x],
-                matte.screen_probability[read_y, read_x],
-                matte.fringe_mask[read_y, read_x],
-                screen_tile,
-                nearest_inner_rgb,
-                nearest_inner_valid,
-                matte.screen_color,
-                settings,
-            )
+        rgb_tile, spill_tile = _process_color_tile(
+            rgb_read,
+            matte.alpha[read_y, read_x],
+            matte.edge_mask[read_y, read_x],
+            matte.screen_probability[read_y, read_x],
+            matte.fringe_mask[read_y, read_x],
+            screen_tile,
+            nearest_inner_rgb,
+            nearest_inner_valid,
+            matte.screen_color,
+            settings,
+        )
         rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
         if despill_mask is not None:
             despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
@@ -1753,220 +1401,6 @@ def _process_color_tile(
         rgb_out[changed] = repaired[changed]
     rgb_out[~live] = 0
     return rgb_out, np.rint(np.clip(spill_mask, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def _process_hybrid_color_tile(
-    rgb_tile: np.ndarray,
-    alpha_u8: np.ndarray,
-    edge_mask: np.ndarray,
-    probability: np.ndarray,
-    fringe_mask: np.ndarray,
-    screen_tile: np.ndarray | None,
-    nearest_inner_rgb: np.ndarray | None,
-    nearest_inner_valid: np.ndarray | None,
-    screen_color: tuple[int, int, int],
-    settings: KeySettings,
-    unmix_region: np.ndarray | None,
-    despill_region: np.ndarray | None,
-    protected_fg: np.ndarray | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """HybridBiRefNet-only RGB cleanup using final alpha and clean plate B."""
-
-    rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
-    alpha = np.asarray(alpha_u8, dtype=np.float32) / 255.0
-    if screen_tile is None:
-        screen = _srgb_u8_to_linear_f32(np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3))
-    else:
-        screen = _srgb_u8_to_linear_f32(screen_tile)
-
-    out = rgb_linear.copy()
-    live = alpha > 0.001
-    shape = alpha_u8.shape
-    unmix = _mask_to_bool(unmix_region, shape, "unmix_region") if unmix_region is not None else None
-    despill = _mask_to_bool(despill_region, shape, "despill_region") if despill_region is not None else None
-    protected = _mask_to_bool(protected_fg, shape, "protected_fg") if protected_fg is not None else None
-    if unmix is None:
-        unmix = np.zeros(shape, dtype=bool)
-    if despill is None:
-        despill = np.zeros(shape, dtype=bool)
-    if protected is None:
-        protected = np.zeros(shape, dtype=bool)
-    unmix &= live
-    despill &= live & ~protected
-
-    fringe_signal = np.asarray(fringe_mask, dtype=np.float32) / 255.0
-    fringe_signal[~live] = 0.0
-    edge_strength = np.clip(alpha * (1.0 - alpha) * 4.0, 0.0, 1.0)
-    edge_strength = np.maximum(edge_strength, np.asarray(edge_mask, dtype=bool).astype(np.float32) * 0.45)
-    edge_strength = np.maximum(edge_strength, fringe_signal)
-
-    repair_mask = np.zeros(shape, dtype=np.float32)
-    edge_repair = _clip01(settings.edge_color_repair)
-    decontaminate = 0.25 + 0.75 * _clip01(settings.decontaminate)
-    unmix_strength = _clip01(settings.unmix_amount) * (0.35 + 0.65 * edge_repair) * decontaminate
-    if unmix_strength > 0.0 and np.any(unmix):
-        safe_alpha = np.maximum(alpha[:, :, None], 1.0 / 255.0)
-        unmixed = (rgb_linear - (1.0 - alpha[:, :, None]) * screen) / safe_alpha
-        unmixed = np.nan_to_num(unmixed, nan=0.0, posinf=1.0, neginf=0.0)
-        unmixed = np.clip(unmixed, 0.0, 1.0)
-
-        repaired, repaired_valid = _foreground_repair_color_tile(
-            rgb_linear,
-            alpha,
-            probability,
-            nearest_inner_rgb,
-            nearest_inner_valid,
-            settings,
-        )
-        low_alpha = unmix & (alpha < 0.15)
-        mid_alpha = unmix & (alpha >= 0.15) & (alpha < 0.60)
-        if np.any(low_alpha):
-            stable = low_alpha & repaired_valid
-            unstable = low_alpha & ~repaired_valid
-            if np.any(stable):
-                unmixed[stable] = repaired[stable]
-            if np.any(unstable):
-                unmixed[unstable] = rgb_linear[unstable]
-        if np.any(mid_alpha):
-            stable = mid_alpha & repaired_valid
-            unstable = mid_alpha & ~repaired_valid
-            if np.any(stable):
-                unmixed[stable] = unmixed[stable] * 0.75 + repaired[stable] * 0.25
-            if np.any(unstable):
-                unmixed[unstable] = unmixed[unstable] * 0.50 + rgb_linear[unstable] * 0.50
-
-        unmix_weight = np.maximum(edge_strength, 0.55) * unmix_strength
-        unmix_weight = np.where(unmix, unmix_weight, 0.0).astype(np.float32, copy=False)
-        if np.any(low_alpha):
-            low_floor = 0.95 * max(edge_repair, _clip01(settings.unmix_amount))
-            unmix_weight[low_alpha] = np.maximum(unmix_weight[low_alpha], low_floor)
-        if np.any(mid_alpha):
-            unmix_weight[mid_alpha] = np.maximum(unmix_weight[mid_alpha], 0.55 * edge_repair * _clip01(settings.unmix_amount))
-        unmix_weight = np.clip(unmix_weight, 0.0, 1.0)
-        if np.any(unmix_weight > 0.0):
-            out = out * (1.0 - unmix_weight[:, :, None]) + unmixed * unmix_weight[:, :, None]
-            repair_mask = np.maximum(repair_mask, unmix_weight)
-
-    despill_strength = _hybrid_despill_strength(alpha, edge_strength, fringe_signal, despill, protected, settings)
-    if np.any(despill_strength > 0.0):
-        out = _apply_hybrid_edge_despill(out, screen, screen_color, despill_strength)
-        repair_mask = np.maximum(repair_mask, despill_strength)
-
-    out = _protect_luminance(out, rgb_linear, repair_mask, settings)
-    out = np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
-    out = np.clip(out, 0.0, 1.0)
-    out[~live] = 0.0
-
-    rgb_out = rgb_tile.copy()
-    changed = live & (repair_mask > 0.0)
-    if np.any(changed):
-        repaired_rgb = _linear_f32_to_srgb_u8(out)
-        rgb_out[changed] = repaired_rgb[changed]
-    rgb_out[~live] = 0
-    return rgb_out, np.rint(np.clip(repair_mask, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def _foreground_repair_color_tile(
-    rgb_linear: np.ndarray,
-    alpha: np.ndarray,
-    probability: np.ndarray,
-    nearest_inner_rgb: np.ndarray | None,
-    nearest_inner_valid: np.ndarray | None,
-    settings: KeySettings,
-) -> tuple[np.ndarray, np.ndarray]:
-    repair = np.zeros_like(rgb_linear, dtype=np.float32)
-    valid = np.zeros(alpha.shape, dtype=bool)
-    if nearest_inner_rgb is not None and nearest_inner_valid is not None:
-        nearest_valid = np.asarray(nearest_inner_valid, dtype=bool) & (np.asarray(nearest_inner_rgb).ndim == 3)
-        if np.any(nearest_valid):
-            nearest_linear = _srgb_u8_to_linear_f32(nearest_inner_rgb)
-            repair[nearest_valid] = nearest_linear[nearest_valid]
-            valid[nearest_valid] = True
-
-    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
-    solid = (alpha >= 0.96) & (np.asarray(probability, dtype=np.uint8) <= prob_limit)
-    if np.count_nonzero(solid) >= _MIN_TILE_LOCAL_INNER_PIXELS:
-        radius = max(3, min(31, _effective_edge_radius(settings) * 4 + max(1, int(settings.fringe_band_radius)) * 2 + 1))
-        if radius % 2 == 0:
-            radius += 1
-        weights = solid.astype(np.float32)
-        denom = cv2.boxFilter(weights, cv2.CV_32F, (radius, radius), normalize=False, borderType=cv2.BORDER_REPLICATE)
-        blurred = np.zeros_like(rgb_linear, dtype=np.float32)
-        blur_valid = denom >= 1.0
-        for channel in range(3):
-            num = cv2.boxFilter(
-                rgb_linear[:, :, channel] * weights,
-                cv2.CV_32F,
-                (radius, radius),
-                normalize=False,
-                borderType=cv2.BORDER_REPLICATE,
-            )
-            blurred[:, :, channel] = np.divide(
-                num,
-                np.maximum(denom, 1.0),
-                out=np.zeros_like(denom, dtype=np.float32),
-                where=blur_valid,
-            )
-        use_blur = blur_valid & ~valid
-        if np.any(use_blur):
-            repair[use_blur] = blurred[use_blur]
-            valid[use_blur] = True
-        global_color = np.mean(rgb_linear[solid], axis=0).astype(np.float32)
-        use_global = ~valid
-        if np.any(use_global):
-            repair[use_global] = global_color.reshape(1, 3)
-            valid[use_global] = True
-    return np.clip(repair, 0.0, 1.0), valid
-
-
-def _hybrid_despill_strength(
-    alpha: np.ndarray,
-    edge_strength: np.ndarray,
-    fringe_signal: np.ndarray,
-    despill_region: np.ndarray,
-    protected_fg: np.ndarray,
-    settings: KeySettings,
-) -> np.ndarray:
-    amount = _clip01(settings.despill) * (0.35 + 0.65 * _clip01(settings.fringe_remove))
-    if amount <= 0.0:
-        return np.zeros(alpha.shape, dtype=np.float32)
-    live = alpha > 0.001
-    protected_core = protected_fg & (alpha >= 0.96)
-    strong = despill_region & live & ~protected_fg
-    medium = (fringe_signal > 0.02) & live & ~strong & ~protected_core
-    weak = (edge_strength > 0.20) & live & ~strong & ~medium & ~protected_core & (alpha < 0.98)
-    strength = np.zeros(alpha.shape, dtype=np.float32)
-    if np.any(strong):
-        strength[strong] = np.maximum(strength[strong], amount)
-    if np.any(medium):
-        strength[medium] = np.maximum(strength[medium], amount * 0.55)
-    if np.any(weak):
-        strength[weak] = np.maximum(strength[weak], amount * 0.18)
-    strength *= np.maximum(edge_strength, fringe_signal)
-    strength[protected_fg & (alpha >= 0.85)] = 0.0
-    return np.clip(strength, 0.0, 1.0).astype(np.float32, copy=False)
-
-
-def _apply_hybrid_edge_despill(
-    rgb: np.ndarray,
-    screen_linear: np.ndarray,
-    screen_color: tuple[int, int, int],
-    strength: np.ndarray,
-) -> np.ndarray:
-    if not np.any(strength > 0.0):
-        return np.clip(rgb, 0.0, 1.0)
-    out = rgb.copy()
-    key = np.asarray(screen_color, dtype=np.float32) / 255.0
-    key_channel = int(np.argmax(key))
-    other = [c for c in range(3) if c != key_channel]
-    key_dom = float(key[key_channel] - max(key[other[0]], key[other[1]]))
-    if key_dom > 0.12:
-        target = np.maximum(out[:, :, other[0]], out[:, :, other[1]])
-        spill = np.maximum(out[:, :, key_channel] - target, 0.0)
-        out[:, :, key_channel] -= spill * np.clip(strength, 0.0, 1.0)
-    else:
-        out = _apply_vlahos_clamp(out, screen_linear, strength * 0.80)
-    return np.clip(out, 0.0, 1.0)
 
 
 def _compute_despill_mask(

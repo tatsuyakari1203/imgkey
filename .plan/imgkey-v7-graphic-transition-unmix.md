@@ -1,7 +1,7 @@
 # 06 - ImgKey v7 No-AI Classical GPU + Transition Unmix
 
 Date: 2026-05-18
-Status: Planned
+Status: In progress
 Owner: ImgKey Classical Keyer / Classical GPU Runtime
 Scope: Remove AI entirely, improve deterministic transition/fringe cleanup, and focus GPU work on classical CUDA acceleration.
 
@@ -95,10 +95,13 @@ Isolation:
 - Own AI removal across `app.py`, `keyer.py`, `smoke_test.py`, docs/specs/requirements. No transition-unmix or GPU kernel implementation yet.
 
 Status:
-- Planned
+- Complete
 
-Current:
-- Yes
+Progress:
+- 2026-05-18: Removed assisted-matte UI/runtime surface, deleted backend/worker/spec/requirements files, retained manual keep/remove and renamed retained matte import to `Imported Matte`.
+- 2026-05-18: Updated docs/build specs/release workflow/repo context to list only `ImgKey.exe` and `ImgKey-GPU.exe` public build flavors; marked the v6 plan superseded/historical.
+- 2026-05-18: Added smoke no-AI source/non-existence guards and updated verification to compile only retained helpers.
+
 
 #### P0.1 - Remove AI UI and modes
 - Remove UI/actions/status/view modes for Generate BiRefNet Hint, Cancel AI, BiRefNet Alpha, Hybrid BiRefNet output, Optional AI Adapters, legacy BiRefNet, and CorridorKey.
@@ -118,10 +121,8 @@ Acceptance:
 - Existing classical modes still work.
 
 Status:
-- Planned
+- Complete
 
-Current:
-- Yes
 
 #### P0.2 - Remove AI worker/backend/source files
 - Delete or retire:
@@ -143,10 +144,8 @@ Acceptance:
 - `python smoke_test.py` passes after test cleanup.
 
 Status:
-- Planned
+- Complete
 
-Current:
-- No
 
 #### P0.3 - Update docs and repo context for no-AI direction
 - Update `AGENTS.md`, README/build docs, and plan references:
@@ -160,13 +159,17 @@ Acceptance:
 - Docs list only no-AI build flavors.
 
 Status:
-- Planned
+- Complete
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- Yes
 ### Phase 1 - Transition model and settings
 
 Category:
@@ -184,8 +187,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P1.0 - Add baseline graphic transition fixtures first
 - Add synthetic fixtures before algorithm wiring:
@@ -214,8 +215,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P1.1 - Add v7 transition-unmix settings
 - Add fields to `KeySettings`, appended for positional compatibility:
@@ -245,8 +244,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P1.2 - Add transition/fringe region helpers
 - Add helpers in `keyer.py`; reuse/extend any existing `_compute_key_spill_strength()` helper instead of creating duplicate names:
@@ -287,11 +284,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 2 - Foreground reference and alpha recovery
 
 Category:
@@ -309,8 +310,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P2.1 - Build radius-aware foreground reference
 - Reuse existing nearest-inner mechanisms where possible, but decouple v7 reference availability from old `inner_color_pull` / `edge_color_repair` gates. If `transition_unmix` is enabled, reference maps must be available even when legacy color-pull sliders are low.
@@ -343,8 +342,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P2.2 - Implement global alpha solve anti-erosion
 - Add `_recover_transition_alpha_global(...)` or equivalent in global matte construction, not inside `_process_color_tile()`.
@@ -385,11 +382,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 3 - Linear RGB transition unmix and key-vector despill
 
 Category:
@@ -407,8 +408,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.1 - Add `_repair_transition_unmix()`
 - Add main helper in `keyer.py`:
@@ -449,8 +448,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.2 - Add key-vector spill removal and luma-preserving chroma pull
 - Implement vector spill removal, not single-channel global clamp:
@@ -484,8 +481,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.3 - Wire into classical graphic color path
 - Integrate transition repair into `_process_color_tile()` after existing edge repair or as a replacement for the transition/fringe part when `settings.transition_unmix` is true.
@@ -506,11 +501,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 4 - Diagnostics and regression gates
 
 Category:
@@ -528,8 +527,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P4.1 - Promote baseline fixtures into strict regressions
 - Reuse the Phase 1 baseline fixtures and convert them into pass/fail gates after Phase 2/3 behavior is wired.
@@ -546,8 +543,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P4.2 - Add required assertions and diagnostics
 - Metrics:
@@ -583,11 +578,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 5 - UI controls and defaults
 
 Category:
@@ -605,8 +604,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P5.1 - Add transition repair controls
 - Add controls under `Spill Cleanup` or an `Advanced Graphic` subsection:
@@ -627,11 +624,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 6 - Classical GPU runtime and kernels
 
 Category:
@@ -649,8 +650,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P6.1 - Define no-AI GPU backend API
 - Add a small backend module such as `gpu_accel.py` with lazy imports only inside functions.
@@ -673,8 +672,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P6.2 - Benchmark and ship only worthwhile kernels
 - Benchmark CPU vs GPU under `.artifact/gpu-benchmarks/`:
@@ -692,8 +689,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P6.3 - Add GPU UI controls/status
 - Add no-AI controls/status:
@@ -710,11 +705,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 7 - No-AI packaging
 
 Category:
@@ -732,8 +731,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P7.1 - Keep only two public build flavors
 - Keep:
@@ -751,11 +748,15 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+
+
+
+Current:
+- No
 ### Phase 8 - Full verification, build, and phase commit hygiene
 
 Category:
@@ -773,8 +774,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P8.1 - Verification floor
 - Run:
@@ -800,8 +799,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P8.2 - Build smoke
 - Build default non-AI app:
@@ -824,8 +821,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P8.3 - Commit boundaries
 - Treat each implementation phase as a clean commit boundary.
@@ -851,11 +846,17 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
 ## 5) Immediate next step
 
-Start Phase 0 with `deep-worker`: remove AI product/runtime surfaces and update docs/tests so the repo is unambiguously classical-only before transition-unmix or GPU kernel work.
+Planner can assign Phase 1 next: add baseline graphic transition fixtures and v7 transition settings/masks before changing repair behavior.
+
+
+
+
+
+
+Current:
+- No
