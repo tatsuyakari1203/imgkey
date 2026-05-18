@@ -255,6 +255,8 @@ Progress:
 
 
 
+
+
 Current:
 - No
 ### Phase 2 - Replace torch GPU path with compact DLL backend
@@ -319,6 +321,8 @@ Progress:
 
 
 
+
+
 Current:
 - No
 ### Phase 3 - Compact GPU packaging
@@ -336,7 +340,7 @@ Isolation:
 - Own `ImgKey-GPU.spec`, workflow/build docs, and native build integration. Do not change algorithms except packaging fixes.
 
 Status:
-- Planned
+- Completed
 
 
 #### P3.1 - Remove torch from GPU requirements/spec
@@ -358,7 +362,10 @@ Acceptance:
 - GPU EXE includes only ImgKey app + compact CUDA DLL/minimal runtime DLLs.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- Completed 2026-05-18. GPU packaging no longer installs or bundles torch/Python CUDA stacks. `requirements-gpu-runtime-cu128.txt` is a no-op compatibility note, `ImgKey-GPU.spec` bundles `imgkey_cuda.dll` plus MSVC runtime DLLs, keeps splash/progress, and excludes torch/nvidia Python packages. Runtime hook now adds the frozen extraction root for bundled DLL discovery. Release workflow/docs now build the native DLL before the GPU PyInstaller build and document dependency inspection: static-runtime local DLL depends on `MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`, Windows/UCRT DLLs, and no `cudart64_*.dll`.
 
 
 #### P3.2 - Build and size gate
@@ -382,7 +389,10 @@ Acceptance:
 - Prefer an actual clean Windows target with NVIDIA driver only when available; if unavailable, document sanitized-path result as local substitute.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- Completed 2026-05-18. Built `native/imgkey_cuda/build/imgkey_cuda.dll`, built `dist\ImgKey-GPU.exe`, verified archive contains `imgkey_cuda.dll` and no torch/nvidia/cudart entries, and verified built EXE probe with normal and sanitized PATH runs. Local size gate result: `dist\ImgKey-GPU.exe` is 102,044,207 bytes (97.32 MiB), SHA256 `893071a8468e665bf2ead25451aab23fc3b013dcce68b3024f681ec2c5a66210`.
 
 
 ---
@@ -390,8 +400,10 @@ Status:
 
 
 
+
+
 Current:
-- Yes
+- No
 ### Phase 4 - Final verification and cleanup
 
 Category:
@@ -444,7 +456,10 @@ Status:
 
 ## 6) Immediate next step
 
-Continue with Phase 3/P3.1: update compact GPU packaging to bundle the native CUDA DLL/runtime dependencies and remove the old GPU packaging assumptions.
+Continue with Phase 4/P4.1: run final verification and cleanup, including the default `ImgKey.exe` build, before planner pushes the final branch.
+
+
+
 
 
 
@@ -452,4 +467,4 @@ Continue with Phase 3/P3.1: update compact GPU packaging to bundle the native CU
 
 
 Current:
-- No
+- Yes

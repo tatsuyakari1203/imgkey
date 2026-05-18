@@ -1,9 +1,9 @@
-# ImgKey GPU runtime flavor (CUDA 12.8 PyTorch wheels).
-# Install after requirements.txt in a clean Windows venv:
-#   python -m pip install -r requirements.txt
+# ImgKey compact GPU packaging note.
+#
+# The optional GPU executable uses native/imgkey_cuda/imgkey_cuda.dll and does
+# not require extra Python GPU packages. Keep this file pip-installable as a
+# no-op for older build scripts that still run:
 #   python -m pip install -r requirements-gpu-runtime-cu128.txt
-# RTX 50-series / Blackwell targets require a recent PyTorch CUDA wheel;
-# do not substitute old cu121/cu124 wheels for this flavor.
-# This optional flavor intentionally adds only torch; companion packages are omitted.
---index-url https://download.pytorch.org/whl/cu128
-torch>=2.7
+#
+# Build the native DLL before running PyInstaller:
+#   native/imgkey_cuda/build.ps1

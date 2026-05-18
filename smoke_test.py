@@ -3685,10 +3685,12 @@ def run_packaging_flavor_tests() -> None:
     default_excludes = set(_spec_string_list_assignment(Path("ImgKey.spec"), "DEFAULT_RUNTIME_EXCLUDES"))
     gpu_excludes = set(_spec_string_list_assignment(Path("ImgKey-GPU.spec"), "GPU_RUNTIME_EXCLUDES"))
     shared_optional_excludes = {
+        "torch",
         "torchvision",
         "torchaudio",
         "torchtext",
         "triton",
+        "nvidia",
         "trans" + "formers",
         "timm",
         "kornia",
@@ -3718,12 +3720,15 @@ def run_packaging_flavor_tests() -> None:
     }
     assert {"torch", "nvidia"}.issubset(default_excludes), "default spec must exclude CUDA runtime packages"
     assert not (shared_optional_excludes - default_excludes), f"default spec missing excludes: {sorted(shared_optional_excludes - default_excludes)}"
-    assert "nvidia" not in gpu_excludes, "GPU spec must keep NVIDIA CUDA runtime libraries available"
+    assert {"torch", "nvidia", "cupy", "pycuda", "pyopencl"}.issubset(gpu_excludes), "GPU spec must exclude Python GPU package stacks"
     assert not (shared_optional_excludes - gpu_excludes), f"GPU spec missing excludes: {sorted(shared_optional_excludes - gpu_excludes)}"
 
     gpu_spec_text = Path("ImgKey-GPU.spec").read_text(encoding="utf-8")
     assert "datas=[]" in gpu_spec_text, "GPU spec should not bundle extra data files"
     assert "'gpu_accel'" in gpu_spec_text and "'gpu_runtime'" in gpu_spec_text, "GPU spec must include GPU helper modules"
+    assert "imgkey_cuda.dll" in gpu_spec_text, "GPU spec must bundle the compact CUDA DLL"
+    assert "collect_dynamic_libs" not in gpu_spec_text, "GPU spec must not collect Python CUDA package libraries"
+    assert "'torch'" not in gpu_spec_text.partition("hiddenimports=")[2].partition("]")[0], "GPU hidden imports must not include torch"
     assert "Splash(" in gpu_spec_text and "packaging/imgkey_splash.png" in gpu_spec_text, "GPU spec must keep onefile splash/progress"
     assert "name='ImgKey-GPU'" in gpu_spec_text, "GPU spec must build ImgKey-GPU.exe"
     assert "name='ImgKey'" in Path("ImgKey.spec").read_text(encoding="utf-8"), "default spec must build ImgKey.exe"
@@ -3733,7 +3738,7 @@ def run_packaging_flavor_tests() -> None:
         for line in Path("requirements-gpu-runtime-cu128.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    assert requirement_lines == ["--index-url https://download.pytorch.org/whl/cu128", "torch>=2.7"], requirement_lines
+    assert requirement_lines == [], requirement_lines
 
 
 def run_source_surface_guard() -> None:

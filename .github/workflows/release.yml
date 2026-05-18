@@ -42,6 +42,7 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "asset_name=ImgKey-$version-windows-x64.exe" >> $env:GITHUB_OUTPUT
+          "gpu_asset_name=ImgKey-GPU-$version-windows-x64.exe" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -74,11 +75,71 @@ jobs:
           }
           Copy-Item -LiteralPath "dist\ImgKey.exe" -Destination "dist\${{ steps.release.outputs.asset_name }}" -Force
 
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.34
+        with:
+          cuda: "12.6.0"
+          method: network
+          sub-packages: '["nvcc","cudart"]'
+
+      - name: Add CUDA Toolkit to PATH
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH was not set by the CUDA Toolkit action"
+          }
+          "$env:CUDA_PATH\bin" >> $env:GITHUB_PATH
+          "CUDAToolkit_ROOT=$env:CUDA_PATH" >> $env:GITHUB_ENV
+
+      - name: Build ImgKey-GPU.exe
+        shell: pwsh
+        run: |
+          .\native\imgkey_cuda\build.ps1
+          python -m gpu_runtime --probe --json --no-kernel-smoke
+          python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
+          if (-not (Test-Path -LiteralPath "dist\ImgKey-GPU.exe")) {
+            throw "dist\ImgKey-GPU.exe was not produced"
+          }
+          $blockedPath = @("NVIDIA GPU Computing Toolkit", "Microsoft Visual Studio", "Windows Kits", "MSVC")
+          $pathParts = @($env:PATH -split [IO.Path]::PathSeparator | Where-Object { $_ })
+          $sanitizedPath = @($pathParts | Where-Object { $part = $_; -not ($blockedPath | Where-Object { $part -like "*$_*" }) }) -join [IO.Path]::PathSeparator
+          $probeInfo = [System.Diagnostics.ProcessStartInfo]::new()
+          $probeInfo.FileName = (Resolve-Path -LiteralPath "dist\ImgKey-GPU.exe").Path
+          $probeInfo.WorkingDirectory = (Resolve-Path -LiteralPath ".").Path
+          $probeInfo.UseShellExecute = $false
+          $probeInfo.RedirectStandardOutput = $true
+          $probeInfo.RedirectStandardError = $true
+          $probeInfo.Environment["PATH"] = $sanitizedPath
+          foreach ($key in @($probeInfo.Environment.Keys)) {
+            if ($key -like "CUDA_PATH*" -or $key -in @("CUDA_HOME", "CUDAToolkit_ROOT", "VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsRedistDir")) {
+              $probeInfo.Environment.Remove($key) | Out-Null
+            }
+          }
+          foreach ($arg in @("--gpu-probe", "--json", "--no-kernel-smoke")) {
+            $probeInfo.ArgumentList.Add($arg) | Out-Null
+          }
+          $probe = [System.Diagnostics.Process]::Start($probeInfo)
+          $probeStdout = $probe.StandardOutput.ReadToEnd()
+          $probeStderr = $probe.StandardError.ReadToEnd()
+          $probe.WaitForExit()
+          $probeStdout
+          if ($probeStderr) { $probeStderr }
+          if ($probe.ExitCode -ne 0) {
+            throw "dist\ImgKey-GPU.exe probe failed with exit code $($probe.ExitCode)"
+          }
+          $probeJson = $probeStdout | ConvertFrom-Json
+          if (-not $probeJson.cuda_dll.load_success) {
+            throw "dist\ImgKey-GPU.exe did not load the bundled compact CUDA DLL: $($probeJson.cuda_dll.message)"
+          }
+          Copy-Item -LiteralPath "dist\ImgKey-GPU.exe" -Destination "dist\${{ steps.release.outputs.gpu_asset_name }}" -Force
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.release.outputs.asset_name }}
-          path: dist/${{ steps.release.outputs.asset_name }}
+          name: ImgKey-${{ steps.release.outputs.version }}-windows-x64
+          path: |
+            dist/${{ steps.release.outputs.asset_name }}
+            dist/${{ steps.release.outputs.gpu_asset_name }}
           if-no-files-found: error
 
       - name: Create GitHub release
@@ -88,4 +149,6 @@ jobs:
           name: ImgKey ${{ steps.release.outputs.version }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
           generate_release_notes: true
-          files: dist/${{ steps.release.outputs.asset_name }}
+          files: |
+            dist/${{ steps.release.outputs.asset_name }}
+            dist/${{ steps.release.outputs.gpu_asset_name }}

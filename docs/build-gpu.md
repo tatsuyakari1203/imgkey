@@ -1,6 +1,6 @@
 # ImgKey GPU build notes
 
-ImgKey has exactly two public Windows build flavors. Keep them separated so the default app remains lightweight and the optional GPU executable can carry CUDA tensor-runtime files.
+ImgKey has exactly two public Windows build flavors. Keep them separated so the default app remains lightweight and the optional GPU executable carries only the compact native CUDA DLL backend.
 
 ## 1. Default `ImgKey.exe`
 
@@ -19,32 +19,62 @@ python -m PyInstaller --noconfirm --clean ImgKey.spec
 
 ## 2. GPU runtime `ImgKey-GPU.exe`
 
-Includes PyTorch CUDA for tensor-runtime/probe support. The GPU spec collects torch/NVIDIA dynamic libraries only, leaves PyInstaller data files empty, and uses PyInstaller's boot splash (`packaging/imgkey_splash.png`) so onefile extraction shows visible progress before the Qt UI can start.
+Includes the custom `imgkey_cuda.dll` backend for compact GPU acceleration/probe support. The GPU spec bundles `imgkey_cuda.dll` plus required MSVC runtime DLLs, leaves PyInstaller data files empty, excludes Python CUDA package stacks, and uses PyInstaller's boot splash (`packaging/imgkey_splash.png`) so onefile extraction shows visible progress before the Qt UI can start.
 
 ```powershell
 python -m venv .venv-gpu
 .\.venv-gpu\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
-python -m pip install -r requirements-gpu-runtime-cu128.txt
+native/imgkey_cuda/build.ps1
 python -m gpu_runtime --probe --json
 python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
 .\dist\ImgKey-GPU.exe --gpu-probe --json
 ```
 
-`requirements-gpu-runtime-cu128.txt` intentionally adds only the `torch` CUDA wheel after the default requirements; PyTorch companion packages are not required for this flavor.
+`requirements-gpu-runtime-cu128.txt` is now a no-op compatibility note. There are no extra Python GPU packages for this flavor; build `native/imgkey_cuda/build/imgkey_cuda.dll` before running PyInstaller. Set `IMGKEY_CUDA_DLL` only when packaging a DLL from a non-default path.
 
 ## RTX 5060 Ti / Blackwell constraints
 
-- Use PyTorch CUDA 12.8 or newer for RTX 50-series / Blackwell. Do not use old `cu121` or `cu124` wheels.
-- Install from the official PyTorch CUDA wheel index, currently represented by `requirements-gpu-runtime-cu128.txt`.
-- The target machine needs an NVIDIA driver whose `nvidia-smi` reports CUDA 12.8 or newer. A local CUDA Toolkit install is not required for the packaged EXE.
+- CUDA Toolkit 12.6 can build the DLL with `sm_90` plus `compute_90` PTX forward-JIT, which has been verified on the local RTX 5060 Ti / compute 12.0 machine.
+- A future CUDA Toolkit with `compute_120` support can be used by `native/imgkey_cuda/build.ps1`; the script selects it automatically when `nvcc --list-gpu-arch` exposes it.
+- The target machine needs an NVIDIA display driver. A local CUDA Toolkit install is not required for the packaged EXE.
 - Validate with `python -m gpu_runtime --probe --json` before packaging and with `ImgKey-GPU.exe --gpu-probe --json` after packaging.
+
+## Native DLL dependency inspection
+
+Inspect every DLL build before packaging:
+
+```powershell
+$vs = "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat"
+cmd /d /s /c "call `"$vs`" -arch=amd64 -host_arch=amd64 >nul && dumpbin /dependents native\imgkey_cuda\build\imgkey_cuda.dll"
+```
+
+Current local static-runtime build dependents:
+
+```text
+MSVCP140.dll
+KERNEL32.dll
+VCRUNTIME140.dll
+VCRUNTIME140_1.dll
+api-ms-win-crt-runtime-l1-1-0.dll
+api-ms-win-crt-stdio-l1-1-0.dll
+api-ms-win-crt-heap-l1-1-0.dll
+api-ms-win-crt-convert-l1-1-0.dll
+api-ms-win-crt-string-l1-1-0.dll
+api-ms-win-crt-time-l1-1-0.dll
+```
+
+Packaging policy:
+
+- `MSVCP140.dll`, `VCRUNTIME140.dll`, and `VCRUNTIME140_1.dll` are bundled by `ImgKey-GPU.spec`.
+- `KERNEL32.dll` and `api-ms-win-crt-*` entries are Windows/UCRT platform DLLs.
+- `cudart64_*.dll` is not listed for the static-runtime build and is not bundled. If a future dynamic-runtime build lists it, place the verified DLL beside `imgkey_cuda.dll` or set `IMGKEY_CUDA_RUNTIME_DLLS` before running PyInstaller.
 
 ## Clean-target testing expectations
 
 Test generated EXEs on a clean Windows x64 target with an NVIDIA driver only: no Python, no pip packages, and no CUDA Toolkit on PATH.
 
 1. `ImgKey.exe` opens and passes a manual import/export smoke path without torch files.
-2. `ImgKey-GPU.exe --gpu-probe --json` reports CUDA availability or a clear driver/runtime error, with extraction splash/progress visible during onefile startup.
+2. `ImgKey-GPU.exe --gpu-probe --json` reports compact CUDA DLL availability or a clear driver/runtime error, with extraction splash/progress visible during onefile startup.
 3. Confirm `build/`, `dist/`, wheels, caches, and `.artifact/` outputs remain ignored and are not committed.

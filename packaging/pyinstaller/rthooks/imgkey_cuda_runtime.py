@@ -30,11 +30,8 @@ def _add_dll_directory(path: Path) -> None:
 root = _runtime_root()
 
 for relative in (
-    Path("torch") / "lib",
+    Path("."),
+    Path("bin"),
+    Path("cuda"),
 ):
     _add_dll_directory(root / relative)
-
-nvidia_root = root / "nvidia"
-if nvidia_root.exists():
-    for bin_dir in nvidia_root.glob("*/bin"):
-        _add_dll_directory(bin_dir)
