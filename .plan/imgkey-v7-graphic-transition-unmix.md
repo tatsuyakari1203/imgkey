@@ -754,7 +754,10 @@ Isolation:
 - Own specs, requirements, splash, docs. No algorithm changes except packaging fixes.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Phase 7 completed no-AI packaging cleanup. Kept public outputs to `ImgKey.exe` and `ImgKey-GPU.exe`, left the GPU requirement torch-only, tightened default/GPU PyInstaller excludes plus static smoke guards, preserved GPU splash/progress and CUDA probe wiring, and refreshed packaging/build docs.
 
 
 #### P7.1 - Keep only two public build flavors
@@ -771,7 +774,7 @@ Acceptance:
 - No model files are bundled.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -782,7 +785,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 8 - Full verification, build, and phase commit hygiene
 
 Category:
@@ -806,11 +809,14 @@ Status:
 
 ```powershell
 python smoke_test.py
-python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py
+python smoke_test.py --gpu-parity
+python -m gpu_runtime --probe --json
+python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
 python -c "import app, keyer; print('import ok')"
-python -c "import sys, app, keyer, gpu_runtime, screen_analysis; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
-python -c "from pathlib import Path; roots=[Path(p) for p in ['app.py','keyer.py','smoke_test.py','README.md','AGENTS.md','gpu_runtime.py','screen_analysis.py','ImgKey.spec','ImgKey-GPU.spec','requirements.txt','requirements-gpu-runtime-cu128.txt']]; roots += list(Path('docs').glob('**/*')) if Path('docs').exists() else []; forbidden=['BiRefNet','CorridorKey','Matting Anything','SAM','U2Net','MODNet','ViTMatte','Hugging Face','transformers','AI Hint','Hybrid BiRefNet']; hits=[]; [hits.append((str(p),s)) for p in roots if p.is_file() for s in forbidden if s in p.read_text(encoding='utf-8', errors='ignore')]; assert not hits, hits; print('public no-AI source guard ok')"
+python -c "import sys, app, keyer, gpu_accel, gpu_runtime, screen_analysis; blocked={'torch','torchvision','transformers','timm','kornia','einops','accelerate','huggingface_hub','safetensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
+python -c "from pathlib import Path; roots=[Path(p) for p in ['app.py','keyer.py','smoke_test.py','README.md','AGENTS.md','gpu_accel.py','gpu_runtime.py','screen_analysis.py','ImgKey.spec','ImgKey-GPU.spec','requirements.txt','requirements-gpu-runtime-cu128.txt']]; roots += list(Path('docs').glob('**/*')) if Path('docs').exists() else []; forbidden=['BiRefNet','CorridorKey','Matting Anything','SAM','U2Net','MODNet','ViTMatte','Hugging Face','transformers','AI Hint','Hybrid BiRefNet']; hits=[]; [hits.append((str(p),s)) for p in roots if p.is_file() for s in forbidden if s in p.read_text(encoding='utf-8', errors='ignore')]; assert not hits, hits; print('public no-AI source guard ok')"
 python -c "from pathlib import Path; forbidden=[Path('ai_worker.py'),Path('ai_assist.py'),Path('ai_backends'),Path('ImgKey-GPU-BiRefNet.spec'),Path('requirements-gpu-birefnet-cu128.txt')]; existing=[str(p) for p in forbidden if p.exists()]; assert not existing, existing; print('AI files removed ok')"
+git diff --check
 ```
 
 - If `gpu_accel.py` or a renamed classical trimap helper exists, include it in `py_compile` and the import-fence command.
@@ -877,7 +883,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 7 next to deep-worker: update the no-AI packaging/runtime build flavor now that the classical GPU backend path exists.
+Planner can assign Phase 8 next to deep-worker: run full verification/build smoke and keep the branch clean for planner push.
 
 
 
@@ -887,4 +893,4 @@ Planner can assign Phase 7 next to deep-worker: update the no-AI packaging/runti
 
 
 Current:
-- No
+- Yes

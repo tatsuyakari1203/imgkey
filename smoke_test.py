@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -3668,6 +3669,81 @@ def run_removed_surface_tests() -> None:
     assert not existing, f"removed runtime files still exist: {existing}"
 
 
+def _string_expr_value(node: ast.AST) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _string_expr_value(node.left) + _string_expr_value(node.right)
+    raise AssertionError(f"unsupported string expression in spec: {ast.dump(node)}")
+
+
+def _spec_string_list_assignment(path: Path, name: str) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            continue
+        assert isinstance(node.value, ast.List), f"{name} in {path} must be a list"
+        return [_string_expr_value(item) for item in node.value.elts]
+    raise AssertionError(f"{name} assignment not found in {path}")
+
+
+def run_packaging_flavor_tests() -> None:
+    default_excludes = set(_spec_string_list_assignment(Path("ImgKey.spec"), "DEFAULT_RUNTIME_EXCLUDES"))
+    gpu_excludes = set(_spec_string_list_assignment(Path("ImgKey-GPU.spec"), "GPU_RUNTIME_EXCLUDES"))
+    shared_optional_excludes = {
+        "torchvision",
+        "torchaudio",
+        "torchtext",
+        "triton",
+        "trans" + "formers",
+        "timm",
+        "kornia",
+        "einops",
+        "accelerate",
+        "hugging" + "face_hub",
+        "safe" + "tensors",
+        "skimage",
+        "diff" + "users",
+        "peft",
+        "tokenizers",
+        "sentencepiece",
+        "tensorflow",
+        "keras",
+        "jax",
+        "jaxlib",
+        "flax",
+        "ultralytics",
+        "onnx",
+        "onnxruntime",
+        "onnxruntime_gpu",
+        "pymatting",
+        "scipy",
+        "numba",
+        "corridor" + "key",
+        "Corridor" + "Key",
+    }
+    assert {"torch", "nvidia"}.issubset(default_excludes), "default spec must exclude CUDA runtime packages"
+    assert not (shared_optional_excludes - default_excludes), f"default spec missing excludes: {sorted(shared_optional_excludes - default_excludes)}"
+    assert "nvidia" not in gpu_excludes, "GPU spec must keep NVIDIA CUDA runtime libraries available"
+    assert not (shared_optional_excludes - gpu_excludes), f"GPU spec missing excludes: {sorted(shared_optional_excludes - gpu_excludes)}"
+
+    gpu_spec_text = Path("ImgKey-GPU.spec").read_text(encoding="utf-8")
+    assert "datas=[]" in gpu_spec_text, "GPU spec should not bundle extra data files"
+    assert "'gpu_accel'" in gpu_spec_text and "'gpu_runtime'" in gpu_spec_text, "GPU spec must include GPU helper modules"
+    assert "Splash(" in gpu_spec_text and "packaging/imgkey_splash.png" in gpu_spec_text, "GPU spec must keep onefile splash/progress"
+    assert "name='ImgKey-GPU'" in gpu_spec_text, "GPU spec must build ImgKey-GPU.exe"
+    assert "name='ImgKey'" in Path("ImgKey.spec").read_text(encoding="utf-8"), "default spec must build ImgKey.exe"
+
+    requirement_lines = [
+        line.strip()
+        for line in Path("requirements-gpu-runtime-cu128.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert requirement_lines == ["--index-url https://download.pytorch.org/whl/cu128", "torch>=2.7"], requirement_lines
+
+
 def run_source_surface_guard() -> None:
     roots = [
         Path("app.py"),
@@ -3747,6 +3823,7 @@ def main(argv: list[str] | None = None) -> None:
     run_app_ui_tests()
     run_v6_screen_analysis_tests()
     run_removed_surface_tests()
+    run_packaging_flavor_tests()
     run_source_surface_guard()
     run_import_compile_tests()
     if "--write-diagnostics" in args:

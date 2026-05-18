@@ -8,6 +8,7 @@ All notable changes to ImgKey are documented here.
 
 - Removed the retired assisted-matte product/runtime surface so ImgKey is classical-only before v7 transition cleanup work.
 - Kept two build flavors: default `ImgKey.exe` and optional CUDA tensor-runtime `ImgKey-GPU.exe`.
+- Locked the optional GPU packaging requirement to the torch CUDA runtime and tightened PyInstaller excludes for optional companion/scientific packages.
 - Renamed retained manual matte import UI to **Imported Matte**.
 - Updated smoke tests, docs, packaging specs, and release workflow for the classical-only surface.
 

@@ -61,9 +61,9 @@ jobs:
         shell: pwsh
         run: |
           python smoke_test.py
-          python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+          python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
           python -c "import app, keyer; print('import ok')"
-          python -c "import sys, app, keyer, gpu_runtime, screen_analysis; blocked={'torch','torchvision','trans'+'formers','timm','kornia','einops','accelerate','hugging'+'face_hub','safe'+'tensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
+          python -c "import sys, app, keyer, gpu_accel, gpu_runtime, screen_analysis; blocked={'torch','torchvision','trans'+'formers','timm','kornia','einops','accelerate','hugging'+'face_hub','safe'+'tensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
 
       - name: Build ImgKey.exe
         shell: pwsh

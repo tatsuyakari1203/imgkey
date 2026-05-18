@@ -2,6 +2,8 @@
 
 ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The default build is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks.
 
+Public Windows builds are limited to `ImgKey.exe` for the default CPU path and `ImgKey-GPU.exe` for the optional CUDA tensor-runtime path.
+
 ## Quick start
 
 ```powershell
@@ -49,7 +51,7 @@ python app.py
 ```powershell
 python smoke_test.py
 python smoke_test.py --write-edge-repair-diagnostics
-python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
 python -c "import app, keyer; print('import ok')"
 ```
 
@@ -74,7 +76,7 @@ if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 
 ## Build optional GPU runtime EXE
 
-`ImgKey-GPU.spec` builds `dist\ImgKey-GPU.exe` with PyTorch CUDA tensor-runtime/probe support. See `docs/build-gpu.md` for exact clean-environment install/build commands and RTX 50-series / CUDA 12.8 constraints.
+`ImgKey-GPU.spec` builds `dist\ImgKey-GPU.exe` with PyTorch CUDA tensor-runtime/probe support and visible onefile startup splash/progress. See `docs/build-gpu.md` for exact clean-environment install/build commands and RTX 50-series / CUDA 12.8 constraints.
 
 ## Release workflow
 

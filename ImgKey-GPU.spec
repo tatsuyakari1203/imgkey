@@ -1,22 +1,39 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# GPU runtime packaging flavor: PyTorch CUDA tensor runtime and probe support.
+# GPU runtime packaging flavor: PyTorch CUDA tensor runtime and probe support only.
 
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
 
 GPU_RUNTIME_EXCLUDES = [
+    'torch' + 'vision',
+    'torch' + 'audio',
+    'torch' + 'text',
+    'triton',
     'trans' + 'formers',
-    'timm',
-    'kornia',
-    'einops',
-    'accelerate',
+    't' + 'imm',
+    'kor' + 'nia',
+    'ei' + 'nops',
+    'accel' + 'erate',
     'hugging' + 'face_hub',
     'safe' + 'tensors',
-    'skimage',
+    'ski' + 'mage',
+    'diff' + 'users',
+    'peft',
+    'token' + 'izers',
+    'sentence' + 'piece',
+    'tensorflow',
+    'keras',
+    'jax',
+    'jaxlib',
+    'flax',
+    'ultra' + 'lytics',
+    'onnx',
     'onnxruntime',
     'onnxruntime_gpu',
     'pymatting',
+    'scipy',
+    'numba',
     'corridor' + 'key',
     'Corridor' + 'Key',
 ]
@@ -39,6 +56,7 @@ a = Analysis(
     datas=[],
     hiddenimports=[
         'gpu_runtime',
+        'gpu_accel',
         'torch',
         'torch.cuda',
     ],

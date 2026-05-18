@@ -4,5 +4,6 @@
 #   python -m pip install -r requirements-gpu-runtime-cu128.txt
 # RTX 50-series / Blackwell targets require a recent PyTorch CUDA wheel;
 # do not substitute old cu121/cu124 wheels for this flavor.
+# This optional flavor intentionally adds only torch; companion packages are omitted.
 --index-url https://download.pytorch.org/whl/cu128
 torch>=2.7

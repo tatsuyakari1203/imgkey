@@ -6,6 +6,7 @@ This document describes how ImgKey releases are produced, verified, and publishe
 
 - Target platform: Windows x64
 - Release artifact: `ImgKey-<version>-windows-x64.exe`
+- Optional local artifact: `ImgKey-GPU.exe`
 - Build type: one-file, windowed PyInstaller executable
 - Runtime profile: default classical build
 
@@ -29,7 +30,7 @@ The workflow runs on `windows-latest` and performs:
 3. Install dependencies from `requirements.txt` plus PyInstaller.
 4. Run verification:
    - `python smoke_test.py`
-   - `python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py`
+   - `python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py`
    - `python -c "import app, keyer; print('import ok')"`
 5. Build the executable with `python -m PyInstaller --noconfirm --clean ImgKey.spec`.
 6. Rename the release asset to `ImgKey-<version>-windows-x64.exe`.
@@ -71,7 +72,7 @@ Run these commands before creating a release tag:
 
 ```powershell
 python smoke_test.py
-python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
 python -c "import app, keyer; print('import ok')"
 python -m PyInstaller --noconfirm --clean ImgKey.spec
 ```
