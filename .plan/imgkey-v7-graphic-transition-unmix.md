@@ -168,6 +168,7 @@ Status:
 
 
 
+
 Current:
 - No
 ### Phase 1 - Transition model and settings
@@ -294,6 +295,7 @@ Status:
 
 
 
+
 Current:
 - No
 ### Phase 2 - Foreground reference and alpha recovery
@@ -311,7 +313,10 @@ Isolation:
 - Own `keyer.py` transition repair internals and smoke fixtures. No UI. Preserve existing tiled/crop contracts.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Added radius-valid foreground reference maps, deterministic tile-local fallback, and global transition alpha recovery with source-alpha/manual-mask clamps before tiled rendering.
 
 
 #### P2.1 - Build radius-aware foreground reference
@@ -343,7 +348,7 @@ Acceptance:
 - When no valid foreground reference exists, alpha recovery skips deterministically rather than using a far/unbounded color.
 
 Status:
-- Planned
+- Complete
 
 
 #### P2.2 - Implement global alpha solve anti-erosion
@@ -383,7 +388,7 @@ Acceptance:
 - Source-alpha semi-transparent and fully transparent regression tests pass.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -392,8 +397,9 @@ Status:
 
 
 
+
 Current:
-- Yes
+- No
 ### Phase 3 - Linear RGB transition unmix and key-vector despill
 
 Category:
@@ -511,8 +517,9 @@ Status:
 
 
 
+
 Current:
-- No
+- Yes
 ### Phase 4 - Diagnostics and regression gates
 
 Category:
@@ -588,6 +595,7 @@ Status:
 
 
 
+
 Current:
 - No
 ### Phase 5 - UI controls and defaults
@@ -629,6 +637,7 @@ Status:
 
 
 ---
+
 
 
 
@@ -715,6 +724,7 @@ Status:
 
 
 
+
 Current:
 - No
 ### Phase 7 - No-AI packaging
@@ -753,6 +763,7 @@ Status:
 
 
 ---
+
 
 
 
@@ -855,6 +866,8 @@ Status:
 ## 5) Immediate next step
 
 Planner can assign Phase 2 next: build the foreground-reference path and global alpha recovery using the Phase 1 diagnostic fixtures/settings/masks.
+
+
 
 
 
