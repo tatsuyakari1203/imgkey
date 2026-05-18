@@ -115,6 +115,14 @@ class GeometricBenchmarkCase:
     notes: str
 
 
+@dataclass(frozen=True)
+class GeometricTuningProfile:
+    name: str
+    label: str
+    description: str
+    settings: KeySettings
+
+
 @contextmanager
 def _temporary_inner_label_cap(cap: int):
     previous = keyer_module._MAX_INNER_LABEL_PIXELS
@@ -3447,6 +3455,29 @@ GEOMETRIC_COLOR_FEATURES = (
     "foreground_color_key",
 )
 
+GEOMETRIC_TUNING_SCORE_WEIGHTS = {
+    "thin_line_visible_recall": 28.0,
+    "thin_line_alpha_ratio": 10.0,
+    "dot_visible_recall": 8.0,
+    "background_leak": 22.0,
+    "foreground_loss": 10.0,
+    "edge_key_residual": 14.0,
+    "foreground_core_rgb": 12.0,
+    "alpha_mae": 8.0,
+}
+
+GEOMETRIC_TUNING_PROMOTION_TOLERANCES = {
+    "minimum_score_improvement_fraction": 0.05,
+    "detail_recall_epsilon": 1e-9,
+    "background_leak_pixel_slack": 5,
+    "background_leak_rate_slack": 0.001,
+    "foreground_loss_rate_slack": 0.002,
+    "foreground_core_rgb_mean_abs_error_max": 5.0,
+    "legacy_alpha_mae_slack": 0.005,
+    "legacy_detail_recall_slack": 0.001,
+    "legacy_core_rgb_delta_slack": 1.0,
+}
+
 
 def _geometric_circle_mask(shape: tuple[int, int], cx: float, cy: float, radius: float) -> np.ndarray:
     yy, xx = np.indices(shape, dtype=np.float32)
@@ -3687,7 +3718,7 @@ def generate_geometric_benchmark_asset() -> GeometricBenchmarkAsset:
     )
 
 
-def _geometric_benchmark_settings(key_color: tuple[int, int, int]) -> KeySettings:
+def _geometric_current_default_settings(key_color: tuple[int, int, int]) -> KeySettings:
     return KeySettings(
         key_color=key_color,
         tolerance=0.45,
@@ -3720,6 +3751,129 @@ def _geometric_benchmark_settings(key_color: tuple[int, int, int]) -> KeySetting
         foreground_reference_pull=0.65,
         gpu_acceleration="Off",
     )
+
+
+def _geometric_benchmark_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return _geometric_current_default_settings(key_color)
+
+
+def _geometric_strict_asset_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return replace(
+        _geometric_current_default_settings(key_color),
+        tolerance=0.01,
+        softness=0.01,
+        clip_background=0.97,
+        clip_foreground=0.33,
+        matte_gamma=2.20,
+        core_strength=0.38,
+        edge_refine_radius=32,
+        edge_blur=(32 - 1) / 4.0,
+        edge_softness=0.00,
+        erode_expand=-8,
+        despeckle_min_area=0,
+        aggressive_interior_removal=True,
+        despill=1.00,
+        decontaminate=1.00,
+        luminance_restore=1.00,
+        luminance_protect=1.00,
+        fringe_remove=1.00,
+        edge_color_repair=1.00,
+        inner_color_pull=1.00,
+        fringe_band_radius=12,
+        transition_unmix=True,
+        alpha_recover_strength=1.00,
+        key_vector_despill=1.00,
+        foreground_reference_pull=1.00,
+    )
+
+
+def _geometric_moderated_strict_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return replace(
+        _geometric_current_default_settings(key_color),
+        tolerance=0.06,
+        softness=0.01,
+        clip_background=0.97,
+        clip_foreground=0.18,
+        matte_gamma=2.20,
+        core_strength=0.38,
+        edge_refine_radius=32,
+        edge_blur=(32 - 1) / 4.0,
+        edge_softness=0.00,
+        erode_expand=-8,
+        despeckle_min_area=0,
+        aggressive_interior_removal=True,
+        despill=0.90,
+        decontaminate=0.85,
+        luminance_restore=0.90,
+        luminance_protect=0.90,
+        fringe_remove=0.90,
+        edge_color_repair=0.85,
+        inner_color_pull=0.75,
+        fringe_band_radius=8,
+        transition_unmix=True,
+        alpha_recover_strength=0.92,
+        key_vector_despill=0.90,
+        foreground_reference_pull=0.85,
+    )
+
+
+def _geometric_green_cyan_safe_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return replace(
+        _geometric_current_default_settings(key_color),
+        tolerance=0.26,
+        softness=0.02,
+        clip_background=0.95,
+        clip_foreground=0.08,
+        matte_gamma=1.60,
+        core_strength=0.45,
+        edge_refine_radius=24,
+        edge_blur=(24 - 1) / 4.0,
+        edge_softness=0.04,
+        erode_expand=-4,
+        despeckle_min_area=0,
+        aggressive_interior_removal=True,
+        despill=0.80,
+        decontaminate=0.70,
+        luminance_restore=0.85,
+        luminance_protect=0.85,
+        fringe_remove=0.85,
+        edge_color_repair=0.80,
+        inner_color_pull=0.60,
+        fringe_band_radius=5,
+        transition_unmix=True,
+        alpha_recover_strength=0.90,
+        key_vector_despill=0.85,
+        foreground_reference_pull=0.75,
+    )
+
+
+def geometric_tuning_profiles(key_color: tuple[int, int, int]) -> list[GeometricTuningProfile]:
+    return [
+        GeometricTuningProfile(
+            name="current_app_default",
+            label="Current app default",
+            description="Existing High Accuracy Graphic default settings, with the benchmark case key color substituted.",
+            settings=_geometric_current_default_settings(key_color),
+        ),
+        GeometricTuningProfile(
+            name="asset_strict_screenshot",
+            label="Asset Strict screenshot",
+            description="User screenshot strict asset profile: narrow tolerance, clip FG 0.33, full transition and color-repair strengths.",
+            settings=_geometric_strict_asset_settings(key_color),
+        ),
+        GeometricTuningProfile(
+            name="moderated_strict",
+            label="Moderated strict",
+            description="Strict-profile fallback with less foreground clipping and reduced repair pull to avoid over-cleaning.",
+            settings=_geometric_moderated_strict_settings(key_color),
+        ),
+        GeometricTuningProfile(
+            name="green_cyan_safe",
+            label="Green/cyan safe",
+            description="Moderate tolerance and repair strengths aimed at green, cyan, and uneven gradient robustness.",
+            settings=_geometric_green_cyan_safe_settings(key_color),
+        ),
+    ]
 
 
 def _geometric_background(
@@ -4058,6 +4212,21 @@ def _geometric_gpu_parity(cases: list[GeometricBenchmarkCase]) -> dict[str, Any]
             "max_rgba_diff_vs_cpu": max_rgba_diff,
             "max_alpha_diff_vs_cpu": max_alpha_diff,
             "cases_with_gpu_tiles": used_case_count,
+            "interpretation": {
+                "rgb_only_mismatch": bool(max_rgba_diff > 2 and max_alpha_diff <= 1 and used_case_count > 0),
+                "blocks_cpu_default_scoring": False,
+                "blocks_gpu_parity_gate": bool(max_rgba_diff > 2 or max_alpha_diff > 1 or used_case_count <= 0),
+                "note": (
+                    "Geometry parity is RGB-only outside tolerance; CPU remains the tuning reference, "
+                    "but geometry-level GPU parity should not be considered passing. The direct tile parity "
+                    "test can still pass because it compares the compact DLL against the gpu_accel CPU mirror, "
+                    "while this benchmark compares the full keyer CPU path against forced GPU transition repair."
+                    if max_rgba_diff > 2 and max_alpha_diff <= 1 and used_case_count > 0
+                    else "Geometry parity is within tolerance."
+                    if max_rgba_diff <= 2 and max_alpha_diff <= 1 and used_case_count > 0
+                    else "Geometry GPU parity did not use enough compact CUDA tiles or exceeded alpha tolerance."
+                ),
+            },
         }
     )
     return parity
@@ -4113,6 +4282,457 @@ def _geometric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "gpu_parity": metrics["gpu_parity"],
         "cases": case_summaries,
     }
+
+
+def _score_high_is_good(value: float) -> float:
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def _score_low_is_good(value: float, full_penalty_at: float) -> float:
+    if full_penalty_at <= 0:
+        return 1.0 if value <= 0 else 0.0
+    return float(1.0 - np.clip(value / full_penalty_at, 0.0, 1.0))
+
+
+def _geometric_tuning_case_score(case_metrics: dict[str, Any]) -> dict[str, Any]:
+    alpha_metrics = case_metrics["whole"]["alpha"]
+    background_leak = case_metrics["background_leak"]
+    edge_residual = case_metrics["edge_key_color_residual"]
+    core_rgb = case_metrics["whole"]["foreground_core_rgb_delta"]
+    thin = case_metrics["thin_line_recall"]
+    dots = case_metrics["dot_preservation"]
+
+    background_count = max(int(background_leak["count"]), 1)
+    background_leak_rate = float(background_leak["leaking_pixels"]) / float(background_count)
+    components = {
+        "thin_line_visible_recall": {
+            "value": float(thin["visible_recall"]),
+            "score": _score_high_is_good(float(thin["visible_recall"])),
+        },
+        "thin_line_alpha_ratio": {
+            "value": float(thin["mean_alpha_ratio"]),
+            "score": _score_high_is_good(float(thin["mean_alpha_ratio"])),
+        },
+        "dot_visible_recall": {
+            "value": float(dots["visible_recall"]),
+            "score": _score_high_is_good(float(dots["visible_recall"])),
+        },
+        "background_leak": {
+            "value": background_leak_rate,
+            "pixels": int(background_leak["leaking_pixels"]),
+            "count": int(background_leak["count"]),
+            "score": _score_low_is_good(background_leak_rate, 0.01),
+        },
+        "foreground_loss": {
+            "value": float(alpha_metrics["false_background_loss_rate"]),
+            "pixels": int(alpha_metrics["false_background_loss_pixels"]),
+            "score": _score_low_is_good(float(alpha_metrics["false_background_loss_rate"]), 0.05),
+        },
+        "edge_key_residual": {
+            "value": float(edge_residual["p95_positive_excess"]),
+            "score": _score_low_is_good(float(edge_residual["p95_positive_excess"]), 64.0),
+        },
+        "foreground_core_rgb": {
+            "value": float(core_rgb["mean_abs_error"]),
+            "score": _score_low_is_good(float(core_rgb["mean_abs_error"]), 12.0),
+        },
+        "alpha_mae": {
+            "value": float(alpha_metrics["alpha_mae"]),
+            "score": _score_low_is_good(float(alpha_metrics["alpha_mae"]), 0.08),
+        },
+    }
+    weighted_total = 0.0
+    weight_sum = 0.0
+    for name, component in components.items():
+        weight = float(GEOMETRIC_TUNING_SCORE_WEIGHTS[name])
+        component["weight"] = weight
+        weighted_total += float(component["score"]) * weight
+        weight_sum += weight
+    return {
+        "weighted_score": float(100.0 * weighted_total / weight_sum) if weight_sum else 0.0,
+        "components": components,
+    }
+
+
+def _geometric_tuning_case_digest(case_metrics: dict[str, Any]) -> dict[str, Any]:
+    alpha_metrics = case_metrics["whole"]["alpha"]
+    background_leak = case_metrics["background_leak"]
+    return {
+        "alpha_mae": float(alpha_metrics["alpha_mae"]),
+        "alpha_precision": float(alpha_metrics["alpha_precision"]),
+        "alpha_recall": float(alpha_metrics["alpha_recall"]),
+        "foreground_loss_pixels": int(alpha_metrics["false_background_loss_pixels"]),
+        "foreground_loss_rate": float(alpha_metrics["false_background_loss_rate"]),
+        "background_leaking_pixels": int(background_leak["leaking_pixels"]),
+        "background_count": int(background_leak["count"]),
+        "background_mean_alpha": float(background_leak["mean_alpha"]),
+        "thin_line_visible_recall": float(case_metrics["thin_line_recall"]["visible_recall"]),
+        "thin_line_alpha_ratio": float(case_metrics["thin_line_recall"]["mean_alpha_ratio"]),
+        "dot_visible_recall": float(case_metrics["dot_preservation"]["visible_recall"]),
+        "dot_alpha_ratio": float(case_metrics["dot_preservation"]["mean_alpha_ratio"]),
+        "foreground_core_rgb_mean_abs_error": float(case_metrics["whole"]["foreground_core_rgb_delta"]["mean_abs_error"]),
+        "foreground_core_rgb_max_abs_error": int(case_metrics["whole"]["foreground_core_rgb_delta"]["max_abs_error"]),
+        "edge_key_residual_p95": float(case_metrics["edge_key_color_residual"]["p95_positive_excess"]),
+        "edge_key_residual_max": int(case_metrics["edge_key_color_residual"]["max_positive_excess"]),
+        "transparent_rgb_max": int(case_metrics["transparent_rgb_residual"]["max_rgb_when_transparent"]),
+    }
+
+
+def _geometric_key_family(case: GeometricBenchmarkCase) -> str:
+    if case.key_color == (30, 80, 235):
+        return "blue"
+    if case.key_color == (0, 220, 50):
+        return "green"
+    if case.key_color == (0, 190, 210):
+        return "cyan"
+    return "custom"
+
+
+def _profile_for_key(profile_name: str, key_color: tuple[int, int, int]) -> GeometricTuningProfile:
+    profiles = {profile.name: profile for profile in geometric_tuning_profiles(key_color)}
+    return profiles[profile_name]
+
+
+def _geometric_cases_for_profile(cases: list[GeometricBenchmarkCase], profile_name: str) -> list[GeometricBenchmarkCase]:
+    return [
+        replace(case, settings=_profile_for_key(profile_name, case.key_color).settings)
+        for case in cases
+    ]
+
+
+def _summarize_tuning_profile(profile_name: str, cases: list[GeometricBenchmarkCase]) -> dict[str, Any]:
+    reference_profile = _profile_for_key(profile_name, (30, 80, 235))
+    case_records: dict[str, Any] = {}
+    score_values: list[float] = []
+    thin_values: list[float] = []
+    dot_values: list[float] = []
+    alpha_values: list[float] = []
+    core_values: list[float] = []
+    background_leaks = 0
+    family_scores: dict[str, list[float]] = {}
+
+    for case in cases:
+        profile = _profile_for_key(profile_name, case.key_color)
+        candidate_case = replace(case, settings=profile.settings)
+        result = process_key_image(case.source_rgb, profile.settings)
+        metrics = _geometric_case_metrics(candidate_case, result)
+        score = _geometric_tuning_case_score(metrics)
+        digest = _geometric_tuning_case_digest(metrics)
+        family = _geometric_key_family(case)
+        weighted_score = float(score["weighted_score"])
+        score_values.append(weighted_score)
+        family_scores.setdefault(family, []).append(weighted_score)
+        thin_values.append(float(digest["thin_line_visible_recall"]))
+        dot_values.append(float(digest["dot_visible_recall"]))
+        alpha_values.append(float(digest["alpha_mae"]))
+        core_values.append(float(digest["foreground_core_rgb_mean_abs_error"]))
+        background_leaks += int(digest["background_leaking_pixels"])
+        case_records[case.name] = {
+            "background_name": case.background_name,
+            "key_family": family,
+            "key_color": list(case.key_color),
+            "metrics": digest,
+            "score": score,
+        }
+
+    return {
+        "name": reference_profile.name,
+        "label": reference_profile.label,
+        "description": reference_profile.description,
+        "settings_blue_key": asdict(reference_profile.settings),
+        "aggregate": {
+            "weighted_score": float(np.mean(score_values)) if score_values else 0.0,
+            "weighted_score_min": float(np.min(score_values)) if score_values else 0.0,
+            "thin_line_visible_recall_min": float(np.min(thin_values)) if thin_values else 1.0,
+            "dot_visible_recall_min": float(np.min(dot_values)) if dot_values else 1.0,
+            "alpha_mae_mean": float(np.mean(alpha_values)) if alpha_values else 0.0,
+            "alpha_mae_max": float(np.max(alpha_values)) if alpha_values else 0.0,
+            "foreground_core_rgb_mean_abs_error_max": float(np.max(core_values)) if core_values else 0.0,
+            "background_leaking_pixels_total": int(background_leaks),
+            "families": {
+                family: {
+                    "weighted_score": float(np.mean(values)),
+                    "weighted_score_min": float(np.min(values)),
+                    "case_count": len(values),
+                }
+                for family, values in family_scores.items()
+            },
+        },
+        "cases": case_records,
+    }
+
+
+def _geometric_legacy_tuning_fixtures() -> list[DiagnosticFixture]:
+    fixtures = [
+        blue_gradient_screen_fixture(),
+        green_gradient_screen_fixture(),
+        _cyanish_screen_fixture(),
+        hair_lines_fixture(),
+        semi_transparent_glass_fixture(),
+        white_gray_black_composite_fixture(),
+    ]
+    return [fixture for fixture in fixtures if fixture.expected_alpha is not None]
+
+
+def _legacy_tuning_metrics(fixture: DiagnosticFixture, settings: KeySettings) -> dict[str, Any]:
+    result = _process_fixture_result(fixture, settings, include_debug=False)
+    known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+    if fixture.expected_alpha is None:
+        alpha_mae = 0.0
+        expected_for_detail = None
+    else:
+        expected_u8 = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+        alpha_mae = float(np.mean(np.abs(result.alpha.astype(np.int16) - expected_u8.astype(np.int16))) / 255.0)
+        detail_mask = soft_edge if np.any(soft_edge) else fixture.expected_alpha > 0.0
+        expected_for_detail = np.where(detail_mask, fixture.expected_alpha, 0.0)
+    detail = alpha_detail_recall(expected_for_detail, result.alpha)
+    background = background_alpha_leak(result.alpha, known_background)
+    core_delta = foreground_core_rgb_delta(fixture, result)
+    edge_residual = edge_key_residual(result.rgba, settings.key_color, soft_edge)
+    return {
+        "alpha_mae": alpha_mae,
+        "detail_visible_recall": float(detail["visible_recall"]),
+        "detail_alpha_ratio": float(detail["mean_alpha_ratio"]),
+        "background_leaking_pixels": int(background["leaking_pixels"]),
+        "background_count": int(background["count"]),
+        "foreground_core_rgb_mean_delta": float(core_delta["mean_delta"]),
+        "foreground_core_rgb_max_delta": int(core_delta["max_delta"]),
+        "edge_key_residual_p95": float(edge_residual["p95_positive_excess"]),
+    }
+
+
+def _legacy_tuning_summary(profile_names: list[str]) -> dict[str, Any]:
+    fixtures = _geometric_legacy_tuning_fixtures()
+    baseline: dict[str, Any] = {}
+    profiles: dict[str, Any] = {}
+    for profile_name in profile_names:
+        records: dict[str, Any] = {}
+        regressions: list[dict[str, Any]] = []
+        for fixture in fixtures:
+            profile = _profile_for_key(profile_name, fixture.settings.key_color)
+            metrics = _legacy_tuning_metrics(fixture, profile.settings)
+            records[fixture.name] = metrics
+            if profile_name == "current_app_default":
+                baseline[fixture.name] = metrics
+                continue
+            base = baseline[fixture.name]
+            leak_slack = max(
+                int(GEOMETRIC_TUNING_PROMOTION_TOLERANCES["background_leak_pixel_slack"]),
+                int(round(float(base["background_count"]) * GEOMETRIC_TUNING_PROMOTION_TOLERANCES["background_leak_rate_slack"])),
+            )
+            if float(metrics["alpha_mae"]) > float(base["alpha_mae"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["legacy_alpha_mae_slack"]:
+                regressions.append({"fixture": fixture.name, "metric": "alpha_mae", "baseline": base["alpha_mae"], "candidate": metrics["alpha_mae"]})
+            if int(metrics["background_leaking_pixels"]) > int(base["background_leaking_pixels"]) + leak_slack:
+                regressions.append({"fixture": fixture.name, "metric": "background_leak", "baseline": base["background_leaking_pixels"], "candidate": metrics["background_leaking_pixels"], "slack": leak_slack})
+            if float(metrics["detail_visible_recall"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["legacy_detail_recall_slack"] < float(base["detail_visible_recall"]):
+                regressions.append({"fixture": fixture.name, "metric": "detail_visible_recall", "baseline": base["detail_visible_recall"], "candidate": metrics["detail_visible_recall"]})
+            core_limit = min(
+                GEOMETRIC_TUNING_PROMOTION_TOLERANCES["foreground_core_rgb_mean_abs_error_max"],
+                float(base["foreground_core_rgb_mean_delta"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["legacy_core_rgb_delta_slack"],
+            )
+            if float(metrics["foreground_core_rgb_mean_delta"]) > core_limit:
+                regressions.append({"fixture": fixture.name, "metric": "foreground_core_rgb_mean_delta", "limit": core_limit, "candidate": metrics["foreground_core_rgb_mean_delta"]})
+        profiles[profile_name] = {"fixtures": records, "regressions": regressions}
+    return {
+        "fixture_names": [fixture.name for fixture in fixtures],
+        "profiles": profiles,
+    }
+
+
+def _geometric_promotion_checks(profile_summaries: dict[str, Any], legacy_summary: dict[str, Any]) -> dict[str, Any]:
+    baseline = profile_summaries["current_app_default"]
+    baseline_score = float(baseline["aggregate"]["weighted_score"])
+    checks: dict[str, Any] = {}
+    for profile_name, summary in profile_summaries.items():
+        score = float(summary["aggregate"]["weighted_score"])
+        improvement_fraction = (score - baseline_score) / max(abs(baseline_score), 1e-9)
+        detail_regressions: list[dict[str, Any]] = []
+        leak_regressions: list[dict[str, Any]] = []
+        foreground_loss_regressions: list[dict[str, Any]] = []
+        core_blocks: list[dict[str, Any]] = []
+        if profile_name != "current_app_default":
+            for case_name, record in summary["cases"].items():
+                candidate_metrics = record["metrics"]
+                baseline_metrics = baseline["cases"][case_name]["metrics"]
+                if float(candidate_metrics["thin_line_visible_recall"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["detail_recall_epsilon"] < float(baseline_metrics["thin_line_visible_recall"]):
+                    detail_regressions.append({"case": case_name, "metric": "thin_line_visible_recall", "baseline": baseline_metrics["thin_line_visible_recall"], "candidate": candidate_metrics["thin_line_visible_recall"]})
+                if float(candidate_metrics["dot_visible_recall"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["detail_recall_epsilon"] < float(baseline_metrics["dot_visible_recall"]):
+                    detail_regressions.append({"case": case_name, "metric": "dot_visible_recall", "baseline": baseline_metrics["dot_visible_recall"], "candidate": candidate_metrics["dot_visible_recall"]})
+                leak_slack = max(
+                    int(GEOMETRIC_TUNING_PROMOTION_TOLERANCES["background_leak_pixel_slack"]),
+                    int(round(float(baseline_metrics["background_count"]) * GEOMETRIC_TUNING_PROMOTION_TOLERANCES["background_leak_rate_slack"])),
+                )
+                if int(candidate_metrics["background_leaking_pixels"]) > int(baseline_metrics["background_leaking_pixels"]) + leak_slack:
+                    leak_regressions.append({"case": case_name, "baseline": baseline_metrics["background_leaking_pixels"], "candidate": candidate_metrics["background_leaking_pixels"], "slack": leak_slack})
+                if float(candidate_metrics["foreground_loss_rate"]) > float(baseline_metrics["foreground_loss_rate"]) + GEOMETRIC_TUNING_PROMOTION_TOLERANCES["foreground_loss_rate_slack"]:
+                    foreground_loss_regressions.append({"case": case_name, "baseline": baseline_metrics["foreground_loss_rate"], "candidate": candidate_metrics["foreground_loss_rate"]})
+                if float(candidate_metrics["foreground_core_rgb_mean_abs_error"]) > GEOMETRIC_TUNING_PROMOTION_TOLERANCES["foreground_core_rgb_mean_abs_error_max"]:
+                    core_blocks.append({"case": case_name, "candidate": candidate_metrics["foreground_core_rgb_mean_abs_error"], "limit": GEOMETRIC_TUNING_PROMOTION_TOLERANCES["foreground_core_rgb_mean_abs_error_max"]})
+        legacy_regressions = legacy_summary["profiles"].get(profile_name, {}).get("regressions", [])
+        eligible = bool(
+            profile_name != "current_app_default"
+            and improvement_fraction >= GEOMETRIC_TUNING_PROMOTION_TOLERANCES["minimum_score_improvement_fraction"]
+            and not detail_regressions
+            and not leak_regressions
+            and not foreground_loss_regressions
+            and not core_blocks
+            and not legacy_regressions
+        )
+        checks[profile_name] = {
+            "score_improvement_fraction": float(improvement_fraction),
+            "score_improvement_percent": float(improvement_fraction * 100.0),
+            "meets_score_improvement": bool(improvement_fraction >= GEOMETRIC_TUNING_PROMOTION_TOLERANCES["minimum_score_improvement_fraction"]),
+            "detail_regressions": detail_regressions,
+            "background_leak_regressions": leak_regressions,
+            "foreground_loss_regressions": foreground_loss_regressions,
+            "foreground_core_rgb_blocks": core_blocks,
+            "legacy_regressions": legacy_regressions,
+            "eligible_for_global_default": eligible,
+        }
+    return checks
+
+
+def _geometric_tuning_recommendations(
+    profile_summaries: dict[str, Any],
+    promotion_checks: dict[str, Any],
+    profile_gpu_parity: dict[str, Any],
+) -> dict[str, Any]:
+    weighted_winner = max(profile_summaries, key=lambda name: float(profile_summaries[name]["aggregate"]["weighted_score"]))
+    eligible = [name for name, check in promotion_checks.items() if check["eligible_for_global_default"]]
+    if eligible:
+        global_profile = max(eligible, key=lambda name: float(profile_summaries[name]["aggregate"]["weighted_score"]))
+    else:
+        global_profile = "current_app_default"
+    selected_gpu_parity = profile_gpu_parity.get(global_profile, {})
+    gpu_blocks_default = bool(selected_gpu_parity.get("interpretation", {}).get("blocks_gpu_parity_gate"))
+    if eligible:
+        global_action = "defer_global_default_until_gpu_geometry_parity_resolved" if gpu_blocks_default else "promote_global_default_candidate"
+    else:
+        global_action = "keep_current_global_default"
+
+    blue_scores = {
+        name: float(summary["aggregate"]["families"].get("blue", {}).get("weighted_score", 0.0))
+        for name, summary in profile_summaries.items()
+    }
+    strict_blue_winner = bool(blue_scores and blue_scores.get("asset_strict_screenshot", -1.0) >= max(blue_scores.values()) - 1e-9)
+    strict_blocked = not bool(promotion_checks["asset_strict_screenshot"]["eligible_for_global_default"])
+    named_preset = None
+    if strict_blue_winner and strict_blocked:
+        named_preset = {
+            "action": "recommend_named_preset",
+            "preset_name": "Asset Strict",
+            "profile": "asset_strict_screenshot",
+            "reason": "Strict screenshot profile is strongest on blue/graphic geometry but fails at least one global promotion rule.",
+        }
+
+    return {
+        "weighted_winner": weighted_winner,
+        "global_default": {
+            "action": global_action,
+            "profile": global_profile,
+            "reason": (
+                "CPU metrics pass the objective promotion rules, but geometry-level GPU parity is outside tolerance. Resolve or explicitly accept the GPU RGB mismatch before changing the global default."
+                if eligible and gpu_blocks_default
+                else
+                "Candidate passed the objective promotion rules."
+                if eligible
+                else "No candidate passed all objective global-default promotion rules; keep the current default for now."
+            ),
+            "cpu_metric_eligible_profiles": eligible,
+            "gpu_parity_profile": global_profile,
+        },
+        "named_preset": named_preset,
+        "blue_family_scores": blue_scores,
+    }
+
+
+def _geometric_tuning_report(summary: dict[str, Any]) -> str:
+    lines = [
+        "Geometric default tuning sweep",
+        "================================",
+        f"Generated by: {summary['generated_by']}",
+        "",
+        "Candidate ranking:",
+    ]
+    ranked = sorted(
+        summary["profiles"].items(),
+        key=lambda item: float(item[1]["aggregate"]["weighted_score"]),
+        reverse=True,
+    )
+    for name, profile in ranked:
+        aggregate = profile["aggregate"]
+        check = summary["promotion_checks"][name]
+        lines.append(
+            f"- {profile['label']} ({name}): score={aggregate['weighted_score']:.2f}, "
+            f"thin_min={aggregate['thin_line_visible_recall_min']:.3f}, "
+            f"dot_min={aggregate['dot_visible_recall_min']:.3f}, "
+            f"alpha_mae_mean={aggregate['alpha_mae_mean']:.4f}, "
+            f"bg_leak_total={aggregate['background_leaking_pixels_total']}, "
+            f"core_rgb_max={aggregate['foreground_core_rgb_mean_abs_error_max']:.2f}, "
+            f"improvement={check['score_improvement_percent']:.2f}%, "
+            f"global_eligible={check['eligible_for_global_default']}"
+        )
+    recommendation = summary["recommendation"]
+    lines.extend(
+        [
+            "",
+            f"Weighted winner: {recommendation['weighted_winner']}",
+            f"Global default recommendation: {recommendation['global_default']['action']} -> {recommendation['global_default']['profile']}",
+            f"Reason: {recommendation['global_default']['reason']}",
+        ]
+    )
+    if recommendation.get("named_preset"):
+        named = recommendation["named_preset"]
+        lines.append(f"Named preset recommendation: {named['preset_name']} from {named['profile']} ({named['reason']})")
+    parity = summary["geometry_gpu_parity"]
+    parity_profile = recommendation["global_default"].get("gpu_parity_profile", recommendation["global_default"]["profile"])
+    lines.extend(
+        [
+            "",
+            f"Geometry GPU parity ({parity_profile}): status={parity.get('status')} within_tolerance={parity.get('within_tolerance')} "
+            f"max_rgba_diff={parity.get('max_rgba_diff_vs_cpu')} max_alpha_diff={parity.get('max_alpha_diff_vs_cpu')}",
+            f"GPU parity note: {parity.get('interpretation', {}).get('note', parity.get('message'))}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_geometric_tuning_summary() -> None:
+    GEOMETRIC_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"running geometric default tuning sweep; writing summary to {GEOMETRIC_BENCHMARK_DIR}")
+    cases = geometric_benchmark_cases()
+    profile_names = [profile.name for profile in geometric_tuning_profiles((30, 80, 235))]
+    profiles = {name: _summarize_tuning_profile(name, cases) for name in profile_names}
+    legacy_summary = _legacy_tuning_summary(profile_names)
+    promotion_checks = _geometric_promotion_checks(profiles, legacy_summary)
+    profile_gpu_parity = {
+        name: _geometric_gpu_parity(_geometric_cases_for_profile(cases, name))
+        for name in profile_names
+    }
+    recommendation = _geometric_tuning_recommendations(profiles, promotion_checks, profile_gpu_parity)
+    selected_gpu_profile = recommendation["global_default"]["gpu_parity_profile"]
+    gpu_parity = profile_gpu_parity[selected_gpu_profile]
+    summary = {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --tune-geometric-defaults",
+        "artifact_dir": str(GEOMETRIC_BENCHMARK_DIR),
+        "score_weights": GEOMETRIC_TUNING_SCORE_WEIGHTS,
+        "promotion_tolerances": GEOMETRIC_TUNING_PROMOTION_TOLERANCES,
+        "profiles": profiles,
+        "legacy_checks": legacy_summary,
+        "promotion_checks": promotion_checks,
+        "recommendation": recommendation,
+        "geometry_gpu_parity": gpu_parity,
+        "geometry_gpu_parity_by_profile": profile_gpu_parity,
+    }
+    summary_path = GEOMETRIC_BENCHMARK_DIR / "tuning_summary.json"
+    report_path = GEOMETRIC_BENCHMARK_DIR / "tuning_report.txt"
+    report = _geometric_tuning_report(summary)
+    summary_path.write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(report, encoding="utf-8")
+    print(report.rstrip())
+    print(f"wrote geometric tuning summary to {summary_path}")
+    print(f"wrote geometric tuning report to {report_path}")
 
 
 def write_geometric_benchmark() -> None:
@@ -4573,6 +5193,7 @@ def main(argv: list[str] | None = None) -> None:
         "--write-algorithm-baseline",
         "--write-transition-unmix-diagnostics",
         "--write-geometric-benchmark",
+        "--tune-geometric-defaults",
         "--gpu-parity",
         "--gpu-benchmark",
     }
@@ -4581,7 +5202,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
             "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--write-geometric-benchmark] "
-            "[--gpu-parity] [--gpu-benchmark]; "
+            "[--tune-geometric-defaults] [--gpu-parity] [--gpu-benchmark]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -4616,6 +5237,8 @@ def main(argv: list[str] | None = None) -> None:
         write_transition_unmix_diagnostics()
     if "--write-geometric-benchmark" in args:
         write_geometric_benchmark()
+    if "--tune-geometric-defaults" in args:
+        write_geometric_tuning_summary()
     if "--gpu-parity" in args:
         run_gpu_parity_tests()
     if "--gpu-benchmark" in args:

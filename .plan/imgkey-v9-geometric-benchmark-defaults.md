@@ -79,6 +79,7 @@ Current:
 - No
 
 
+
 #### P1.1 - Generate comprehensive ground-truth asset fixtures
 - Add deterministic fixture generator(s) in `smoke_test.py` or a small test helper:
   - foreground RGBA canvas with known alpha,
@@ -159,10 +160,11 @@ Isolation:
 - Own benchmark/tuning code and reports. Do not update app defaults until winner is selected.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
 
 
 #### P2.1 - Add candidate profiles
@@ -182,7 +184,10 @@ Acceptance:
 - Thin-line/detail failures are visible in metrics, not hidden by aggregate score.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- 2026-05-19: Added `--tune-geometric-defaults` candidate sweep covering current default, screenshot strict, moderated strict, and green/cyan-safe profiles with weighted scoring and per-case detail metrics.
 
 
 #### P2.2 - Tune score weights and stop conditions
@@ -207,7 +212,10 @@ Acceptance:
 - Geometry correctness is evaluated on CPU and, when compact CUDA DLL is available, benchmark-level CPU vs GPU parity must compare geometry RGBA/metrics. Existing GPU tile parity alone is not sufficient for v9.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- 2026-05-19: Wrote `.artifact/geometric-benchmark/tuning_summary.json` and `tuning_report.txt`. CPU metrics favor `green_cyan_safe` (+5.41%) but global-default promotion is deferred because geometry-level compact CUDA parity is RGB-only out of tolerance for the candidate (`max_rgba_diff=46`, alpha diff `0`; current default profile diff `48`).
 
 
 ---
@@ -230,7 +238,8 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
 
 
 #### P3.1 - Update default or add named profile
@@ -287,6 +296,7 @@ Current:
 - No
 
 
+
 #### P4.1 - Verification floor
 - Run:
 
@@ -322,4 +332,4 @@ Status:
 
 ## 5) Immediate next step
 
-Start Phase 2 with `deep-worker`: add candidate setting profiles and run the geometry benchmark report before any default changes.
+Start Phase 3 with `worker`: decide whether to fix/defer the GPU geometry RGB parity issue before promoting `green_cyan_safe`, or keep the current global default and add/promote an appropriate named preset/regression gate.
