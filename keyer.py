@@ -113,8 +113,8 @@ class KeySettings:
     transition_alpha_max: int = 253
     preserve_foreground_luma: float = 0.85
 
-    # Optional no-AI GPU acceleration. Default is CPU/off so library callers and
-    # tests never import heavy tensor runtimes unless they opt in explicitly.
+    # Optional no-AI compact CUDA DLL acceleration. Default is CPU/off so library
+    # callers and tests never load the DLL unless they opt in explicitly.
     gpu_acceleration: str = "Off"
 
 
@@ -287,7 +287,7 @@ def _record_gpu_tile_result(gpu_stats: dict | None, result: dict) -> None:
     else:
         gpu_stats["fallback_tiles"] = int(gpu_stats.get("fallback_tiles", 0)) + 1
         reason = result.get("reason")
-        if reason in {"torch_import_failed", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
+        if reason in {"cuda_dll_unavailable", "cuda_dll_probe_failed", "cuda_no_device", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
             gpu_stats["error_tiles"] = int(gpu_stats.get("error_tiles", 0)) + 1
         if gpu_stats.get("status") != "used":
             gpu_stats["status"] = "fallback"
@@ -2291,7 +2291,8 @@ def _process_color_tile(
                 gpu_result = {
                     "ok": False,
                     "used": False,
-                    "backend": "torch_cuda",
+                    "backend": "compact_cuda_dll",
+                    "backend_name": "compact CUDA DLL",
                     "reason": "gpu_exception",
                     "message": f"GPU transition repair failed before launch; CPU fallback is required: {type(exc).__name__}: {exc}",
                     "elapsed_ms": None,
@@ -2300,7 +2301,7 @@ def _process_color_tile(
             if gpu_result.get("used") and isinstance(gpu_result.get("rgb"), np.ndarray) and isinstance(gpu_result.get("repair_mask"), np.ndarray):
                 transition_rgb = gpu_result["rgb"]
                 transition_mask = gpu_result["repair_mask"]
-            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"torch_import_failed", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
+            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"cuda_dll_unavailable", "cuda_dll_probe_failed", "cuda_no_device", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
                 raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but the CUDA backend is unavailable."))
 
         if transition_rgb is None or transition_mask is None:

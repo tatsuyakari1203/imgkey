@@ -253,8 +253,10 @@ Progress:
 ---
 
 
+
+
 Current:
-- Yes
+- No
 ### Phase 2 - Replace torch GPU path with compact DLL backend
 
 Category:
@@ -270,7 +272,7 @@ Isolation:
 - Own `gpu_accel.py`, `gpu_runtime.py`, `keyer.py` dispatch hooks, `smoke_test.py` GPU parity/benchmark/probe expectations, and related tests. No packaging yet except removing torch assumptions from source.
 
 Status:
-- Planned
+- Completed
 
 
 #### P2.1 - Make DLL backend the only active GPU implementation
@@ -289,7 +291,10 @@ Acceptance:
 - GPU benchmark output names the backend as compact CUDA DLL, not torch.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- Completed 2026-05-18. `gpu_runtime.py` now probes only the compact CUDA DLL plus `nvidia-smi`, reports DLL load/version/device-count and a transition repair kernel smoke, and has no torch import path. `gpu_accel.py`/`keyer.py` now expose the compact CUDA DLL as the only active GPU backend, with CPU fallback on missing DLL/no device/errors. `smoke_test.py --gpu-parity` uses the DLL backend directly and skips cleanly when unavailable.
 
 
 #### P2.2 - Benchmark compact DLL backend
@@ -303,10 +308,15 @@ Acceptance:
 - If slower than torch but still useful/small, document tradeoff; if slower than CPU, keep backend behind Auto fallback.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- Completed 2026-05-18. `python smoke_test.py --gpu-benchmark` writes `.artifact/gpu-benchmarks/summary.json` for the compact CUDA DLL backend. Local RTX 5060 Ti run recorded 1024×1024 transition repair direct CPU reference 1247.65 ms vs CUDA DLL 5.67 ms including DLL host/device transfers, max RGB/mask diff 0, plus dispatch CPU 1361.61 ms vs CUDA DLL 856.98 ms including transfers, max RGB diff 4. Auto/CPU fallback remains the policy for unavailable or failed GPU work.
 
 
 ---
+
+
 
 
 Current:
@@ -378,8 +388,10 @@ Status:
 ---
 
 
+
+
 Current:
-- No
+- Yes
 ### Phase 4 - Final verification and cleanup
 
 Category:
@@ -432,7 +444,11 @@ Status:
 
 ## 6) Immediate next step
 
-Continue with Phase 2/P2.1: replace the remaining torch-oriented runtime/probe/benchmark surfaces with the compact DLL backend. Do not change PyInstaller packaging until Phase 3.
+Continue with Phase 3/P3.1: update compact GPU packaging to bundle the native CUDA DLL/runtime dependencies and remove the old GPU packaging assumptions.
+
+
+
+
 
 
 Current:

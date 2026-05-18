@@ -2,30 +2,32 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import json
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 
 NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
-MATMUL_SMOKE_SIZE = 64
-
-
-def _import_torch() -> Any:
-    """Import torch lazily; never call this at module import time."""
-    return importlib.import_module("torch")
+BACKEND_ID = "compact_cuda_dll"
+BACKEND_NAME = "compact CUDA DLL"
+KERNEL_SMOKE_SHAPE = (32, 48)
 
 
 def _base_probe() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "probe": "imgkey_gpu_runtime",
+        "backend": {
+            "id": BACKEND_ID,
+            "name": BACKEND_NAME,
+        },
         "status": "unavailable",
         "available": False,
         "reason": "not_run",
@@ -35,11 +37,20 @@ def _base_probe() -> dict[str, Any]:
             "executable": sys.executable,
             "platform": platform.platform(),
         },
-        "torch": {
-            "import_success": False,
-            "import_error": None,
+        "cuda_dll": {
+            "available": False,
+            "load_success": False,
+            "status": "not_run",
+            "reason": "not_run",
+            "message": None,
+            "dll_path": None,
             "version": None,
-            "cuda_version": None,
+            "device": None,
+            "device_index": None,
+            "device_count": 0,
+            "load_error": None,
+            "probe_error": None,
+            "last_error": None,
         },
         "cuda": {
             "is_available": False,
@@ -48,10 +59,10 @@ def _base_probe() -> dict[str, Any]:
             "current_device": None,
             "device_name": None,
             "device_capability": None,
-            "arch_list": [],
+            "driver_version": None,
+            "cuda_version": None,
             "vram_total_bytes": None,
             "vram_free_bytes": None,
-            "device_properties": None,
         },
         "nvidia_smi": {
             "available": False,
@@ -61,13 +72,14 @@ def _base_probe() -> dict[str, Any]:
             "cuda_version": None,
             "gpus": [],
         },
-        "matmul_smoke": {
+        "transition_repair_smoke": {
             "ran": False,
             "ok": False,
             "error": None,
-            "device": None,
-            "size": MATMUL_SMOKE_SIZE,
-            "mean": None,
+            "shape": list(KERNEL_SMOKE_SHAPE),
+            "elapsed_ms": None,
+            "max_rgb_diff": None,
+            "max_mask_diff": None,
         },
     }
 
@@ -139,6 +151,7 @@ def _parse_nvidia_smi_rows(stdout: str, fields: list[str]) -> list[dict[str, Any
 
 def probe_nvidia_smi(*, timeout_seconds: float = NVIDIA_SMI_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Return structured nvidia-smi driver/GPU info when the tool is present."""
+
     path = shutil.which("nvidia-smi")
     result: dict[str, Any] = {
         "available": False,
@@ -202,228 +215,241 @@ def _set_available(result: dict[str, Any], message: str) -> dict[str, Any]:
     return result
 
 
-def _torch_attr(obj: Any, name: str, default: Any = None) -> Any:
-    try:
-        return getattr(obj, name)
-    except Exception:
-        return default
+def _compute_capability_tuple(value: Any) -> list[int] | None:
+    if value is None:
+        return None
+    match = re.search(r"(\d+)(?:\.(\d+))?", str(value))
+    if not match:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return [major, minor]
 
 
-def _device_properties_dict(props: Any) -> dict[str, Any]:
-    total_memory = _torch_attr(props, "total_memory")
-    return {
-        "name": _torch_attr(props, "name"),
-        "major": _torch_attr(props, "major"),
-        "minor": _torch_attr(props, "minor"),
-        "multi_processor_count": _torch_attr(props, "multi_processor_count"),
-        "total_memory_bytes": int(total_memory) if total_memory is not None else None,
-    }
+def _populate_cuda_from_nvidia_smi(result: dict[str, Any]) -> None:
+    smi = result.get("nvidia_smi") or {}
+    cuda = result["cuda"]
+    cuda["driver_version"] = smi.get("driver_version")
+    cuda["cuda_version"] = smi.get("cuda_version")
+    gpus = smi.get("gpus") or []
+    if not gpus:
+        return
+    first = gpus[0]
+    cuda["device_name"] = first.get("name")
+    cuda["device_capability"] = _compute_capability_tuple(first.get("compute_capability"))
+    if first.get("memory_total_mib") is not None:
+        cuda["vram_total_bytes"] = int(first["memory_total_mib"]) * 1024 * 1024
+    if first.get("memory_free_mib") is not None:
+        cuda["vram_free_bytes"] = int(first["memory_free_mib"]) * 1024 * 1024
 
 
-def _run_cuda_matmul_smoke(torch_module: Any, *, device_index: int, size: int) -> dict[str, Any]:
+def _probe_cuda_dll(*, dll_path: str | None = None) -> dict[str, Any]:
+    import gpu_accel
+
+    return gpu_accel.is_available(refresh=True, dll_path=dll_path)
+
+
+def _apply_cuda_dll_availability(result: dict[str, Any], availability: dict[str, Any]) -> None:
+    dll = result["cuda_dll"]
+    available = bool(availability.get("available"))
+    dll.update(
+        {
+            "available": available,
+            "load_success": bool(availability.get("dll_path")) or available,
+            "status": availability.get("status") or ("available" if available else "unavailable"),
+            "reason": availability.get("reason"),
+            "message": availability.get("message"),
+            "dll_path": availability.get("dll_path"),
+            "version": availability.get("version"),
+            "device": availability.get("device"),
+            "device_index": availability.get("device_index"),
+            "device_count": int(availability.get("device_count") or 0),
+            "load_error": availability.get("load_error"),
+            "probe_error": availability.get("probe_error"),
+            "last_error": availability.get("last_error"),
+        }
+    )
+    cuda = result["cuda"]
+    cuda["is_available"] = available
+    cuda["device_count"] = int(availability.get("device_count") or 0)
+    cuda["current_device"] = availability.get("device_index") if available else None
+    if availability.get("cuda_version"):
+        cuda["cuda_version"] = availability.get("cuda_version")
+    if not available:
+        cuda["availability_error"] = availability.get("message")
+
+
+def _smi_hint(result: dict[str, Any]) -> str:
+    smi = result.get("nvidia_smi", {})
+    driver = smi.get("driver_version")
+    gpu_names = [gpu.get("name") for gpu in smi.get("gpus", []) if gpu.get("name")]
+    if gpu_names or driver:
+        hint = f" nvidia-smi detected {', '.join(gpu_names) or 'an NVIDIA GPU'}"
+        if driver:
+            hint += f" with driver {driver}"
+        return hint + "."
+    if smi.get("error"):
+        return f" {smi['error']}"
+    return ""
+
+
+def _unavailable_message(result: dict[str, Any], reason: str) -> str:
+    dll_message = (result.get("cuda_dll") or {}).get("message")
+    if dll_message:
+        return str(dll_message) + _smi_hint(result)
+    if reason == "cuda_dll_smoke_failed":
+        return "Compact CUDA DLL loaded, but the transition repair kernel smoke test failed." + _smi_hint(result)
+    if reason == "cuda_no_device":
+        return "Compact CUDA DLL loaded, but it reported no CUDA devices. CPU color path will be used." + _smi_hint(result)
+    return "Compact CUDA DLL backend is unavailable. CPU color path will be used." + _smi_hint(result)
+
+
+def _transition_smoke_fixture(shape: tuple[int, int]) -> tuple[Any, ...]:
+    import numpy as np
+
+    h, w = shape
+    key_color = (30, 80, 235)
+    foreground_color = (226, 28, 20)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = np.asarray(key_color, dtype=np.uint8)
+    foreground = np.zeros((h, w, 3), dtype=np.uint8)
+    foreground[:, :] = np.asarray(foreground_color, dtype=np.uint8)
+    x = np.linspace(0.0, 1.0, w, dtype=np.float32).reshape(1, w)
+    y = np.linspace(-0.10, 0.10, h, dtype=np.float32).reshape(h, 1)
+    alpha_f = np.clip((x + y - 0.10) / 0.78, 0.0, 1.0)
+    alpha_u8 = np.rint(alpha_f * 255.0).astype(np.uint8)
+    rgb = np.clip(np.rint(background.astype(np.float32) * (1.0 - alpha_f[:, :, None]) + foreground.astype(np.float32) * alpha_f[:, :, None]), 0, 255).astype(np.uint8)
+    background_mask = alpha_u8 == 0
+    edge_mask = (alpha_u8 > 0) & (alpha_u8 < 255)
+    probability = np.rint((1.0 - alpha_f) * 255.0).astype(np.uint8)
+    fringe = np.where(edge_mask, 180, 0).astype(np.uint8)
+    foreground_valid = np.ascontiguousarray((alpha_u8 > 0).astype(np.uint8) * 255)
+    settings = SimpleNamespace(
+        clip_foreground=0.0,
+        transition_alpha_min=2,
+        transition_alpha_max=253,
+        transition_spill_threshold=0.08,
+        transition_reconstruction_error=0.08,
+        foreground_reference_pull=0.65,
+        key_vector_despill=0.75,
+        preserve_foreground_luma=0.85,
+    )
+    return rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, foreground_valid, key_color, settings
+
+
+def _run_transition_repair_smoke(*, dll_path: str | None = None) -> dict[str, Any]:
+    import numpy as np
+    import gpu_accel
+
     smoke = {
         "ran": True,
         "ok": False,
         "error": None,
-        "device": f"cuda:{device_index}",
-        "size": int(size),
-        "mean": None,
+        "shape": list(KERNEL_SMOKE_SHAPE),
+        "elapsed_ms": None,
+        "max_rgb_diff": None,
+        "max_mask_diff": None,
     }
     try:
-        device = torch_module.device(f"cuda:{device_index}") if hasattr(torch_module, "device") else f"cuda:{device_index}"
-        no_grad = torch_module.no_grad() if hasattr(torch_module, "no_grad") else _null_context()
-        with no_grad:
-            x = torch_module.randn((int(size), int(size)), device=device)
-            y = x @ x
-            smoke["mean"] = float(y.mean().item())
-        torch_module.cuda.synchronize(device)
+        rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, foreground_valid, key_color, settings = _transition_smoke_fixture(KERNEL_SMOKE_SHAPE)
+        transition_strength = gpu_accel.transition_repair_strength_mask_v1(
+            rgb,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe,
+            foreground,
+            foreground_valid > 0,
+            key_color,
+            settings,
+        )
+        cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid, key_color, settings)
+        start = time.perf_counter()
+        dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid, key_color, settings, dll_path=dll_path)
+        smoke["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
+        smoke["max_rgb_diff"] = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+        smoke["max_mask_diff"] = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+        smoke["ok"] = smoke["max_rgb_diff"] <= 2 and smoke["max_mask_diff"] <= 2
+        if not smoke["ok"]:
+            smoke["error"] = f"parity exceeded tolerance: rgb={smoke['max_rgb_diff']} mask={smoke['max_mask_diff']}"
     except Exception as exc:
         smoke["error"] = f"{type(exc).__name__}: {exc}"
-    else:
-        smoke["ok"] = True
-    finally:
-        try:
-            torch_module.cuda.empty_cache()
-        except Exception:
-            pass
     return smoke
-
-
-class _null_context:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        return False
-
-
-def _torch_cuda_summary(result: dict[str, Any], torch_module: Any, *, run_matmul: bool, matmul_size: int) -> None:
-    version_obj = _torch_attr(torch_module, "version")
-    result["torch"].update(
-        {
-            "import_success": True,
-            "import_error": None,
-            "version": str(_torch_attr(torch_module, "__version__", "unknown")),
-            "cuda_version": _torch_attr(version_obj, "cuda"),
-        }
-    )
-
-    cuda = _torch_attr(torch_module, "cuda")
-    if cuda is None:
-        result["cuda"]["availability_error"] = "torch.cuda module is not present."
-        return
-
-    try:
-        result["cuda"]["arch_list"] = list(cuda.get_arch_list()) if hasattr(cuda, "get_arch_list") else []
-    except Exception as exc:
-        result["cuda"]["arch_list"] = []
-        result["cuda"]["availability_error"] = f"torch.cuda.get_arch_list failed: {type(exc).__name__}: {exc}"
-
-    try:
-        is_available = bool(cuda.is_available())
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.is_available failed: {type(exc).__name__}: {exc}"
-        is_available = False
-    result["cuda"]["is_available"] = is_available
-
-    try:
-        result["cuda"]["device_count"] = int(cuda.device_count())
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.device_count failed: {type(exc).__name__}: {exc}"
-        result["cuda"]["device_count"] = 0
-
-    if not is_available or result["cuda"]["device_count"] <= 0:
-        return
-
-    try:
-        device_index = int(cuda.current_device())
-    except Exception:
-        device_index = 0
-    result["cuda"]["current_device"] = device_index
-
-    try:
-        result["cuda"]["device_name"] = str(cuda.get_device_name(device_index))
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.get_device_name failed: {type(exc).__name__}: {exc}"
-
-    try:
-        capability = cuda.get_device_capability(device_index)
-        result["cuda"]["device_capability"] = [int(capability[0]), int(capability[1])]
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.get_device_capability failed: {type(exc).__name__}: {exc}"
-
-    try:
-        props = cuda.get_device_properties(device_index)
-        props_dict = _device_properties_dict(props)
-        result["cuda"]["device_properties"] = props_dict
-        if props_dict["total_memory_bytes"] is not None:
-            result["cuda"]["vram_total_bytes"] = props_dict["total_memory_bytes"]
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.get_device_properties failed: {type(exc).__name__}: {exc}"
-
-    try:
-        free_bytes, total_bytes = cuda.mem_get_info(device_index)
-        result["cuda"]["vram_free_bytes"] = int(free_bytes)
-        result["cuda"]["vram_total_bytes"] = int(total_bytes)
-    except TypeError:
-        try:
-            free_bytes, total_bytes = cuda.mem_get_info()
-            result["cuda"]["vram_free_bytes"] = int(free_bytes)
-            result["cuda"]["vram_total_bytes"] = int(total_bytes)
-        except Exception as exc:
-            result["cuda"]["availability_error"] = f"torch.cuda.mem_get_info failed: {type(exc).__name__}: {exc}"
-    except Exception as exc:
-        result["cuda"]["availability_error"] = f"torch.cuda.mem_get_info failed: {type(exc).__name__}: {exc}"
-
-    if run_matmul:
-        result["matmul_smoke"] = _run_cuda_matmul_smoke(torch_module, device_index=device_index, size=matmul_size)
-
-
-def _unavailable_message(result: dict[str, Any], reason: str) -> str:
-    smi = result.get("nvidia_smi", {})
-    driver = smi.get("driver_version")
-    gpu_names = [gpu.get("name") for gpu in smi.get("gpus", []) if gpu.get("name")]
-    smi_hint = ""
-    if gpu_names or driver:
-        smi_hint = f" nvidia-smi detected {', '.join(gpu_names) or 'an NVIDIA GPU'}"
-        if driver:
-            smi_hint += f" with driver {driver}"
-        smi_hint += "."
-    elif smi.get("error"):
-        smi_hint = f" {smi['error']}"
-
-    if reason == "torch_import_failed":
-        return (
-            "PyTorch could not be imported, so ImgKey cannot use CUDA acceleration. "
-            "Install the GPU runtime build or a CUDA-enabled PyTorch wheel that matches your NVIDIA driver."
-            + smi_hint
-        )
-    if reason == "cuda_unavailable":
-        return (
-            "PyTorch imported, but torch.cuda.is_available() is false or no CUDA device was reported. "
-            "Use a CUDA-enabled PyTorch build, update the NVIDIA driver, and verify the GPU with nvidia-smi."
-            + smi_hint
-        )
-    if reason == "cuda_matmul_failed":
-        return (
-            "PyTorch can see CUDA, but the CUDA matmul smoke test failed. "
-            "Check driver/runtime compatibility, GPU memory availability, and the installed PyTorch CUDA build."
-            + smi_hint
-        )
-    return "GPU runtime probe did not find a usable CUDA runtime." + smi_hint
 
 
 def probe_gpu(
     *,
-    torch_loader: Callable[[], Any] | None = None,
+    gpu_accel_probe: Callable[..., dict[str, Any]] | None = None,
     nvidia_smi_probe: Callable[[], dict[str, Any]] | None = None,
-    run_matmul: bool = True,
-    matmul_size: int = MATMUL_SMOKE_SIZE,
+    run_kernel_smoke: bool = True,
+    dll_path: str | None = None,
 ) -> dict[str, Any]:
-    """Probe PyTorch/CUDA/GPU availability without importing torch at module import time."""
+    """Probe compact CUDA DLL availability without importing optional heavy runtimes."""
+
     result = _base_probe()
     result["nvidia_smi"] = (nvidia_smi_probe or probe_nvidia_smi)()
+    _populate_cuda_from_nvidia_smi(result)
 
     try:
-        torch_module = (torch_loader or _import_torch)()
+        availability = (gpu_accel_probe or _probe_cuda_dll)(dll_path=dll_path)
     except Exception as exc:
-        result["torch"]["import_error"] = f"{type(exc).__name__}: {exc}"
-        return _set_unavailable(result, "torch_import_failed", _unavailable_message(result, "torch_import_failed"))
+        availability = {
+            "available": False,
+            "status": "unavailable",
+            "reason": "cuda_dll_probe_failed",
+            "message": f"Compact CUDA DLL probe failed: {type(exc).__name__}: {exc}. CPU color path will be used.",
+            "probe_error": f"{type(exc).__name__}: {exc}",
+        }
 
-    _torch_cuda_summary(result, torch_module, run_matmul=run_matmul, matmul_size=matmul_size)
+    _apply_cuda_dll_availability(result, availability)
+    if not result["cuda_dll"]["available"]:
+        reason = str(result["cuda_dll"].get("reason") or "cuda_dll_unavailable")
+        return _set_unavailable(result, reason, _unavailable_message(result, reason))
 
-    if not result["cuda"]["is_available"] or result["cuda"]["device_count"] <= 0:
-        return _set_unavailable(result, "cuda_unavailable", _unavailable_message(result, "cuda_unavailable"))
+    if run_kernel_smoke:
+        result["transition_repair_smoke"] = _run_transition_repair_smoke(dll_path=dll_path)
+        if not result["transition_repair_smoke"].get("ok"):
+            return _set_unavailable(result, "cuda_dll_smoke_failed", _unavailable_message(result, "cuda_dll_smoke_failed"))
 
-    if run_matmul and not result["matmul_smoke"]["ok"]:
-        return _set_unavailable(result, "cuda_matmul_failed", _unavailable_message(result, "cuda_matmul_failed"))
-
-    name = result["cuda"].get("device_name") or "CUDA GPU"
-    return _set_available(result, f"CUDA GPU available: {name}; PyTorch CUDA matmul smoke test passed.")
+    dll = result["cuda_dll"]
+    device = result["cuda"].get("device_name") or dll.get("device") or "CUDA device"
+    version = dll.get("version")
+    count = int(dll.get("device_count") or 0)
+    return _set_available(result, f"Compact CUDA DLL available: {device}; DLL version {version}; {count} CUDA device(s) visible.")
 
 
 def format_probe_human(result: dict[str, Any]) -> str:
     lines = [f"GPU runtime: {result['status']} - {result['message']}"]
-    lines.append(f"PyTorch import: {result['torch']['import_success']} version={result['torch']['version']} cuda={result['torch']['cuda_version']}")
+    dll = result.get("cuda_dll", {})
     lines.append(
-        "CUDA: "
-        f"available={result['cuda']['is_available']} "
-        f"device_count={result['cuda']['device_count']} "
-        f"device={result['cuda']['device_name']} "
-        f"capability={result['cuda']['device_capability']}"
+        "CUDA DLL: "
+        f"available={dll.get('available')} "
+        f"version={dll.get('version')} "
+        f"device_count={dll.get('device_count')} "
+        f"path={dll.get('dll_path')}"
+    )
+    cuda = result.get("cuda", {})
+    lines.append(
+        "CUDA device: "
+        f"available={cuda.get('is_available')} "
+        f"device_count={cuda.get('device_count')} "
+        f"device={cuda.get('device_name')} "
+        f"capability={cuda.get('device_capability')}"
     )
     smi = result.get("nvidia_smi", {})
     lines.append(f"nvidia-smi: available={smi.get('available')} driver={smi.get('driver_version')} cuda={smi.get('cuda_version')}")
-    smoke = result.get("matmul_smoke", {})
-    lines.append(f"matmul smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} error={smoke.get('error')}")
+    smoke = result.get("transition_repair_smoke", {})
+    lines.append(f"transition repair smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} max_rgb_diff={smoke.get('max_rgb_diff')} error={smoke.get('error')}")
     return "\n".join(lines)
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Probe ImgKey GPU/PyTorch CUDA runtime availability.")
+    parser = argparse.ArgumentParser(description="Probe ImgKey compact CUDA DLL runtime availability.")
     parser.add_argument("--probe", "--gpu-probe", action="store_true", help="run the GPU runtime probe")
     parser.add_argument("--json", action="store_true", dest="json_output", help="print probe result as JSON")
-    parser.add_argument("--matmul-size", type=int, default=MATMUL_SMOKE_SIZE, help="CUDA matmul smoke-test matrix size")
+    parser.add_argument("--dll", dest="dll_path", default=None, help="override imgkey_cuda.dll path for the probe")
+    parser.add_argument("--no-kernel-smoke", action="store_true", help="skip the transition repair kernel smoke test")
     return parser
 
 
@@ -435,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        result = probe_gpu(matmul_size=max(1, int(args.matmul_size)))
+        result = probe_gpu(run_kernel_smoke=not bool(args.no_kernel_smoke), dll_path=args.dll_path)
     except Exception as exc:  # pragma: no cover - final CLI safety net
         result = _base_probe()
         result["status"] = "error"

@@ -30,7 +30,6 @@ from keyer import (
     _build_tile_local_nearest_inner_rgb,
     _build_transition_repair_mask,
     _compute_key_spill_strength,
-    _compute_screen_probability_block,
     _estimate_screen_tile,
     _foreground_reference_for_slice,
     _guided_filter_gray,
@@ -38,7 +37,6 @@ from keyer import (
     _process_color_tile,
     _repair_transition_unmix,
     _srgb_u8_to_linear_f32,
-    _smoothstep,
     _tile_local_nearest_inner_radius,
     checkerboard_composite,
     process_chroma_key,
@@ -2934,61 +2932,84 @@ def run_gpu_runtime_probe_tests() -> None:
     assert after_import == before, f"importing gpu_runtime must not import heavy runtimes: {after_import - before}"
 
     fake_smi = {
-        "available": False,
-        "path": None,
-        "error": "nvidia-smi was not found on PATH",
-        "driver_version": None,
-        "cuda_version": None,
-        "gpus": [],
+        "available": True,
+        "path": "C:/Windows/System32/nvidia-smi.exe",
+        "error": None,
+        "driver_version": "999.99",
+        "cuda_version": "12.9",
+        "gpus": [
+            {
+                "name": "NVIDIA Test GPU",
+                "driver_version": "999.99",
+                "memory_total_mib": 8192,
+                "memory_free_mib": 4096,
+                "compute_capability": "12.0",
+            }
+        ],
     }
 
-    def missing_torch_loader() -> object:
-        raise ImportError("No module named 'torch'")
+    def missing_dll_probe(*, dll_path: str | None = None) -> dict[str, Any]:
+        del dll_path
+        return {
+            "backend": "compact_cuda_dll",
+            "backend_name": "compact CUDA DLL",
+            "status": "unavailable",
+            "available": False,
+            "reason": "cuda_dll_unavailable",
+            "message": "Compact CUDA DLL backend is unavailable: test missing DLL. CPU color path will be used.",
+            "device": None,
+            "device_index": None,
+            "device_count": 0,
+            "version": None,
+            "dll_path": None,
+            "load_error": "test missing DLL",
+        }
 
-    missing_probe = gpu_runtime.probe_gpu(torch_loader=missing_torch_loader, nvidia_smi_probe=lambda: fake_smi)
+    missing_probe = gpu_runtime.probe_gpu(gpu_accel_probe=missing_dll_probe, nvidia_smi_probe=lambda: fake_smi, run_kernel_smoke=False)
     assert missing_probe["status"] == "unavailable"
     assert missing_probe["available"] is False
-    assert missing_probe["reason"] == "torch_import_failed"
-    assert missing_probe["torch"]["import_success"] is False
-    assert "ImportError" in missing_probe["torch"]["import_error"]
+    assert missing_probe["reason"] == "cuda_dll_unavailable"
+    assert missing_probe["backend"]["id"] == "compact_cuda_dll"
+    assert missing_probe["cuda_dll"]["available"] is False
+    assert missing_probe["cuda_dll"]["load_success"] is False
     assert missing_probe["cuda"]["is_available"] is False
-    assert missing_probe["matmul_smoke"]["ran"] is False
-    assert "pytorch" in missing_probe["message"].lower()
+    assert missing_probe["transition_repair_smoke"]["ran"] is False
+    assert "compact cuda dll" in missing_probe["message"].lower()
 
-    class FakeVersion:
-        cuda = None
+    def available_dll_probe(*, dll_path: str | None = None) -> dict[str, Any]:
+        del dll_path
+        return {
+            "backend": "compact_cuda_dll",
+            "backend_name": "compact CUDA DLL",
+            "status": "available",
+            "available": True,
+            "reason": None,
+            "message": "Compact CUDA DLL backend available (1 CUDA device(s)).",
+            "device": "CUDA device 0 (1 device(s) visible)",
+            "device_index": 0,
+            "device_count": 1,
+            "version": 1,
+            "dll_path": "C:/imgkey/imgkey_cuda.dll",
+        }
 
-    class FakeCuda:
-        def get_arch_list(self) -> list[str]:
-            return ["sm_120"]
+    dll_probe = gpu_runtime.probe_gpu(gpu_accel_probe=available_dll_probe, nvidia_smi_probe=lambda: fake_smi, run_kernel_smoke=False)
+    assert dll_probe["status"] == "available"
+    assert dll_probe["available"] is True
+    assert dll_probe["cuda_dll"]["version"] == 1
+    assert dll_probe["cuda_dll"]["device_count"] == 1
+    assert dll_probe["cuda"]["is_available"] is True
+    assert dll_probe["cuda"]["device_name"] == "NVIDIA Test GPU"
+    assert dll_probe["cuda"]["device_capability"] == [12, 0]
+    assert dll_probe["transition_repair_smoke"]["ran"] is False
 
-        def is_available(self) -> bool:
-            return False
-
-        def device_count(self) -> int:
-            return 0
-
-    class FakeTorch:
-        __version__ = "0.test"
-        version = FakeVersion()
-        cuda = FakeCuda()
-
-    cpu_probe = gpu_runtime.probe_gpu(torch_loader=lambda: FakeTorch(), nvidia_smi_probe=lambda: fake_smi)
-    assert cpu_probe["status"] == "unavailable"
-    assert cpu_probe["reason"] == "cuda_unavailable"
-    assert cpu_probe["torch"]["import_success"] is True
-    assert cpu_probe["torch"]["version"] == "0.test"
-    assert cpu_probe["cuda"]["arch_list"] == ["sm_120"]
-    assert cpu_probe["matmul_smoke"]["ran"] is False
-    assert "cuda" in cpu_probe["message"].lower()
-
-    for probe in (missing_probe, cpu_probe):
+    for probe in (missing_probe, dll_probe):
         round_tripped = json.loads(json.dumps(probe))
-        for key in ("schema_version", "status", "message", "torch", "cuda", "nvidia_smi", "matmul_smoke"):
+        for key in ("schema_version", "status", "message", "backend", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke"):
             assert key in round_tripped, f"gpu runtime probe JSON missing {key}"
+        assert "torch" not in round_tripped, "compact DLL runtime probe must not expose a torch probe section"
 
     after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
-    assert after_probe == before, f"fake gpu probe tests must not import heavy runtimes: {after_probe - before}"
+    assert after_probe == before, f"compact DLL gpu probe tests must not import heavy runtimes: {after_probe - before}"
 
 
 def _gpu_transition_tile(shape: tuple[int, int] = (96, 160)) -> tuple[
@@ -3044,8 +3065,9 @@ def run_gpu_accel_backend_tests() -> None:
     unavailable = gpu_accel.is_available(dll_path=missing_dll, refresh=True)
     assert unavailable["available"] is False
     assert unavailable["status"] == "unavailable"
-    assert unavailable["reason"] == "cuda_unavailable"
-    assert unavailable["backend"] == "cuda_dll"
+    assert unavailable["reason"] == "cuda_dll_unavailable"
+    assert unavailable["backend"] == "compact_cuda_dll"
+    assert unavailable["backend_name"] == "compact CUDA DLL"
 
     rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((32, 48))
     transition_strength = gpu_accel.transition_repair_strength_mask_v1(
@@ -3270,7 +3292,15 @@ def write_gpu_benchmarks() -> None:
     GPU_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {
         "generated_by": "python smoke_test.py --gpu-benchmark",
+        "backend": {
+            "id": "compact_cuda_dll",
+            "name": "compact CUDA DLL",
+        },
         "availability": availability,
+        "notes": [
+            "CPU remains the correctness reference.",
+            "CUDA DLL timings include host/device copies performed inside imgkey_cuda_transition_repair_v1.",
+        ],
         "benchmarks": {},
     }
     if not availability.get("available"):
@@ -3278,34 +3308,51 @@ def write_gpu_benchmarks() -> None:
         print(f"gpu benchmark skipped: {availability.get('reason')} - {availability.get('message')}")
         return
 
-    torch = importlib.import_module("torch")
-    device_index = int(availability.get("device_index") or 0)
-    device = torch.device(f"cuda:{device_index}")
     rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((1024, 1024))
     settings_gpu = replace(settings, gpu_acceleration="Force GPU")
+    transition_strength = gpu_accel.transition_repair_strength_mask_v1(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+    )
+    foreground_valid_u8 = np.ascontiguousarray(nearest_valid.astype(np.uint8) * 255)
 
-    def sync() -> None:
-        torch.cuda.synchronize(device)
+    def cpu_transition_reference() -> None:
+        gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
 
-    def transfer_h2d() -> None:
-        _ = torch.from_numpy(rgb).to(device=device, dtype=torch.uint8)
-        sync()
+    def cuda_dll_transition_direct() -> None:
+        gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
 
-    gpu_rgb_cache = torch.from_numpy(rgb).to(device=device, dtype=torch.uint8)
-    sync()
+    cpu_direct_ms = _median_time_ms(cpu_transition_reference, repeat=5, warmup=1)
+    cuda_direct_ms = _median_time_ms(cuda_dll_transition_direct, repeat=5, warmup=2)
+    cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+    dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+    direct_max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+    direct_max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+    summary["benchmarks"]["transition_repair_tile_1024_direct"] = {
+        "tile_shape": list(rgb.shape[:2]),
+        "active_repair_pixels": int(np.count_nonzero(transition_strength)),
+        "cpu_reference_ms": cpu_direct_ms,
+        "cuda_dll_ms_including_transfer": cuda_direct_ms,
+        "speedup": cpu_direct_ms / cuda_direct_ms if cuda_direct_ms > 0 else None,
+        "transfer_included": True,
+        "transfer_scope": "imgkey_cuda_transition_repair_v1 copies uint8 host inputs to device and RGB/mask outputs back to host before returning.",
+        "max_rgb_diff_vs_cpu": direct_max_rgb_diff,
+        "max_mask_diff_vs_cpu": direct_max_mask_diff,
+        "faster_than_cpu": cuda_direct_ms < cpu_direct_ms,
+    }
 
-    def transfer_d2h() -> None:
-        _ = gpu_rgb_cache.detach().cpu().numpy()
-        sync()
-
-    h2d_ms = _median_time_ms(transfer_h2d, repeat=7, warmup=2)
-    d2h_ms = _median_time_ms(transfer_d2h, repeat=7, warmup=2)
-    summary["benchmarks"]["transfer_rgb_u8_1024"] = {"host_to_device_ms": h2d_ms, "device_to_host_ms": d2h_ms}
-
-    def cpu_transition() -> None:
+    def cpu_transition_dispatch() -> None:
         _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
 
-    def gpu_transition() -> None:
+    def cuda_dll_transition_dispatch() -> None:
         result = gpu_accel.process_color_tile_gpu(
             rgb,
             alpha_u8,
@@ -3322,89 +3369,20 @@ def write_gpu_benchmarks() -> None:
         )
         assert result["used"], result.get("message")
 
-    cpu_transition_ms = _median_time_ms(cpu_transition, repeat=5, warmup=1)
-    gpu_transition_ms = _median_time_ms(gpu_transition, repeat=5, warmup=2)
-    cpu_rgb, _ = _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
+    cpu_dispatch_ms = _median_time_ms(cpu_transition_dispatch, repeat=5, warmup=1)
+    cuda_dispatch_ms = _median_time_ms(cuda_dll_transition_dispatch, repeat=5, warmup=2)
+    cpu_dispatch_rgb, _ = _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
     gpu_result = gpu_accel.process_color_tile_gpu(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings_gpu, force_gpu=True)
-    max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - gpu_result["rgb"].astype(np.int16))))
-    summary["benchmarks"]["transition_repair_color_tile_1024"] = {
-        "cpu_ms": cpu_transition_ms,
-        "gpu_ms_including_transfer": gpu_transition_ms,
-        "speedup": cpu_transition_ms / gpu_transition_ms if gpu_transition_ms > 0 else None,
-        "max_rgb_diff": max_rgb_diff,
-    }
-
-    random_prob = np.random.default_rng(7).random((1024, 1024), dtype=np.float32)
-
-    def cpu_alpha_smoothstep() -> None:
-        _smoothstep(0.10, 0.92, random_prob)
-
-    prob_gpu = torch.from_numpy(random_prob).to(device=device, dtype=torch.float32)
-    sync()
-
-    def gpu_alpha_smoothstep() -> None:
-        t = torch.clamp((prob_gpu - 0.10) / 0.82, 0.0, 1.0)
-        _ = t * t * (3.0 - 2.0 * t)
-        sync()
-
-    cpu_alpha_ms = _median_time_ms(cpu_alpha_smoothstep, repeat=9, warmup=2)
-    gpu_alpha_ms = _median_time_ms(gpu_alpha_smoothstep, repeat=9, warmup=2)
-    summary["benchmarks"]["alpha_smoothstep_arithmetic_1024"] = {
-        "cpu_ms": cpu_alpha_ms,
-        "gpu_ms_device_resident": gpu_alpha_ms,
-        "speedup_device_resident": cpu_alpha_ms / gpu_alpha_ms if gpu_alpha_ms > 0 else None,
-        "shipping_decision": "not_shipped_standalone_transfer_cost_and_matte_pipeline_branching",
-    }
-
-    def cpu_screen_probability() -> None:
-        _compute_screen_probability_block(rgb, key_color, settings)
-
-    rgb_gpu = torch.from_numpy(rgb).to(device=device, dtype=torch.float32).div(255.0)
-    key_gpu = torch.tensor(np.asarray(key_color, dtype=np.float32) / 255.0, device=device, dtype=torch.float32)
-    key_chroma = key_gpu / torch.clamp(torch.sum(key_gpu), min=1e-4)
-    luma_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=torch.float32)
-    sync()
-
-    def gpu_screen_probability_arithmetic() -> None:
-        total = torch.clamp(torch.sum(rgb_gpu, dim=2), min=1e-4)
-        chroma = rgb_gpu / total.unsqueeze(2)
-        chroma_dist = torch.linalg.vector_norm(chroma - key_chroma.view(1, 1, 3), dim=2)
-        luma = torch.sum(rgb_gpu * luma_weights.view(1, 1, 3), dim=2)
-        key_luma = torch.sum(key_gpu * luma_weights)
-        _ = chroma_dist + torch.abs(luma - key_luma)
-        sync()
-
-    cpu_screen_ms = _median_time_ms(cpu_screen_probability, repeat=5, warmup=1)
-    gpu_screen_ms = _median_time_ms(gpu_screen_probability_arithmetic, repeat=7, warmup=2)
-    summary["benchmarks"]["screen_probability_arithmetic_1024"] = {
-        "cpu_full_block_ms": cpu_screen_ms,
-        "gpu_chroma_luma_arithmetic_ms_device_resident": gpu_screen_ms,
-        "shipping_decision": "not_shipped_cpu_path_includes_hsv_and_connected_matte_steps",
-    }
-
-    rgba = np.dstack([rgb, alpha_u8]).astype(np.uint8)
-    bg = np.array([31, 35, 42], dtype=np.float32)
-
-    def cpu_preview_composite() -> None:
-        rgb_f = rgba[:, :, :3].astype(np.float32)
-        a = rgba[:, :, 3:4].astype(np.float32) / 255.0
-        _ = np.clip(np.rint(rgb_f * a + bg.reshape(1, 1, 3) * (1.0 - a)), 0, 255).astype(np.uint8)
-
-    rgba_gpu = torch.from_numpy(rgba).to(device=device, dtype=torch.float32)
-    bg_gpu = torch.tensor(bg, device=device, dtype=torch.float32).view(1, 1, 3)
-    sync()
-
-    def gpu_preview_composite() -> None:
-        a = rgba_gpu[:, :, 3:4] / 255.0
-        _ = torch.clamp(torch.round(rgba_gpu[:, :, :3] * a + bg_gpu * (1.0 - a)), 0, 255).to(torch.uint8)
-        sync()
-
-    cpu_preview_ms = _median_time_ms(cpu_preview_composite, repeat=7, warmup=2)
-    gpu_preview_ms = _median_time_ms(gpu_preview_composite, repeat=7, warmup=2)
-    summary["benchmarks"]["preview_composite_1024"] = {
-        "cpu_ms": cpu_preview_ms,
-        "gpu_ms_device_resident": gpu_preview_ms,
-        "shipping_decision": "not_shipped_preview_source_is_cpu_qimage_and_transfer_dominates",
+    dispatch_max_rgb_diff = int(np.max(np.abs(cpu_dispatch_rgb.astype(np.int16) - gpu_result["rgb"].astype(np.int16))))
+    summary["benchmarks"]["transition_repair_tile_1024_dispatch"] = {
+        "tile_shape": list(rgb.shape[:2]),
+        "cpu_full_transition_ms": cpu_dispatch_ms,
+        "cuda_dll_dispatch_ms_including_transfer": cuda_dispatch_ms,
+        "speedup": cpu_dispatch_ms / cuda_dispatch_ms if cuda_dispatch_ms > 0 else None,
+        "transfer_included": True,
+        "max_rgb_diff_vs_cpu": dispatch_max_rgb_diff,
+        "faster_than_cpu": cuda_dispatch_ms < cpu_dispatch_ms,
+        "auto_fallback_policy": "GPU remains optional; Auto uses CPU fallback on missing DLL, no device, unsupported tile, or execution error.",
     }
 
     (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -3475,7 +3453,7 @@ def run_app_ui_tests() -> None:
         assert window._preview_generation == generation + 1, "GPU acceleration mode change must schedule preview"
         assert "Auto" in window.gpu_probe_status.text(), "GPU status label should reflect selected mode"
         assert window.current_settings().gpu_acceleration == "Auto"
-        assert window._message_mentions_gpu_backend("torch.cuda unavailable")
+        assert window._message_mentions_gpu_backend("compact CUDA DLL unavailable")
         window._preview_timer.stop()
         window.full_rgb = None
         forbidden = ("Bi" + "RefNet", "Corridor" + "Key", "A" + "I Hint", "Hy" + "brid" + " Bi" + "RefNet")

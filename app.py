@@ -1082,7 +1082,7 @@ class MainWindow(QMainWindow):
         self.gpu_acceleration.addItems(GPU_ACCELERATION_MODES)
         gpu_default = str(getattr(self.settings, "gpu_acceleration", "Off") or "Off")
         self.gpu_acceleration.setCurrentText(gpu_default if gpu_default in GPU_ACCELERATION_MODES else "Off")
-        self.gpu_acceleration.setToolTip("Optional classical CUDA tensor acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
+        self.gpu_acceleration.setToolTip("Optional compact CUDA DLL acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
         self.gpu_acceleration.currentTextChanged.connect(self._on_gpu_acceleration_changed)
         layout.addLayout(label_row("GPU Acceleration", self.gpu_acceleration))
 
@@ -1803,7 +1803,7 @@ class MainWindow(QMainWindow):
             if mode == "Off":
                 text = "GPU Status: acceleration off; CPU path used."
             else:
-                text = f"GPU Status: {mode}; waiting for next preview/export. Use GPU Status to probe CUDA runtime."
+                text = f"GPU Status: {mode}; waiting for next preview/export. Use GPU Status to probe the compact CUDA DLL runtime."
             self.gpu_probe_status.setText(text)
             return
         status = str(info.get("status") or "unknown")
@@ -1821,7 +1821,7 @@ class MainWindow(QMainWindow):
 
     def _message_mentions_gpu_backend(self, message: str) -> bool:
         lowered = str(message).lower()
-        return any(token in lowered for token in ("gpu", "cuda", "torch"))
+        return any(token in lowered for token in ("gpu", "cuda", "dll"))
 
     def show_gpu_status(self, checked: bool = False) -> None:
         del checked
@@ -1908,23 +1908,26 @@ class MainWindow(QMainWindow):
     def _format_gpu_probe_summary(self, result: dict) -> str:
         status = result.get("status", "unknown")
         message = str(result.get("message") or "")
-        device = (result.get("cuda") or {}).get("device_name")
+        cuda_dll = result.get("cuda_dll") or {}
+        device = (result.get("cuda") or {}).get("device_name") or cuda_dll.get("device")
         if device:
             return f"{status} · {device}. {message}"
         return f"{status}. {message}"
 
     def _format_gpu_probe_details(self, result: dict) -> str:
+        backend = result.get("backend") or {}
+        cuda_dll = result.get("cuda_dll") or {}
         cuda = result.get("cuda") or {}
-        torch_info = result.get("torch") or {}
         smi = result.get("nvidia_smi") or {}
-        smoke = result.get("matmul_smoke") or {}
+        smoke = result.get("transition_repair_smoke") or {}
         return "\n".join(
             (
                 f"GPU runtime: {result.get('status', 'unknown')} - {result.get('message', '')}",
-                f"PyTorch import: {torch_info.get('import_success')} version={torch_info.get('version')} cuda={torch_info.get('cuda_version')}",
-                f"CUDA: available={cuda.get('is_available')} device_count={cuda.get('device_count')} device={cuda.get('device_name')} capability={cuda.get('device_capability')}",
+                f"Backend: {backend.get('name', 'compact CUDA DLL')} ({backend.get('id', 'compact_cuda_dll')})",
+                f"CUDA DLL: available={cuda_dll.get('available')} version={cuda_dll.get('version')} devices={cuda_dll.get('device_count')} path={cuda_dll.get('dll_path')}",
+                f"CUDA device: available={cuda.get('is_available')} device_count={cuda.get('device_count')} device={cuda.get('device_name')} capability={cuda.get('device_capability')}",
                 f"nvidia-smi: available={smi.get('available')} driver={smi.get('driver_version')} cuda={smi.get('cuda_version')}",
-                f"matmul smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} error={smoke.get('error')}",
+                f"transition repair smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} max_rgb_diff={smoke.get('max_rgb_diff')} error={smoke.get('error')}",
             )
         )
 

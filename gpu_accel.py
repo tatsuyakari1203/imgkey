@@ -11,7 +11,8 @@ from typing import Any
 import numpy as np
 
 
-BACKEND_NAME = "cuda_dll"
+BACKEND_ID = "compact_cuda_dll"
+BACKEND_NAME = "compact CUDA DLL"
 CUDA_DLL_NAME = "imgkey_cuda.dll"
 IMGKEY_CUDA_OK = 0
 IMGKEY_CUDA_INVALID_ARGUMENT = 1
@@ -131,7 +132,8 @@ def _setting(settings: Any, name: str, default: Any) -> Any:
 
 def _status_unavailable(reason: str, message: str, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "backend": BACKEND_NAME,
+        "backend": BACKEND_ID,
+        "backend_name": BACKEND_NAME,
         "status": "unavailable",
         "available": False,
         "reason": reason,
@@ -141,7 +143,6 @@ def _status_unavailable(reason: str, message: str, *, extra: dict[str, Any] | No
         "device_count": 0,
         "version": None,
         "dll_path": None,
-        "torch_version": None,
         "cuda_version": None,
     }
     if extra:
@@ -151,7 +152,8 @@ def _status_unavailable(reason: str, message: str, *, extra: dict[str, Any] | No
 
 def _status_available(backend: _CudaDll, device_count: int) -> dict[str, Any]:
     return {
-        "backend": BACKEND_NAME,
+        "backend": BACKEND_ID,
+        "backend_name": BACKEND_NAME,
         "status": "available",
         "available": True,
         "reason": None,
@@ -161,7 +163,6 @@ def _status_available(backend: _CudaDll, device_count: int) -> dict[str, Any]:
         "device_count": int(device_count),
         "version": backend.version(),
         "dll_path": str(backend.path),
-        "torch_version": None,
         "cuda_version": None,
     }
 
@@ -225,13 +226,11 @@ def _load_cuda_dll(dll_path: str | os.PathLike[str] | None = None, *, refresh: b
 
 def is_available(
     *,
-    torch_loader: Any | None = None,
     refresh: bool = False,
     dll_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Return compact CUDA DLL availability without loading anything at import time."""
 
-    del torch_loader  # kept only for source compatibility with the previous probe signature.
     global _AVAILABILITY_CACHE
     use_cache = dll_path is None
     if use_cache and _AVAILABILITY_CACHE is not None and not refresh:
@@ -241,7 +240,7 @@ def is_available(
         backend = _load_cuda_dll(dll_path, refresh=refresh)
     except Exception as exc:
         result = _status_unavailable(
-            "cuda_unavailable",
+            "cuda_dll_unavailable",
             f"Compact CUDA DLL backend is unavailable: {type(exc).__name__}: {exc}. CPU color path will be used.",
             extra={"load_error": f"{type(exc).__name__}: {exc}"},
         )
@@ -253,7 +252,7 @@ def is_available(
         device_count = backend.device_count()
     except Exception as exc:
         result = _status_unavailable(
-            "cuda_unavailable",
+            "cuda_dll_probe_failed",
             f"Compact CUDA DLL device probe failed: {type(exc).__name__}: {exc}. CPU color path will be used.",
             extra={"dll_path": str(backend.path), "probe_error": f"{type(exc).__name__}: {exc}"},
         )
@@ -262,7 +261,7 @@ def is_available(
         return result
     if device_count <= 0:
         result = _status_unavailable(
-            "cuda_unavailable",
+            "cuda_no_device",
             f"Compact CUDA DLL reported no CUDA devices: {backend.last_error() or 'device_count <= 0'}. CPU color path will be used.",
             extra={"dll_path": str(backend.path), "version": backend.version()},
         )
@@ -280,7 +279,8 @@ def _fallback(reason: str, message: str, *, elapsed_ms: float | None = None, ava
     result: dict[str, Any] = {
         "ok": False,
         "used": False,
-        "backend": BACKEND_NAME,
+        "backend": BACKEND_ID,
+        "backend_name": BACKEND_NAME,
         "reason": reason,
         "message": message,
         "rgb": None,
@@ -296,7 +296,8 @@ def _ok(rgb: np.ndarray, repair_mask: np.ndarray, message: str, elapsed_ms: floa
     return {
         "ok": True,
         "used": True,
-        "backend": BACKEND_NAME,
+        "backend": BACKEND_ID,
+        "backend_name": BACKEND_NAME,
         "reason": None,
         "message": message,
         "rgb": rgb,
@@ -689,11 +690,9 @@ def process_color_tile_gpu(
     settings: Any,
     *,
     force_gpu: bool = False,
-    torch_loader: Any | None = None,
 ) -> dict[str, Any]:
     """Run compact CUDA DLL transition RGB repair when available and useful."""
 
-    del torch_loader  # source-compatible no-op; this module never imports torch.
     start = time.perf_counter()
     if not bool(_setting(settings, "transition_unmix", True)):
         return _fallback("transition_disabled", "Transition unmix is disabled; CPU color path remains active.")
