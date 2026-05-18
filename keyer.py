@@ -98,6 +98,19 @@ class KeySettings:
     guided_eps: float = 1e-3
     guided_max_pixels: int = 2_000_000
 
+    # v7 transition-unmix controls, appended for positional compatibility.
+    transition_unmix: bool = True
+    alpha_recover_strength: float = 0.85
+    foreground_reference_pull: float = 0.65
+    key_vector_despill: float = 0.75
+    transition_spill_threshold: float = 0.08
+    transition_reconstruction_error: float = 0.08
+    foreground_reference_radius: int = 96
+    foreground_candidate_count: int = 4
+    transition_alpha_min: int = 2
+    transition_alpha_max: int = 253
+    preserve_foreground_luma: float = 0.85
+
 
 @dataclass(slots=True)
 class KeyResult:
@@ -1018,6 +1031,107 @@ def _compute_key_spill_strength(rgb: np.ndarray, screen_color: tuple[int, int, i
     residual = pix - pix_luma[:, :, None]
     projection = np.sum(residual * key_vec.reshape(1, 1, 3), axis=2)
     return np.clip(np.maximum(projection, 0.0), 0.0, 1.0).astype(np.float32)
+
+
+def _bool_mask_or_empty(mask: np.ndarray | None, shape: tuple[int, int], name: str) -> np.ndarray:
+    if mask is None:
+        return np.zeros(shape, dtype=bool)
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, -1] if arr.shape[2] == 4 else arr[:, :, 0]
+    if arr.shape != shape:
+        raise ValueError(f"{name} must match alpha shape")
+    if arr.dtype == bool:
+        return arr.astype(bool, copy=False)
+    return arr > 0
+
+
+def _u8_mask_or_empty(mask: np.ndarray | None, shape: tuple[int, int], name: str) -> np.ndarray:
+    if mask is None:
+        return np.zeros(shape, dtype=np.uint8)
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, -1] if arr.shape[2] == 4 else arr[:, :, 0]
+    if arr.shape != shape:
+        raise ValueError(f"{name} must match alpha shape")
+    if arr.dtype == bool:
+        return arr.astype(np.uint8) * 255
+    if arr.dtype != np.uint8:
+        return np.clip(arr, 0, 255).astype(np.uint8)
+    return arr.astype(np.uint8, copy=False)
+
+
+def _build_foreground_core_mask(
+    alpha_u8: np.ndarray,
+    background_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    settings: KeySettings,
+) -> np.ndarray:
+    """Return protected opaque foreground-core pixels for transition repair."""
+
+    alpha = np.asarray(alpha_u8, dtype=np.uint8)
+    shape = alpha.shape
+    background = _bool_mask_or_empty(background_mask, shape, "background_mask")
+    probability_u8 = _u8_mask_or_empty(probability, shape, "probability")
+    fringe_u8 = _u8_mask_or_empty(fringe_mask, shape, "fringe_mask")
+    keep = _bool_mask_or_empty(keep_mask, shape, "keep_mask")
+    remove = _bool_mask_or_empty(remove_mask, shape, "remove_mask")
+    remove_effective = remove & ~keep
+
+    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
+    core = (alpha >= 250) & (~background) & (probability_u8 <= prob_limit) & (fringe_u8 <= 24)
+    if np.any(keep):
+        core |= keep & (alpha >= 250)
+    core &= ~remove_effective
+    return core.astype(bool, copy=False)
+
+
+def _build_transition_repair_mask(
+    alpha_u8: np.ndarray,
+    edge_mask: np.ndarray,
+    fringe_mask: np.ndarray,
+    spill_strength: np.ndarray,
+    background_mask: np.ndarray,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    foreground_core_mask: np.ndarray,
+    settings: KeySettings,
+) -> np.ndarray:
+    """Return pixels eligible for future v7 transition/fringe repair.
+
+    The mask only describes where repair may run; it does not modify alpha.
+    """
+
+    alpha = np.asarray(alpha_u8, dtype=np.uint8)
+    shape = alpha.shape
+    edge = _bool_mask_or_empty(edge_mask, shape, "edge_mask")
+    fringe_u8 = _u8_mask_or_empty(fringe_mask, shape, "fringe_mask")
+    spill = np.asarray(spill_strength, dtype=np.float32)
+    if spill.shape != shape:
+        raise ValueError("spill_strength must match alpha shape")
+    background = _bool_mask_or_empty(background_mask, shape, "background_mask")
+    keep = _bool_mask_or_empty(keep_mask, shape, "keep_mask")
+    remove = _bool_mask_or_empty(remove_mask, shape, "remove_mask")
+    foreground_core = _bool_mask_or_empty(foreground_core_mask, shape, "foreground_core_mask")
+    remove_effective = remove & ~keep
+
+    alpha_min = int(np.clip(int(settings.transition_alpha_min), 0, 255))
+    alpha_max = int(np.clip(int(settings.transition_alpha_max), 0, 255))
+    if alpha_max < alpha_min:
+        alpha_min, alpha_max = alpha_max, alpha_min
+    semi = (alpha >= alpha_min) & (alpha <= alpha_max)
+    live = (alpha > 0) & (~background) & (~remove_effective)
+    live_edge = edge & live
+    live_fringe = (fringe_u8 > 0) & live
+    live_spill = (spill > float(settings.transition_spill_threshold)) & live
+    eligible = semi | live_edge | live_fringe | live_spill
+
+    protected_core = foreground_core & (alpha >= 250)
+    core_allowed = (~protected_core) | semi | live_fringe
+    return (live & eligible & core_allowed).astype(bool, copy=False)
 
 
 def _build_nearest_inner_label_map(

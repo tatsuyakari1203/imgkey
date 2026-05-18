@@ -21,8 +21,11 @@ from keyer import (
     KeyResult,
     KeySettings,
     _MAX_INNER_LABEL_PIXELS,
+    _build_foreground_core_mask,
     _build_nearest_inner_label_map,
     _build_tile_local_nearest_inner_rgb,
+    _build_transition_repair_mask,
+    _compute_key_spill_strength,
     _estimate_screen_tile,
     _guided_filter_gray,
     _linear_f32_to_srgb_u8,
@@ -69,6 +72,7 @@ class DiagnosticFixture:
     soft_edge_mask: np.ndarray | None = None
     expected_alpha: np.ndarray | None = None
     expected_foreground_rgb: np.ndarray | tuple[int, int, int] | None = None
+    original_alpha: np.ndarray | None = None
     diagnostic_only: bool = True
 
 
@@ -118,6 +122,43 @@ def _masks_from_alpha(alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nda
     return known_background, foreground_core, soft_edge
 
 
+def _draw_antialiased_alpha(
+    shape: tuple[int, int],
+    draw_callback,
+    scale: int = 4,
+) -> np.ndarray:
+    h, w = shape
+    mask = Image.new("L", (w * scale, h * scale), 0)
+    draw_callback(ImageDraw.Draw(mask), scale)
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    return np.asarray(mask.resize((w, h), resampling), dtype=np.float32) / 255.0
+
+
+def _graphic_transition_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return KeySettings(
+        key_color=key_color,
+        auto_border_sample=False,
+        local_screen_model=False,
+        sample_size=10,
+        tolerance=0.45,
+        softness=0.01,
+        clip_background=0.97,
+        clip_foreground=0.00,
+        matte_gamma=2.20,
+        core_strength=0.38,
+        edge_refine_radius=12,
+        erode_expand=-8,
+        despill=0.70,
+        decontaminate=0.50,
+        luminance_restore=0.76,
+        luminance_protect=0.76,
+        fringe_remove=0.75,
+        edge_color_repair=0.65,
+        inner_color_pull=0.45,
+        fringe_band_radius=3,
+    )
+
+
 def _expected_foreground_array(fixture: DiagnosticFixture) -> np.ndarray | None:
     expected = fixture.expected_foreground_rgb
     if expected is None:
@@ -135,7 +176,10 @@ def _expected_rgba_for_fixture(fixture: DiagnosticFixture) -> np.ndarray | None:
     fg = _expected_foreground_array(fixture)
     if fg is None:
         return None
-    alpha_u8 = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    alpha = np.clip(fixture.expected_alpha, 0.0, 1.0)
+    if fixture.original_alpha is not None:
+        alpha = np.minimum(alpha, np.clip(fixture.original_alpha.astype(np.float32), 0.0, 1.0))
+    alpha_u8 = np.rint(alpha * 255.0).astype(np.uint8)
     rgba = np.zeros((*alpha_u8.shape, 4), dtype=np.uint8)
     rgba[:, :, :3] = fg
     rgba[:, :, 3] = alpha_u8
@@ -553,6 +597,145 @@ def white_gray_black_composite_fixture() -> DiagnosticFixture:
     )
 
 
+def _transition_slash_fixture(key_color: tuple[int, int, int], name: str) -> DiagnosticFixture:
+    h, w = 220, 320
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = key_color
+
+    def draw_slash(draw: ImageDraw.ImageDraw, scale: int) -> None:
+        draw.line(
+            [(-28 * scale, (h + 18) * scale), ((w + 28) * scale, -18 * scale)],
+            fill=255,
+            width=24 * scale,
+        )
+
+    alpha = _draw_antialiased_alpha((h, w), draw_slash, scale=4)
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (228, 18, 16)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name=name,
+        rgb=_composite_rgb_linear(background, foreground, alpha),
+        settings=_graphic_transition_settings(key_color),
+        notes="v7 transition baseline: red anti-aliased slash physically composited over a key plate.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def red_slash_green_transition_fixture() -> DiagnosticFixture:
+    return _transition_slash_fixture((0, 220, 50), "transition_red_slash_green")
+
+
+def red_slash_blue_transition_fixture() -> DiagnosticFixture:
+    return _transition_slash_fixture((30, 80, 235), "transition_red_slash_blue")
+
+
+def white_black_barcode_transition_fixture() -> DiagnosticFixture:
+    h, w = 170, 300
+    key_color = (30, 80, 235)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = key_color
+    alpha = np.zeros((h, w), dtype=np.float32)
+    foreground = np.zeros_like(background)
+    bar_xs = [42, 45, 51, 59, 72, 75, 90, 104, 107, 123, 139, 143, 160, 178, 181, 199, 217, 221, 236, 251]
+    for index, x in enumerate(bar_xs):
+        color = (255, 255, 255) if index % 2 == 0 else (0, 0, 0)
+        alpha[32:138, x : x + 1] = 1.0
+        foreground[32:138, x : x + 1] = color
+    # A few horizontal one-pixel strokes make the fixture text-like without font dependencies.
+    for index, y in enumerate((52, 76, 101, 126)):
+        color = (255, 255, 255) if index % 2 == 0 else (0, 0, 0)
+        alpha[y : y + 1, 58:244] = 1.0
+        foreground[y : y + 1, 58:244] = color
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="transition_white_black_1px_lines",
+        rgb=_composite_rgb_linear(background, foreground, alpha),
+        settings=_graphic_transition_settings(key_color),
+        notes="v7 transition baseline: white/black one-pixel barcode/text strokes over blue key.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def black_tape_edge_transition_fixture() -> DiagnosticFixture:
+    h, w = 190, 320
+    key_color = (0, 220, 50)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = key_color
+
+    def draw_tape(draw: ImageDraw.ImageDraw, scale: int) -> None:
+        points = [
+            (30 * scale, 76 * scale),
+            (286 * scale, 48 * scale),
+            (296 * scale, 98 * scale),
+            (39 * scale, 128 * scale),
+        ]
+        draw.polygon(points, fill=255)
+
+    alpha = _draw_antialiased_alpha((h, w), draw_tape, scale=4)
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (0, 0, 0)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(alpha)
+    return DiagnosticFixture(
+        name="transition_black_tape_edge",
+        rgb=_composite_rgb_linear(background, foreground, alpha),
+        settings=_graphic_transition_settings(key_color),
+        notes="v7 transition baseline: black tape edge with anti-aliased key-color transition pixels.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=alpha,
+        expected_foreground_rgb=foreground,
+    )
+
+
+def source_alpha_cap_transition_fixture() -> DiagnosticFixture:
+    h, w = 180, 260
+    key_color = (30, 80, 235)
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = key_color
+    alpha = _disc_alpha(h, w, 62, feather=9.0)
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (230, 22, 18)
+    original_alpha = np.ones((h, w), dtype=np.float32)
+    original_alpha[:, 120:170] = 0.50
+    original_alpha[28:62, 34:92] = 0.0
+    rgb = _composite_rgb_linear(background, foreground, alpha)
+    rgb[original_alpha <= 0.0] = (255, 32, 16)
+    expected_alpha = np.minimum(alpha, original_alpha)
+    known_background, foreground_core, soft_edge = _masks_from_alpha(expected_alpha)
+    return DiagnosticFixture(
+        name="transition_source_alpha_cap",
+        rgb=rgb,
+        settings=_graphic_transition_settings(key_color),
+        notes="v7 transition baseline: source alpha caps recovered alpha and transparent RGB must be zeroed.",
+        known_background_mask=known_background,
+        foreground_core_mask=foreground_core,
+        soft_edge_mask=soft_edge,
+        expected_alpha=expected_alpha,
+        expected_foreground_rgb=foreground,
+        original_alpha=original_alpha,
+    )
+
+
+def transition_unmix_baseline_fixtures() -> list[DiagnosticFixture]:
+    return [
+        red_slash_green_transition_fixture(),
+        red_slash_blue_transition_fixture(),
+        white_black_barcode_transition_fixture(),
+        black_tape_edge_transition_fixture(),
+        source_alpha_cap_transition_fixture(),
+    ]
+
+
 def large_tile_gradient_runtime_fixture() -> DiagnosticFixture:
     h, w = 1152, 1536
     x_grad = np.linspace(-24, 26, w, dtype=np.float32).reshape(1, w)
@@ -911,7 +1094,7 @@ def composite_black_white_gray_error(
     if not np.any(mask):
         return {
             name: {"count": 0, "max_abs_error": 0, "mean_abs_error": 0.0}
-            for name in ("black", "white", "gray")
+            for name in ("black", "white", "gray", "checker")
         }
     metrics: dict[str, dict[str, int | float]] = {}
     for name, color in (("black", (0, 0, 0)), ("white", (255, 255, 255)), ("gray", (128, 128, 128))):
@@ -923,7 +1106,44 @@ def composite_black_white_gray_error(
             "max_abs_error": int(delta.max()),
             "mean_abs_error": float(np.mean(delta)),
         }
+    actual_checker = checkerboard_composite(rgba)
+    expected_checker = checkerboard_composite(expected_rgba)
+    checker_delta = np.abs(actual_checker[mask].astype(np.int16) - expected_checker[mask].astype(np.int16))
+    metrics["checker"] = {
+        "count": int(checker_delta.shape[0]),
+        "max_abs_error": int(checker_delta.max()),
+        "mean_abs_error": float(np.mean(checker_delta)),
+    }
     return metrics
+
+
+def background_alpha_leak(alpha_u8: np.ndarray, known_background: np.ndarray) -> dict[str, int | float]:
+    mask = known_background.astype(bool, copy=False)
+    if not np.any(mask):
+        return {"count": 0, "max_alpha": 0, "mean_alpha": 0.0, "leaking_pixels": 0}
+    values = alpha_u8[mask]
+    return {
+        "count": int(values.size),
+        "max_alpha": int(values.max()),
+        "mean_alpha": float(np.mean(values)),
+        "leaking_pixels": int(np.count_nonzero(values > 0)),
+    }
+
+
+def alpha_detail_recall(expected_alpha: np.ndarray | None, actual_alpha_u8: np.ndarray) -> dict[str, int | float]:
+    if expected_alpha is None:
+        return {"count": 0, "visible_recall": 1.0, "mean_alpha_ratio": 1.0}
+    expected_u8 = np.rint(np.clip(expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    detail = expected_u8 > 0
+    if not np.any(detail):
+        return {"count": 0, "visible_recall": 1.0, "mean_alpha_ratio": 1.0}
+    actual = actual_alpha_u8[detail].astype(np.float32)
+    expected = np.maximum(expected_u8[detail].astype(np.float32), 1.0)
+    return {
+        "count": int(actual.size),
+        "visible_recall": float(np.mean(actual > 0)),
+        "mean_alpha_ratio": float(np.mean(np.minimum(actual / expected, 1.0))),
+    }
 
 
 def _baseline_metrics_for_fixture(fixture: DiagnosticFixture, result: KeyResult) -> dict[str, Any]:
@@ -970,6 +1190,38 @@ def _baseline_metrics_for_fixture(fixture: DiagnosticFixture, result: KeyResult)
     return metrics
 
 
+def _transition_unmix_baseline_metrics_for_fixture(fixture: DiagnosticFixture, result: KeyResult) -> dict[str, Any]:
+    known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+    expected_rgba = _expected_rgba_for_fixture(fixture)
+    transition_mask = soft_edge
+    if not np.any(transition_mask) and result.fringe_mask is not None:
+        transition_mask = result.fringe_mask > 0
+    if not np.any(transition_mask) and fixture.expected_alpha is not None:
+        transition_mask = (fixture.expected_alpha > 0.0) & ~foreground_core
+
+    metrics = _baseline_metrics_for_fixture(fixture, result)
+    metrics.update(
+        {
+            "hard_edge_core_rgb_delta": opaque_foreground_max_delta(
+                fixture.rgb,
+                result.rgba,
+                foreground_core,
+                _expected_foreground_array(fixture),
+            ),
+            "transition_key_residual": edge_key_residual(result.rgba, fixture.settings.key_color, transition_mask),
+            "alpha_detail_recall": alpha_detail_recall(fixture.expected_alpha, result.alpha),
+            "background_alpha_leak": background_alpha_leak(result.alpha, known_background),
+            "composite_residuals": None,
+        }
+    )
+    if expected_rgba is not None:
+        composite_mask = foreground_core | soft_edge
+        if not np.any(composite_mask):
+            composite_mask = ~known_background
+        metrics["composite_residuals"] = composite_black_white_gray_error(result.rgba, expected_rgba, composite_mask)
+    return metrics
+
+
 def _write_composite_baseline_previews(fixture: DiagnosticFixture, result: KeyResult) -> None:
     expected_rgba = _expected_rgba_for_fixture(fixture)
     if expected_rgba is None:
@@ -993,18 +1245,18 @@ def _write_composite_baseline_previews(fixture: DiagnosticFixture, result: KeyRe
 
 def write_algorithm_upgrade_baseline() -> None:
     ALGORITHM_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
-    fixtures = algorithm_upgrade_fixtures(include_large=True)
+    fixtures = algorithm_upgrade_fixtures(include_large=True) + transition_unmix_baseline_fixtures()
     all_metrics: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_by": "python smoke_test.py --write-algorithm-baseline",
-        "baseline_note": "Phase 1 v4 diagnostic baseline; hardest new fixture thresholds are intentionally not enforced yet.",
+        "baseline_note": "Classical diagnostic baseline; v7 transition-unmix fixtures are non-strict until later phases.",
         "fixtures": {},
     }
     summary_lines = [
-        "# ImgKey v5 classical algorithm baseline",
+        "# ImgKey classical algorithm baseline",
         "",
         "Generated by `python smoke_test.py --write-algorithm-baseline`.",
-        "Hardest v5 fixture checks are diagnostic-only in Phase 1; later phases compare against these hashes/metrics.",
+        "Transition-unmix fixtures are diagnostic-only in Phase 1; later phases compare against these hashes/metrics.",
         "",
         "| Fixture | Edge residual max | Core max delta | Soft band px | Transparent RGB zero | Tile/full max |",
         "| --- | ---: | ---: | ---: | --- | ---: |",
@@ -1012,14 +1264,17 @@ def write_algorithm_upgrade_baseline() -> None:
 
     for fixture in fixtures:
         print(f"baseline fixture {fixture.name}: {fixture.notes}")
-        result = process_key_image(fixture.rgb, fixture.settings)
+        result = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha)
         known_background, foreground_core, soft_edge = _fixture_masks(fixture)
         expected_alpha_u8 = (
             np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
             if fixture.expected_alpha is not None
             else np.zeros(fixture.rgb.shape[:2], dtype=np.uint8)
         )
-        metrics = _baseline_metrics_for_fixture(fixture, result)
+        if fixture.name.startswith("transition_"):
+            metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, result)
+        else:
+            metrics = _baseline_metrics_for_fixture(fixture, result)
         hashes = {
             "source_rgb_sha256": _array_sha256(fixture.rgb),
             "rgba_sha256": _array_sha256(result.rgba),
@@ -1906,6 +2161,127 @@ def run_v4_edge_repair_tests() -> None:
     assert not imported, f"default v4 edge repair path must not import heavy optional modules: {sorted(imported)}"
 
 
+def run_transition_unmix_baseline_tests() -> None:
+    summaries: list[str] = []
+    max_transition_residual = 0
+    for fixture in transition_unmix_baseline_fixtures():
+        result = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha)
+        metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, result)
+        transparent = metrics["transparent_rgb_zero"]
+        leak = metrics["background_alpha_leak"]
+        core_delta = metrics["hard_edge_core_rgb_delta"]
+        residual = metrics["transition_key_residual"]
+        recall = metrics["alpha_detail_recall"]
+        assert transparent["ok"], (
+            f"{fixture.name}: transparent output RGB must stay zero, max={transparent['max_rgb_when_transparent']}"
+        )
+        if core_delta["count"]:
+            assert core_delta["max_delta"] <= 8, f"{fixture.name}: hard/core RGB drift too high: {core_delta}"
+        assert recall["visible_recall"] >= 0.65, f"{fixture.name}: diagnostic detail recall unexpectedly low: {recall}"
+        if fixture.original_alpha is not None:
+            cap_u8 = np.rint(np.clip(fixture.original_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+            over_cap = int(np.maximum(result.alpha.astype(np.int16) - cap_u8.astype(np.int16), 0).max())
+            assert over_cap <= 1, f"{fixture.name}: output alpha exceeded source-alpha cap by {over_cap}"
+            transparent_source = cap_u8 == 0
+            assert result.rgba[transparent_source, :3].max() == 0, f"{fixture.name}: source-transparent RGB must be zeroed"
+
+        max_transition_residual = max(max_transition_residual, int(residual["max_positive_excess"]))
+        checker = (metrics.get("composite_residuals") or {}).get("checker", {})
+        summaries.append(
+            f"{fixture.name}: residual_max={residual['max_positive_excess']} "
+            f"core_delta={core_delta['max_delta']} recall={recall['visible_recall']:.3f} "
+            f"bg_leak={leak['max_alpha']} checker_mean={checker.get('mean_abs_error', 0.0):.2f}"
+        )
+
+    assert max_transition_residual >= 1, "v7 baseline fixtures should retain a measurable transition key residual"
+    _assert_transition_unmix_mask_helpers()
+    print("v7 transition-unmix baseline diagnostics:")
+    for line in summaries:
+        print(f"  {line}")
+
+
+def _assert_transition_unmix_mask_helpers() -> None:
+    settings = _graphic_transition_settings((30, 80, 235))
+    for fixture in (
+        red_slash_blue_transition_fixture(),
+        white_black_barcode_transition_fixture(),
+        black_tape_edge_transition_fixture(),
+    ):
+        known_background, foreground_core, soft_edge = _fixture_masks(fixture)
+        alpha_u8 = np.rint(np.clip(fixture.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+        probability = np.where(known_background, 255, 0).astype(np.uint8)
+        fringe = np.where(soft_edge, 180, 0).astype(np.uint8)
+        core = _build_foreground_core_mask(
+            alpha_u8,
+            known_background,
+            probability,
+            fringe,
+            None,
+            None,
+            fixture.settings,
+        )
+        expected_core_count = int(np.count_nonzero(foreground_core))
+        assert expected_core_count > 0, f"{fixture.name}: synthetic fixture should have a foreground core"
+        found_core = int(np.count_nonzero(core & foreground_core))
+        assert found_core >= int(expected_core_count * 0.95), (
+            f"{fixture.name}: foreground-core helper missed too many core pixels {found_core}/{expected_core_count}"
+        )
+        assert not np.any(core & known_background), f"{fixture.name}: foreground-core helper included background"
+
+        spill = _compute_key_spill_strength(fixture.rgb, fixture.settings.key_color)
+        transition = _build_transition_repair_mask(
+            alpha_u8,
+            soft_edge,
+            fringe,
+            spill,
+            known_background,
+            None,
+            None,
+            core,
+            fixture.settings,
+        )
+        if np.any(soft_edge):
+            assert np.count_nonzero(transition & soft_edge) > 0, f"{fixture.name}: transition mask should catch soft edge pixels"
+        assert not np.any(transition & known_background), f"{fixture.name}: transition mask included known background"
+        protected_opaque = core & (alpha_u8 == 255) & (fringe == 0)
+        assert not np.any(transition & protected_opaque), f"{fixture.name}: transition mask included protected opaque core"
+
+    alpha = np.array(
+        [
+            [0, 0, 0, 0, 0, 0],
+            [0, 255, 128, 128, 255, 255],
+            [0, 0, 0, 0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    background = np.zeros(alpha.shape, dtype=bool)
+    background[0, :] = True
+    probability = np.zeros(alpha.shape, dtype=np.uint8)
+    fringe = np.zeros(alpha.shape, dtype=np.uint8)
+    fringe[1, 4] = 160
+    edge = np.zeros(alpha.shape, dtype=bool)
+    edge[1, 1:5] = True
+    spill = np.zeros(alpha.shape, dtype=np.float32)
+    spill[1, 1:5] = 0.50
+    keep = np.zeros(alpha.shape, dtype=bool)
+    remove = np.zeros(alpha.shape, dtype=bool)
+    remove[1, 2] = True
+    foreground_core = np.zeros(alpha.shape, dtype=bool)
+    foreground_core[1, 1] = True
+    foreground_core[1, 3] = True
+    foreground_core[1, 4] = True
+    mask = _build_transition_repair_mask(alpha, edge, fringe, spill, background, keep, remove, foreground_core, settings)
+    assert not mask[0, 1], "transition mask must exclude known background"
+    assert not mask[1, 1], "transition mask must exclude protected opaque core on edge/spill alone"
+    assert not mask[1, 2], "transition mask must exclude manual remove pixels"
+    assert mask[1, 3], "semi-transparent transition pixels remain eligible even when core-protected"
+    assert mask[1, 4], "fringe pixels remain eligible even when core-protected"
+    keep[1, 2] = True
+    keep_core = _build_foreground_core_mask(alpha, background, probability, fringe, keep, remove, settings)
+    keep_mask = _build_transition_repair_mask(alpha, edge, fringe, spill, background, keep, remove, keep_core, settings)
+    assert keep_mask[1, 2], "keep mask should override manual remove for semi-transparent transition eligibility"
+
+
 def run_gpu_runtime_probe_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert "torch" not in sys.modules, "smoke test start should not have torch imported"
@@ -2255,6 +2631,7 @@ def main(argv: list[str] | None = None) -> None:
     rgba = run_current_baseline()
     run_v2_numeric_tests()
     run_v4_edge_repair_tests()
+    run_transition_unmix_baseline_tests()
     if not writing_algorithm_baseline:
         run_phase2_linear_color_tests()
         run_phase3_guided_alpha_tests()

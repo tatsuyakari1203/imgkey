@@ -169,7 +169,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 1 - Transition model and settings
 
 Category:
@@ -185,7 +185,10 @@ Isolation:
 - Own `keyer.py` settings/helpers and targeted smoke tests. No UI yet. No AI files/specs.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Added diagnostic transition-unmix graphic fixtures/metrics, appended compatible v7 settings, and added covered transition/core mask helpers without wiring behavior.
 
 
 #### P1.0 - Add baseline graphic transition fixtures first
@@ -213,7 +216,7 @@ Acceptance:
 - Existing smoke tests still pass.
 
 Status:
-- Planned
+- Complete
 
 
 #### P1.1 - Add v7 transition-unmix settings
@@ -242,7 +245,7 @@ Acceptance:
 - `python -m py_compile keyer.py smoke_test.py` passes.
 
 Status:
-- Planned
+- Complete
 
 
 #### P1.2 - Add transition/fringe region helpers
@@ -282,7 +285,7 @@ Acceptance:
 - Tests prove `_build_transition_repair_mask()` excludes known background, manual remove, and protected opaque core while still including semi-transparent transition/fringe pixels.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -390,7 +393,7 @@ Status:
 
 
 Current:
-- No
+- Yes
 ### Phase 3 - Linear RGB transition unmix and key-vector despill
 
 Category:
@@ -851,7 +854,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 1 next: add baseline graphic transition fixtures and v7 transition settings/masks before changing repair behavior.
+Planner can assign Phase 2 next: build the foreground-reference path and global alpha recovery using the Phase 1 diagnostic fixtures/settings/masks.
 
 
 
