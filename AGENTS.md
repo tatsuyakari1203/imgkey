@@ -3,7 +3,7 @@
 ## What this repo is
 - ImgKey is a Windows/Python desktop chroma-key app for large still images, built with PySide6, NumPy, OpenCV, and Pillow.
 - The product/runtime surface is classical-only. Default `ImgKey.exe` is CPU/lightweight; `ImgKey-GPU.exe` is an optional CUDA tensor-runtime probe/acceleration flavor.
-- Current source of truth is the root source files, `ImgKey.spec`, `ImgKey-GPU.spec`, `docs/build-gpu.md`, and the active v7 transition plan. `build/`, `dist/`, caches, and `.artifact/` outputs are generated/disposable.
+- Current source of truth is the root source files, `ImgKey.spec`, `ImgKey-GPU.spec`, `docs/build-gpu.md`, and the active v9 geometric defaults plan. `build/`, `dist/`, caches, and `.artifact/` outputs are generated/disposable.
 
 ## Core architecture
 - `app.py` — PySide6 viewer-first UI, `ImageCanvas`, inspector controls, preview/export threads, eyedropper, manual keep/remove masks, imported matte support, GPU status probe, and full-resolution PNG export wiring.
@@ -29,7 +29,7 @@
 - Do not rewrite the algorithm or UI while doing repo-context/baseline-safety work.
 - Large-image keying must avoid full-image float32 RGB allocations; keep source as `uint8`, masks as `uint8`, nearest-inner labels as bounded `int32`, and use float work per tile/ROI only.
 - Global screen sampling, connected-background decisions, trimaps, manual masks, fringe masks, and capped nearest-inner repair labels must happen before tiled export to avoid seams.
-- UI defaults are the user-approved **High Accuracy Graphic** Blue preset: key color `(30, 80, 235)`, sample size `10`, tolerance `0.45`, softness `0.01`, clip background `0.97`, clip foreground `0.00`, matte gamma `2.20`, core strength `0.38`, edge radius `32`, erode/expand `-8`, despill `0.70`, decontaminate `0.50`, luminance restore/protect `0.76`, fringe remove `0.75`, edge color repair `0.65`, inner color pull `0.45`, and fringe band radius `3`.
+- UI defaults are the **High Accuracy** `green_cyan_safe` geometric benchmark profile: key color `(30, 80, 235)`, sample size `10`, tolerance `0.26`, softness `0.02`, clip background `0.95`, clip foreground `0.08`, matte gamma `1.60`, core strength `0.45`, edge radius `24`, erode/expand `-4`, despill `0.80`, decontaminate `0.70`, luminance restore/protect `0.85`, fringe remove `0.85`, edge color repair `0.80`, inner color pull `0.60`, fringe band radius `5`, transition alpha recover `0.90`, key-vector despill `0.85`, and foreground color pull `0.75`.
 - Linear-light repair rule: edge repair is RGB-only and alpha/edge/fringe-gated; unmix, Vlahos-style channel clamp, nearest-inner color pull, and luminance protection operate in linear light with linear key/screen vectors, then convert back to sRGB. Do not turn it into a global color-grade pass, do not change alpha from the repair path, and always zero RGB where alpha is 0.
 - Guided-filter rule: `guided_alpha_refine` defaults to `0.0` (off). When enabled, guided alpha refinement must use grayscale/linear-luma edge-band ROI work only, clamp exact known background/foreground/core regions afterward, obey `guided_max_pixels`, and deterministically skip/fall back to unchanged alpha when the cap would be exceeded.
 - Tile-local screen rule: full-image `uint8` screen maps are allowed only under `max_local_screen_model_pixels`; otherwise tiled render must estimate screen color inside each read tile from connected/background-safe pixels. Read overlap must include the screen-estimation radius and write only tile cores.

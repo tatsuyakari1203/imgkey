@@ -2167,7 +2167,10 @@ def _repair_transition_unmix(
 
     pull_amount = _clip01(settings.foreground_reference_pull)
     if pull_amount > 0:
-        pull = np.clip(repair_strength * spill_gate * pull_amount, 0.0, 1.0)
+        # ``repair_strength`` already bakes in the spill/edge gate used by the
+        # compact CUDA ABI. Applying ``spill_gate`` a second time makes the CPU
+        # full-keyer path diverge from the parity-tested GPU tile kernel.
+        pull = np.clip(repair_strength * pull_amount, 0.0, 1.0)
         if np.any(pull > 0):
             reference_luma_matched = _match_luma_linear(foreground_linear, _linear_luma(cleaned))
             cleaned = cleaned * (1.0 - pull[:, :, None]) + reference_luma_matched * pull[:, :, None]

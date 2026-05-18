@@ -14,7 +14,7 @@ This document describes how ImgKey releases are produced, verified, and publishe
 
 - Large-image chroma-key workflow for green, blue, auto-detected, and picked custom screen colors.
 - Viewer-first PySide6 UI with pan/zoom, fit/100%, eyedropper, debug views, imported mattes, and background previews.
-- High Accuracy Graphic defaults tuned for blue-screen graphic/poster images.
+- High Accuracy geometric defaults tuned from the `green_cyan_safe` benchmark profile for blue, green, cyan, and uneven screen assets.
 - Global connected-background matte decisions before tiled full-resolution export.
 - Edge-only trimap refinement and tile-safe PNG export.
 - Edge Color Reconstruction Pro: alpha/spill-gated fringe mask, alpha-aware foreground unmix, Vlahos-style key-channel clamp, nearest-inner foreground color pull, luminance protection, and zeroed transparent RGB.

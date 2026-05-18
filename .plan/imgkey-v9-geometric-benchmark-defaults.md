@@ -80,6 +80,7 @@ Current:
 
 
 
+
 #### P1.1 - Generate comprehensive ground-truth asset fixtures
 - Add deterministic fixture generator(s) in `smoke_test.py` or a small test helper:
   - foreground RGBA canvas with known alpha,
@@ -167,6 +168,7 @@ Current:
 
 
 
+
 #### P2.1 - Add candidate profiles
 - Evaluate at least:
   1. current app default,
@@ -235,10 +237,11 @@ Isolation:
 - Own `app.py`, `keyer.py` defaults if needed, UI tests, docs/changelog. No algorithm rewrites unless benchmark exposed a small targeted bug.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
 
 
 
@@ -253,7 +256,10 @@ Acceptance:
 - UI labels/tooltips remain no-AI.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- 2026-05-19: Fixed the full-geometry CPU/GPU RGB parity mismatch by removing the duplicate spill-gate multiplier from CPU transition foreground-reference pull so the full keyer matches the compact CUDA tile ABI (`green_cyan_safe` geometry parity now `max_rgba_diff=1`, alpha diff `0`). Promoted the exact `green_cyan_safe` values to `APP_DEFAULT_SETTINGS`/High Accuracy reset while keeping the approved blue key color and no-AI UI surface; did not add the screenshot-strict preset because Phase 2 showed high background leak and it was not recommended.
 
 
 #### P3.2 - Promote benchmark gates
@@ -270,7 +276,10 @@ Acceptance:
 - `python smoke_test.py --write-geometric-benchmark` writes detailed artifacts.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- 2026-05-19: Added strict smoke-test geometric benchmark gates for thin-line recall, transparent-band alpha accuracy, dot preservation, zero background leak, edge residual, transparent RGB zeroing, and compact CUDA CPU/GPU geometry parity when available. Full diagnostic image writing remains gated behind `--write-geometric-benchmark`.
 
 
 ---
@@ -293,7 +302,8 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
 
 
 
@@ -332,4 +342,4 @@ Status:
 
 ## 5) Immediate next step
 
-Start Phase 3 with `worker`: decide whether to fix/defer the GPU geometry RGB parity issue before promoting `green_cyan_safe`, or keep the current global default and add/promote an appropriate named preset/regression gate.
+Start Phase 4 with `deep-worker`: run the remaining full verification/build floor, inspect final diffs, and prepare the branch for planner push.

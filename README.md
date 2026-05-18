@@ -40,6 +40,7 @@ python app.py
 ## Classical keying notes
 
 - The default **Aggressive Interior Removal** target removes disconnected high-confidence key-colored islands. Switch to **Connected Background** when preserving same-key foreground islands matters more.
+- The default **High Accuracy** profile uses the geometric-benchmark `green_cyan_safe` settings: blue key color, moderate tolerance, tighter foreground/background clips, 24px edge radius, and stronger transition/color repair for green, cyan, and uneven screens.
 - Edge-only alpha refinement keeps hard background at alpha 0 and foreground core at alpha 255 while preserving soft anti-aliased edges.
 - Optional guided alpha refinement settings are available for API/test use: `guided_alpha_refine`, `guided_radius`, `guided_eps`, and `guided_max_pixels`. The default strength is `0.0` (off), and capped edge-band ROI filtering skips deterministically when the memory cap would be exceeded.
 - **Edge Color Repair** repairs contaminated soft-edge RGB after alpha generation in linear light. It builds an alpha/spill-gated **Fringe Mask**, unmixes screen color, applies a Vlahos-style channel clamp, optionally pulls color from the nearest clean opaque foreground pixel, and preserves linear-luminance detail via **Luminance Restore**.
@@ -50,6 +51,7 @@ python app.py
 
 ```powershell
 python smoke_test.py
+python smoke_test.py --write-geometric-benchmark
 python smoke_test.py --write-edge-repair-diagnostics
 python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
 python -c "import app, keyer; print('import ok')"

@@ -10,6 +10,7 @@ All notable changes to ImgKey are documented here.
 - Kept two build flavors: default `ImgKey.exe` and optional CUDA tensor-runtime `ImgKey-GPU.exe`.
 - Locked the optional GPU packaging requirement to the torch CUDA runtime and tightened PyInstaller excludes for optional companion/scientific packages.
 - Renamed retained manual matte import UI to **Imported Matte**.
+- Promoted the geometric-benchmark `green_cyan_safe` profile as the default **High Accuracy** settings and added smoke gates for geometry detail, leak, edge residual, and CPU/GPU parity.
 - Updated smoke tests, docs, packaging specs, and release workflow for the classical-only surface.
 
 ## v1.1.0 - 2026-05-17

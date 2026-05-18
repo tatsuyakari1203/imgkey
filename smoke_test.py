@@ -3721,34 +3721,34 @@ def generate_geometric_benchmark_asset() -> GeometricBenchmarkAsset:
 def _geometric_current_default_settings(key_color: tuple[int, int, int]) -> KeySettings:
     return KeySettings(
         key_color=key_color,
-        tolerance=0.45,
-        softness=0.01,
-        edge_blur=(32 - 1) / 4.0,
+        tolerance=0.26,
+        softness=0.02,
+        edge_blur=(24 - 1) / 4.0,
         cleanup=0,
-        despill=0.70,
+        despill=0.80,
         sample_size=10,
         auto_border_sample=True,
         auto_detect_key_color=False,
-        clip_background=0.97,
-        clip_foreground=0.00,
-        matte_gamma=2.20,
-        core_strength=0.38,
-        edge_refine_radius=32,
-        edge_softness=0.00,
-        erode_expand=-8,
+        clip_background=0.95,
+        clip_foreground=0.08,
+        matte_gamma=1.60,
+        core_strength=0.45,
+        edge_refine_radius=24,
+        edge_softness=0.04,
+        erode_expand=-4,
         despeckle_min_area=0,
         aggressive_interior_removal=True,
-        decontaminate=0.50,
-        luminance_restore=0.76,
-        luminance_protect=0.76,
-        fringe_remove=0.75,
-        edge_color_repair=0.65,
-        inner_color_pull=0.45,
-        fringe_band_radius=3,
+        decontaminate=0.70,
+        luminance_restore=0.85,
+        luminance_protect=0.85,
+        fringe_remove=0.85,
+        edge_color_repair=0.80,
+        inner_color_pull=0.60,
+        fringe_band_radius=5,
         transition_unmix=True,
-        alpha_recover_strength=0.85,
-        key_vector_despill=0.75,
-        foreground_reference_pull=0.65,
+        alpha_recover_strength=0.90,
+        key_vector_despill=0.85,
+        foreground_reference_pull=0.75,
         gpu_acceleration="Off",
     )
 
@@ -4284,6 +4284,44 @@ def _geometric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def run_geometric_benchmark_gate_tests() -> None:
+    cases = geometric_benchmark_cases()
+    failures: list[str] = []
+    for case in cases:
+        result = process_key_image(case.source_rgb, case.settings)
+        metrics = _geometric_case_metrics(case, result)
+        thin_recall = float(metrics["thin_line_recall"]["visible_recall"])
+        dot_recall = float(metrics["dot_preservation"]["visible_recall"])
+        band_alpha = metrics["features"]["transparency_bands"]["alpha"]
+        band_alpha_mae_u8 = float(band_alpha["alpha_mae_u8"])
+        background_leak_pixels = int(metrics["background_leak"]["leaking_pixels"])
+        edge_residual_p95 = float(metrics["edge_key_color_residual"]["p95_positive_excess"])
+        transparent_rgb_max = int(metrics["transparent_rgb_residual"]["max_rgb_when_transparent"])
+        if thin_recall < 0.75:
+            failures.append(f"{case.name}: thin-line recall {thin_recall:.3f} < 0.75")
+        if dot_recall < 0.75:
+            failures.append(f"{case.name}: dot preservation {dot_recall:.3f} < 0.75")
+        if band_alpha_mae_u8 > 100.0:
+            failures.append(f"{case.name}: transparency-band alpha MAE {band_alpha_mae_u8:.2f} > 100.0")
+        if background_leak_pixels != 0:
+            failures.append(f"{case.name}: background leak {background_leak_pixels} pixels != 0")
+        if edge_residual_p95 > 2.0:
+            failures.append(f"{case.name}: edge key residual p95 {edge_residual_p95:.2f} > 2.0")
+        if transparent_rgb_max != 0:
+            failures.append(f"{case.name}: transparent RGB max {transparent_rgb_max} != 0")
+
+    assert not failures, "geometric benchmark gates failed:\n" + "\n".join(failures)
+
+    gpu_parity = _geometric_gpu_parity(cases)
+    if gpu_parity.get("status") == "skipped":
+        print(f"geometry GPU parity skipped: {gpu_parity.get('reason')} - {gpu_parity.get('message')}")
+    else:
+        assert gpu_parity.get("within_tolerance"), (
+            "geometry GPU parity max diff too high: "
+            f"rgba={gpu_parity.get('max_rgba_diff_vs_cpu')} alpha={gpu_parity.get('max_alpha_diff_vs_cpu')}"
+        )
+
+
 def _score_high_is_good(value: float) -> float:
     return float(np.clip(value, 0.0, 1.0))
 
@@ -4605,8 +4643,14 @@ def _geometric_tuning_recommendations(
         global_profile = "current_app_default"
     selected_gpu_parity = profile_gpu_parity.get(global_profile, {})
     gpu_blocks_default = bool(selected_gpu_parity.get("interpretation", {}).get("blocks_gpu_parity_gate"))
+    current_matches_green_cyan_safe = bool(
+        profile_summaries.get("current_app_default", {}).get("settings_blue_key")
+        == profile_summaries.get("green_cyan_safe", {}).get("settings_blue_key")
+    )
     if eligible:
         global_action = "defer_global_default_until_gpu_geometry_parity_resolved" if gpu_blocks_default else "promote_global_default_candidate"
+    elif current_matches_green_cyan_safe:
+        global_action = "current_global_default_matches_green_cyan_safe"
     else:
         global_action = "keep_current_global_default"
 
@@ -4636,6 +4680,9 @@ def _geometric_tuning_recommendations(
                 else
                 "Candidate passed the objective promotion rules."
                 if eligible
+                else
+                "Current app defaults already match the green/cyan-safe geometric benchmark profile."
+                if current_matches_green_cyan_safe
                 else "No candidate passed all objective global-default promotion rules; keep the current default for now."
             ),
             "cpu_metric_eligible_profiles": eligible,
@@ -4809,6 +4856,34 @@ def run_app_ui_tests() -> None:
         assert window.output_mode.findText("Imported Matte") >= 0
         assert window.alpha_hint_mask is None
         defaults = app_module.APP_DEFAULT_SETTINGS
+        promoted_expected = {
+            "tolerance": 0.26,
+            "softness": 0.02,
+            "clip_background": 0.95,
+            "clip_foreground": 0.08,
+            "matte_gamma": 1.60,
+            "core_strength": 0.45,
+            "edge_refine_radius": 24,
+            "edge_softness": 0.04,
+            "erode_expand": -4,
+            "despill": 0.80,
+            "decontaminate": 0.70,
+            "luminance_restore": 0.85,
+            "luminance_protect": 0.85,
+            "fringe_remove": 0.85,
+            "edge_color_repair": 0.80,
+            "inner_color_pull": 0.60,
+            "fringe_band_radius": 5,
+            "alpha_recover_strength": 0.90,
+            "key_vector_despill": 0.85,
+            "foreground_reference_pull": 0.75,
+        }
+        for attr, expected in promoted_expected.items():
+            actual = getattr(defaults, attr)
+            if isinstance(expected, float):
+                assert abs(float(actual) - expected) < 1e-9, f"APP default {attr} mismatch: {actual} != {expected}"
+            else:
+                assert actual == expected, f"APP default {attr} mismatch: {actual} != {expected}"
         assert window.gpu_acceleration.currentText() == defaults.gpu_acceleration
         assert window.transition_unmix.text() == "Transition Unmix"
         assert window.transition_unmix.isChecked() is bool(defaults.transition_unmix)
@@ -4817,6 +4892,12 @@ def run_app_ui_tests() -> None:
         assert abs(float(window.foreground_reference_pull.value()) - defaults.foreground_reference_pull) < 1e-9
         ui_settings = window.current_settings()
         assert ui_settings.transition_unmix is bool(defaults.transition_unmix)
+        for attr, expected in promoted_expected.items():
+            actual = getattr(ui_settings, attr)
+            if isinstance(expected, float):
+                assert abs(float(actual) - expected) < 1e-9, f"UI default {attr} mismatch: {actual} != {expected}"
+            else:
+                assert actual == expected, f"UI default {attr} mismatch: {actual} != {expected}"
         assert abs(ui_settings.alpha_recover_strength - defaults.alpha_recover_strength) < 1e-9
         assert abs(ui_settings.key_vector_despill - defaults.key_vector_despill) < 1e-9
         assert abs(ui_settings.foreground_reference_pull - defaults.foreground_reference_pull) < 1e-9
@@ -5223,6 +5304,7 @@ def main(argv: list[str] | None = None) -> None:
     run_gpu_accel_backend_tests()
     run_app_ui_tests()
     run_v6_screen_analysis_tests()
+    run_geometric_benchmark_gate_tests()
     run_removed_surface_tests()
     run_packaging_flavor_tests()
     run_source_surface_guard()
