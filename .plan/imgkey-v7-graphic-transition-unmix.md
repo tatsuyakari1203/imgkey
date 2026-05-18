@@ -415,7 +415,10 @@ Isolation:
 - Own `_process_color_tile()` transition repair path in `keyer.py`; all retained behavior must be classical/no-AI. Do not preserve AI/hybrid-specific branches.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Added linear RGB transition unmix/color repair, key-vector despill, luma-preserving foreground-reference pull, final-alpha tile color wiring, and strict transition RGB smoke gates.
 
 
 #### P3.1 - Add `_repair_transition_unmix()`
@@ -455,7 +458,7 @@ Acceptance:
 - Does not retain full-image float32 RGB outside tile scope.
 
 Status:
-- Planned
+- Complete
 
 
 #### P3.2 - Add key-vector spill removal and luma-preserving chroma pull
@@ -488,7 +491,7 @@ Acceptance:
 - Black edges do not get lifted/yellowed; white edges stay white.
 
 Status:
-- Planned
+- Complete
 
 
 #### P3.3 - Wire into classical graphic color path
@@ -508,7 +511,7 @@ Acceptance:
 - `rgba[:, :, 3]` always comes from final global `matte.alpha`; tile color repair only writes RGB and repair mask.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -519,7 +522,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 4 - Diagnostics and regression gates
 
 Category:
@@ -597,7 +600,7 @@ Status:
 
 
 Current:
-- No
+- Yes
 ### Phase 5 - UI controls and defaults
 
 Category:
@@ -865,7 +868,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 2 next: build the foreground-reference path and global alpha recovery using the Phase 1 diagnostic fixtures/settings/masks.
+Planner can assign Phase 4 next: promote the transition fixtures/metrics into diagnostics-only follow-up gates without changing the Phase 3 color algorithm.
 
 
 

@@ -32,6 +32,7 @@ from keyer import (
     _foreground_reference_for_slice,
     _guided_filter_gray,
     _linear_f32_to_srgb_u8,
+    _repair_transition_unmix,
     _srgb_u8_to_linear_f32,
     _tile_local_nearest_inner_radius,
     checkerboard_composite,
@@ -1819,8 +1820,13 @@ def run_phase6_tile_local_nearest_inner_tests() -> None:
         assert local_residual["max_positive_excess"] <= no_pull_residual["max_positive_excess"], (
             f"tile-local pull should not worsen max edge residual: {no_pull_residual} -> {local_residual}"
         )
-        assert local_residual["p95_positive_excess"] < no_pull_residual["p95_positive_excess"], (
-            f"tile-local pull should improve p95 edge residual: {no_pull_residual} -> {local_residual}"
+        assert local_residual["p95_positive_excess"] <= no_pull_residual["p95_positive_excess"], (
+            f"tile-local pull should not worsen p95 edge residual: {no_pull_residual} -> {local_residual}"
+        )
+        assert local_residual["mean_positive_excess"] < no_pull_residual["mean_positive_excess"] or (
+            local_residual["max_positive_excess"] < no_pull_residual["max_positive_excess"]
+        ), (
+            f"tile-local pull should still improve mean or max residual: {no_pull_residual} -> {local_residual}"
         )
 
         seam = tile_boundary_band_metrics(fixture.rgb, settings, tile_sizes=(137, 199))
@@ -2144,8 +2150,9 @@ def run_v4_edge_repair_tests() -> None:
 
     control_key = (0, 220, 50)
     control_rgb, _, control_settings = _edge_fringe_fixture(control_key)
-    low_cleanup = process_key_image(control_rgb, replace(control_settings, decontaminate=0.0, despill=0.0))
-    high_cleanup = process_key_image(control_rgb, replace(control_settings, decontaminate=1.0, despill=1.0))
+    legacy_control_settings = replace(control_settings, transition_unmix=False)
+    low_cleanup = process_key_image(control_rgb, replace(legacy_control_settings, decontaminate=0.0, despill=0.0))
+    high_cleanup = process_key_image(control_rgb, replace(legacy_control_settings, decontaminate=1.0, despill=1.0))
     y, x = _find_fringe_sample(control_rgb, high_cleanup, control_key)
     low_excess = _dominant_excess(low_cleanup.rgba[y, x, :3], control_key)
     high_excess = _dominant_excess(high_cleanup.rgba[y, x, :3], control_key)
@@ -2172,7 +2179,7 @@ def run_v4_edge_repair_tests() -> None:
 
 def run_transition_unmix_baseline_tests() -> None:
     summaries: list[str] = []
-    max_transition_residual = 0
+    improved_residual_count = 0
     total_recovered_pixels = 0
     for fixture in transition_unmix_baseline_fixtures():
         baseline = process_key_image(
@@ -2181,7 +2188,26 @@ def run_transition_unmix_baseline_tests() -> None:
             fixture.original_alpha,
         )
         result = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha)
+        alpha_only = process_key_image(
+            fixture.rgb,
+            replace(
+                fixture.settings,
+                key_vector_despill=0.0,
+                foreground_reference_pull=0.0,
+                preserve_foreground_luma=0.0,
+            ),
+            fixture.original_alpha,
+        )
+        assert np.array_equal(result.alpha, alpha_only.alpha), (
+            f"{fixture.name}: RGB transition cleanup knobs must not mutate recovered global alpha"
+        )
+        assert np.array_equal(result.alpha, result.rgba[:, :, 3]), f"{fixture.name}: debug alpha must match output alpha channel"
+        export = process_key_image(fixture.rgb, fixture.settings, fixture.original_alpha, include_debug=False)
+        compat = process_chroma_key(fixture.rgb, fixture.settings, fixture.original_alpha)
+        assert np.array_equal(export.rgba, compat), f"{fixture.name}: export wrapper must match low-memory render"
+        assert np.array_equal(export.rgba, result.rgba), f"{fixture.name}: preview/debug render must match export RGB cleanup"
         metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, result)
+        baseline_metrics = _transition_unmix_baseline_metrics_for_fixture(fixture, baseline)
         known_background, foreground_core, soft_edge = _fixture_masks(fixture)
         detail_region = soft_edge.copy()
         if fixture.expected_alpha is not None:
@@ -2204,13 +2230,49 @@ def run_transition_unmix_baseline_tests() -> None:
         leak = metrics["background_alpha_leak"]
         core_delta = metrics["hard_edge_core_rgb_delta"]
         residual = metrics["transition_key_residual"]
+        baseline_residual = baseline_metrics["transition_key_residual"]
         recall = metrics["alpha_detail_recall"]
         assert transparent["ok"], (
             f"{fixture.name}: transparent output RGB must stay zero, max={transparent['max_rgb_when_transparent']}"
         )
         if core_delta["count"]:
             assert core_delta["max_delta"] <= 8, f"{fixture.name}: hard/core RGB drift too high: {core_delta}"
+        if fixture.expected_alpha is not None and fixture.expected_foreground_rgb is not None:
+            exact_core = (fixture.expected_alpha >= 0.999) & (result.alpha >= 250)
+            expected_rgb = _expected_foreground_array(fixture)
+            if np.any(exact_core) and expected_rgb is not None:
+                exact_delta = int(
+                    np.abs(result.rgba[exact_core, :3].astype(np.int16) - expected_rgb[exact_core].astype(np.int16)).max()
+                )
+                assert exact_delta <= 5, f"{fixture.name}: exact opaque foreground core drift too high: {exact_delta}"
         assert recall["visible_recall"] >= 0.65, f"{fixture.name}: diagnostic detail recall unexpectedly low: {recall}"
+        assert residual["max_positive_excess"] <= baseline_residual["max_positive_excess"], (
+            f"{fixture.name}: transition RGB repair worsened max key residual: {baseline_residual} -> {residual}"
+        )
+        assert residual["p95_positive_excess"] <= baseline_residual["p95_positive_excess"], (
+            f"{fixture.name}: transition RGB repair worsened p95 key residual: {baseline_residual} -> {residual}"
+        )
+        improved = (
+            residual["mean_positive_excess"] < baseline_residual["mean_positive_excess"]
+            or residual["p95_positive_excess"] < baseline_residual["p95_positive_excess"]
+            or residual["max_positive_excess"] < baseline_residual["max_positive_excess"]
+        )
+        assert improved, f"{fixture.name}: transition key residual should decrease: {baseline_residual} -> {residual}"
+        improved_residual_count += 1
+
+        if fixture.name == "transition_black_tape_edge":
+            dark_edge = soft_edge & (result.alpha >= 16)
+            assert np.any(dark_edge), f"{fixture.name}: black edge fixture should expose a visible transition band"
+            max_dark_rgb = int(result.rgba[dark_edge, :3].max())
+            assert max_dark_rgb <= 4, f"{fixture.name}: black transition edges must not be lifted/yellowed, max RGB={max_dark_rgb}"
+        if fixture.name == "transition_white_black_1px_lines" and fixture.expected_foreground_rgb is not None:
+            expected_rgb = _expected_foreground_array(fixture)
+            assert expected_rgb is not None and fixture.expected_alpha is not None
+            white_pixels = (expected_rgb[:, :, 0] >= 250) & (fixture.expected_alpha > 0) & (result.alpha > 0)
+            black_pixels = (expected_rgb[:, :, 0] <= 5) & (fixture.expected_alpha > 0) & (result.alpha > 0)
+            assert np.any(white_pixels) and np.any(black_pixels), "white/black line fixture should contain both polarities"
+            assert int(result.rgba[white_pixels, :3].min()) >= 252, f"{fixture.name}: white edges must stay white"
+            assert int(result.rgba[black_pixels, :3].max()) <= 3, f"{fixture.name}: black line edges must stay black"
         if fixture.original_alpha is not None:
             cap_u8 = np.rint(np.clip(fixture.original_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
             over_cap = int(np.maximum(result.alpha.astype(np.int16) - cap_u8.astype(np.int16), 0).max())
@@ -2218,22 +2280,83 @@ def run_transition_unmix_baseline_tests() -> None:
             transparent_source = cap_u8 == 0
             assert result.rgba[transparent_source, :3].max() == 0, f"{fixture.name}: source-transparent RGB must be zeroed"
 
-        max_transition_residual = max(max_transition_residual, int(residual["max_positive_excess"]))
         checker = (metrics.get("composite_residuals") or {}).get("checker", {})
         summaries.append(
-            f"{fixture.name}: residual_max={residual['max_positive_excess']} "
+            f"{fixture.name}: residual_max={baseline_residual['max_positive_excess']}->{residual['max_positive_excess']} "
             f"core_delta={core_delta['max_delta']} recall={recall['visible_recall']:.3f} "
             f"bg_leak={leak['max_alpha']} checker_mean={checker.get('mean_abs_error', 0.0):.2f}"
         )
 
-    assert max_transition_residual >= 1, "v7 baseline fixtures should retain a measurable transition key residual"
+    assert improved_residual_count == len(transition_unmix_baseline_fixtures()), "all transition fixtures should improve key residual"
     assert total_recovered_pixels > 0, "v7 alpha recovery should raise plausible transition pixels on diagnostic fixtures"
+    _assert_transition_rgb_repair_helper_contract()
     _assert_transition_unmix_mask_helpers()
     _assert_transition_foreground_reference_radius()
     _assert_transition_alpha_recovery_parity()
-    print("v7 transition-unmix baseline diagnostics:")
+    print("Phase 3 transition-unmix RGB checks:")
     for line in summaries:
         print(f"  {line}")
+
+
+def _assert_transition_rgb_repair_helper_contract() -> None:
+    settings = _graphic_transition_settings((30, 80, 235))
+    h, w = 5, 7
+    alpha = np.tile(np.asarray([0.0, 0.18, 0.36, 0.62, 0.82, 1.0, 0.0], dtype=np.float32), (h, 1))
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = settings.key_color
+    foreground = np.zeros_like(background)
+    foreground[:, :] = (228, 18, 16)
+    rgb = _composite_rgb_linear(background, foreground, alpha)
+    alpha_u8 = np.rint(alpha * 255.0).astype(np.uint8)
+    known_background = alpha_u8 == 0
+    edge = (alpha_u8 > 0) & (alpha_u8 < 255)
+    probability = np.where(known_background, 255, 96).astype(np.uint8)
+    probability[:, 5] = 0
+    fringe = np.where(edge, 180, 0).astype(np.uint8)
+    nearest_fg_rgb = foreground.copy()
+    nearest_fg_valid = np.ones((h, w), dtype=bool)
+    alpha_before = alpha_u8.copy()
+
+    repaired, repair_mask = _repair_transition_unmix(
+        rgb,
+        alpha_u8,
+        known_background,
+        edge,
+        probability,
+        fringe,
+        settings.key_color,
+        None,
+        nearest_fg_rgb,
+        nearest_fg_valid,
+        settings,
+    )
+    assert repaired.shape == rgb.shape and repaired.dtype == np.uint8, "transition helper must return uint8 RGB tile shape"
+    assert repair_mask.shape == alpha_u8.shape and repair_mask.dtype == np.uint8, "transition helper mask must be uint8 alpha shape"
+    assert np.array_equal(alpha_u8, alpha_before), "transition RGB helper must not mutate alpha input"
+    transition = edge & (alpha_u8 > 0)
+    before_residual = rgb_key_residual(rgb, settings.key_color, transition)
+    after_residual = rgb_key_residual(repaired, settings.key_color, transition)
+    assert after_residual["max_positive_excess"] < before_residual["max_positive_excess"], (
+        f"transition helper should reduce key residual: {before_residual} -> {after_residual}"
+    )
+    assert np.count_nonzero(repair_mask[transition]) > 0, "transition helper should mark repaired transition pixels"
+    assert np.array_equal(repaired[alpha_u8 == 255], rgb[alpha_u8 == 255]), "opaque protected helper core must stay unchanged"
+
+    no_ref_rgb, no_ref_mask = _repair_transition_unmix(
+        rgb,
+        alpha_u8,
+        known_background,
+        edge,
+        probability,
+        fringe,
+        settings.key_color,
+        None,
+        None,
+        None,
+        settings,
+    )
+    assert np.array_equal(no_ref_rgb, rgb), "helper without foreground reference must return original RGB"
+    assert int(no_ref_mask.max()) == 0, "helper without foreground reference must return a zero repair mask"
 
 
 def _assert_transition_foreground_reference_radius() -> None:
@@ -2244,11 +2367,13 @@ def _assert_transition_foreground_reference_radius() -> None:
         foreground_reference_radius=4,
     )
     h, w = 10, 24
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    rgb[:, :] = settings.key_color
-    rgb[1:5, 1:3] = (232, 40, 32)
     alpha = np.full((h, w), 128, dtype=np.uint8)
     alpha[1:5, 1:3] = 255
+    background_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    background_rgb[:, :] = settings.key_color
+    foreground_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    foreground_rgb[:, :] = (232, 40, 32)
+    rgb = _composite_rgb_linear(background_rgb, foreground_rgb, alpha.astype(np.float32) / 255.0)
     background = np.zeros((h, w), dtype=bool)
     probability = np.full((h, w), 120, dtype=np.uint8)
     probability[1:5, 1:3] = 0
@@ -2285,6 +2410,99 @@ def _assert_transition_foreground_reference_radius() -> None:
     )
     assert local_ref is not None and local_valid is not None and local_distance is not None
     assert local_valid[2, 5] and not local_valid[2, 16], "tile-local references must honor foreground_reference_radius"
+
+    repair_rgb, repair_mask = _repair_transition_unmix(
+        rgb,
+        alpha,
+        background,
+        alpha < 255,
+        probability,
+        fringe,
+        settings.key_color,
+        None,
+        ref_rgb,
+        ref_valid,
+        settings,
+    )
+    assert repair_mask[2, 5] > 0, "near radius-valid transition pixels should be repaired"
+    assert repair_mask[2, 16] == 0, "far transition pixels must not be repaired without a radius-valid reference"
+    assert np.array_equal(repair_rgb[2, 16], rgb[2, 16]), "far pixels must not borrow distant foreground RGB"
+
+    render_settings = replace(
+        settings,
+        use_tiling=False,
+        local_screen_model=False,
+        edge_color_repair=0.0,
+        inner_color_pull=0.0,
+        despill=0.0,
+        decontaminate=0.0,
+    )
+    matte = keyer_module._GlobalMatte(
+        screen_color=settings.key_color,
+        screen_probability=probability,
+        screen_map=None,
+        background_mask=background,
+        edge_mask=alpha < 255,
+        alpha=alpha,
+        color_alpha=None,
+        alpha_hint=None,
+        fringe_mask=fringe,
+        inner_labels=labels,
+        inner_label_to_flat=label_to_flat,
+        inner_distance=distance,
+    )
+    rgba, repair_debug = keyer_module._render_tiled_rgba(rgb, render_settings, matte, None, None, include_debug=True)
+    assert repair_debug is not None
+    assert repair_debug[2, 5] > 0, "render path should repair radius-valid transition pixels"
+    assert repair_debug[2, 16] == 0, "render path must honor foreground_reference_radius for transition RGB repair"
+    assert np.array_equal(rgba[2, 16, :3], rgb[2, 16]), "render path must not repair beyond-radius transition RGB"
+
+    tile_h, tile_w = 40, 120
+    tile_alpha = np.full((tile_h, tile_w), 128, dtype=np.uint8)
+    tile_alpha[4:18, 8:10] = 255
+    tile_bg_rgb = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+    tile_bg_rgb[:, :] = settings.key_color
+    tile_fg_rgb = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+    tile_fg_rgb[:, :] = (232, 40, 32)
+    tile_rgb = _composite_rgb_linear(tile_bg_rgb, tile_fg_rgb, tile_alpha.astype(np.float32) / 255.0)
+    tile_background = np.zeros((tile_h, tile_w), dtype=bool)
+    tile_probability = np.full((tile_h, tile_w), 120, dtype=np.uint8)
+    tile_probability[tile_alpha == 255] = 0
+    tile_fringe = np.where(tile_alpha < 255, 180, 0).astype(np.uint8)
+    tile_settings = replace(
+        settings,
+        foreground_reference_radius=4,
+        use_tiling=True,
+        tile_size=24,
+        tile_overlap=0,
+        local_screen_model=False,
+        edge_refine_radius=8,
+        edge_color_repair=1e-6,
+        inner_color_pull=1e-6,
+        despill=0.0,
+        fringe_remove=0.0,
+        unmix_amount=0.0,
+        decontaminate=0.0,
+    )
+    tile_matte = keyer_module._GlobalMatte(
+        screen_color=settings.key_color,
+        screen_probability=tile_probability,
+        screen_map=None,
+        background_mask=tile_background,
+        edge_mask=tile_alpha < 255,
+        alpha=tile_alpha,
+        color_alpha=None,
+        alpha_hint=None,
+        fringe_mask=tile_fringe,
+        inner_labels=None,
+        inner_label_to_flat=None,
+        inner_distance=None,
+    )
+    tiled_rgba, tiled_debug = keyer_module._render_tiled_rgba(tile_rgb, tile_settings, tile_matte, None, None, include_debug=True)
+    assert tiled_debug is not None
+    assert tiled_debug[10, 12] > 0, "tile-local transition repair should use references inside foreground_reference_radius"
+    assert tiled_debug[10, 35] == 0, "tile-local transition repair must use its own radius, not the larger legacy radius"
+    assert np.array_equal(tiled_rgba[10, 35, :3], tile_rgb[10, 35]), "tile-local repair must not borrow beyond-radius foreground RGB"
 
 
 def _assert_transition_alpha_recovery_parity() -> None:

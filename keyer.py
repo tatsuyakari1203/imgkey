@@ -17,6 +17,7 @@ _MIN_TILE_LOCAL_INNER_PIXELS = 8
 _MAX_TILE_LOCAL_INNER_LABEL_PIXELS = 8_000_000
 _MAX_TILE_LOCAL_NEAREST_INNER_RADIUS = 256
 _MAX_ALPHA_RECOVERY_BLOCK_PIXELS = 2_000_000
+_LINEAR_LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
 @dataclass(slots=True)
@@ -1114,7 +1115,7 @@ def _build_foreground_core_mask(
     remove = _bool_mask_or_empty(remove_mask, shape, "remove_mask")
     remove_effective = remove & ~keep
 
-    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
+    prob_limit = max(64, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
     core = (alpha >= 250) & (~background) & (probability_u8 <= prob_limit) & (fringe_u8 <= 24)
     if np.any(keep):
         core |= keep & (alpha >= 250)
@@ -1156,14 +1157,17 @@ def _build_transition_repair_mask(
     if alpha_max < alpha_min:
         alpha_min, alpha_max = alpha_max, alpha_min
     semi = (alpha >= alpha_min) & (alpha <= alpha_max)
+    protected_semi = semi & (alpha < 240)
     live = (alpha > 0) & (~background) & (~remove_effective)
     live_edge = edge & live
     live_fringe = (fringe_u8 > 0) & live
+    protected_core_fringe = (fringe_u8 > 24) & live
     live_spill = (spill > float(settings.transition_spill_threshold)) & live
     eligible = semi | live_edge | live_fringe | live_spill
 
-    protected_core = foreground_core & (alpha >= 250)
-    core_allowed = (~protected_core) | semi | live_fringe
+    near_opaque_core = (alpha >= 240) & (~background) & (fringe_u8 <= 24)
+    protected_core = (foreground_core | near_opaque_core) & (alpha >= 240)
+    core_allowed = (~protected_core) | protected_semi | protected_core_fringe
     return (live & eligible & core_allowed).astype(bool, copy=False)
 
 
@@ -1242,7 +1246,7 @@ def _nearest_inner_seed_mask(
     fringe_mask: np.ndarray,
     settings: KeySettings,
 ) -> np.ndarray:
-    prob_limit = max(48, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
+    prob_limit = max(64, int(round(_clip01(settings.clip_foreground) * 255.0)) + 32)
     return (alpha_u8 >= 250) & (~background_mask) & (fringe_mask <= 24) & (probability <= prob_limit)
 
 
@@ -1719,7 +1723,7 @@ def _render_tiled_rgba(
     rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
     rgba[:, :, 3] = alpha_out
     despill_mask = np.zeros((out_h, out_w), dtype=np.uint8) if include_debug else None
-    color_alpha = matte.alpha if matte.color_alpha is None else matte.color_alpha
+    reference_alpha = matte.alpha if matte.color_alpha is None else matte.color_alpha
     screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
     local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
     extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
@@ -1765,6 +1769,18 @@ def _render_tiled_rgba(
                 read_y,
                 read_x,
             )
+            if _transition_reference_enabled(settings):
+                transition_inner_rgb, transition_inner_valid, _ = _foreground_reference_for_slice(
+                    rgb,
+                    matte.inner_labels,
+                    matte.inner_label_to_flat,
+                    matte.inner_distance,
+                    read_y,
+                    read_x,
+                    _foreground_reference_radius(settings),
+                )
+            else:
+                transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
         else:
             bounded_local_radius = _bounded_tile_local_nearest_inner_radius(
                 local_nearest_radius,
@@ -1777,18 +1793,45 @@ def _render_tiled_rgba(
             if _can_build_tile_local_nearest_inner(read_y, read_x, core_y, core_x, (h, w)):
                 nearest_inner_rgb, nearest_inner_valid = _build_tile_local_nearest_inner_rgb(
                     rgb_read,
-                    color_alpha[read_y, read_x],
+                    reference_alpha[read_y, read_x],
                     matte.background_mask[read_y, read_x],
                     matte.screen_probability[read_y, read_x],
                     matte.fringe_mask[read_y, read_x],
                     settings,
                     bounded_local_radius,
                 )
+                if _transition_reference_enabled(settings):
+                    bounded_transition_radius = _bounded_tile_local_nearest_inner_radius(
+                        _foreground_reference_radius(settings),
+                        read_y,
+                        read_x,
+                        core_y,
+                        core_x,
+                        (h, w),
+                    )
+                    if bounded_transition_radius == bounded_local_radius:
+                        transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
+                    elif bounded_transition_radius > 0:
+                        transition_inner_rgb, transition_inner_valid = _build_tile_local_nearest_inner_rgb(
+                            rgb_read,
+                            reference_alpha[read_y, read_x],
+                            matte.background_mask[read_y, read_x],
+                            matte.screen_probability[read_y, read_x],
+                            matte.fringe_mask[read_y, read_x],
+                            settings,
+                            bounded_transition_radius,
+                        )
+                    else:
+                        transition_inner_rgb, transition_inner_valid = None, None
+                else:
+                    transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
             else:
                 nearest_inner_rgb, nearest_inner_valid = None, None
+                transition_inner_rgb, transition_inner_valid = None, None
         rgb_tile, spill_tile = _process_color_tile(
             rgb_read,
-            color_alpha[read_y, read_x],
+            matte.alpha[read_y, read_x],
+            matte.background_mask[read_y, read_x],
             matte.edge_mask[read_y, read_x],
             matte.screen_probability[read_y, read_x],
             matte.fringe_mask[read_y, read_x],
@@ -1797,6 +1840,8 @@ def _render_tiled_rgba(
             nearest_inner_valid,
             matte.screen_color,
             settings,
+            transition_nearest_rgb=transition_inner_rgb,
+            transition_nearest_valid=transition_inner_valid,
         )
         rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
         if despill_mask is not None:
@@ -1888,9 +1933,187 @@ def _can_build_tile_local_nearest_inner(
     return not (whole_read and whole_core)
 
 
+def _screen_linear_for_tile(
+    shape: tuple[int, int],
+    screen_color: tuple[int, int, int],
+    screen_tile: np.ndarray | None,
+) -> np.ndarray:
+    h, w = shape
+    if screen_tile is None:
+        screen_u8 = np.empty((h, w, 3), dtype=np.uint8)
+        screen_u8[:, :, :] = np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3)
+        return _srgb_u8_to_linear_f32(screen_u8)
+    return _srgb_u8_to_linear_f32(screen_tile)
+
+
+def _linear_luma(rgb_linear: np.ndarray) -> np.ndarray:
+    return np.sum(np.clip(rgb_linear, 0.0, 1.0) * _LINEAR_LUMA_WEIGHTS.reshape(1, 1, 3), axis=2).astype(np.float32)
+
+
+def _match_luma_linear(rgb_linear: np.ndarray, target_luma: np.ndarray) -> np.ndarray:
+    rgb = np.clip(np.asarray(rgb_linear, dtype=np.float32), 0.0, 1.0)
+    src_luma = _linear_luma(rgb)
+    target = np.clip(np.asarray(target_luma, dtype=np.float32), 0.0, 1.0)
+    scale = np.divide(target, np.maximum(src_luma, 1e-5), out=np.ones_like(target), where=src_luma > 1e-5)
+    scale = np.clip(scale, 0.0, 4.0)
+    return np.clip(rgb * scale[:, :, None], 0.0, 1.0)
+
+
+def _screen_chroma_unit_vectors(screen_linear: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    key_luma = _linear_luma(screen_linear)
+    key_vec = np.clip(screen_linear, 0.0, 1.0) - key_luma[:, :, None]
+    norm = np.linalg.norm(key_vec, axis=2).astype(np.float32)
+    valid = norm >= 1e-5
+    unit = np.divide(key_vec, np.maximum(norm[:, :, None], 1e-5), out=np.zeros_like(key_vec), where=valid[:, :, None])
+    return unit.astype(np.float32, copy=False), valid
+
+
+def _repair_transition_unmix(
+    rgb_u8: np.ndarray,
+    alpha_u8: np.ndarray,
+    background_mask: np.ndarray,
+    edge_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    screen_color: tuple[int, int, int],
+    screen_tile: np.ndarray | None,
+    nearest_fg_rgb: np.ndarray | None,
+    nearest_fg_valid: np.ndarray | None,
+    settings: KeySettings,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return repaired RGB plus the transition repair mask; alpha is read-only."""
+
+    rgb = np.asarray(rgb_u8)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        raise ValueError("rgb_u8 must have shape HxWx3")
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    else:
+        rgb = rgb[:, :, :3]
+    shape = rgb.shape[:2]
+    repair_mask = np.zeros(shape, dtype=np.uint8)
+    original_rgb = rgb.copy()
+
+    if not bool(settings.transition_unmix):
+        return original_rgb, repair_mask
+    if _foreground_reference_radius(settings) <= 0:
+        return original_rgb, repair_mask
+    if nearest_fg_rgb is None or nearest_fg_valid is None:
+        return original_rgb, repair_mask
+
+    foreground_valid = _bool_mask_or_empty(nearest_fg_valid, shape, "nearest_fg_valid")
+    if not np.any(foreground_valid):
+        return original_rgb, repair_mask
+
+    foreground_rgb = np.asarray(nearest_fg_rgb)
+    if foreground_rgb.ndim != 3 or foreground_rgb.shape[:2] != shape or foreground_rgb.shape[2] < 3:
+        raise ValueError("nearest_fg_rgb must match rgb_u8 shape")
+    foreground_rgb = foreground_rgb[:, :, :3]
+    if foreground_rgb.dtype != np.uint8:
+        foreground_rgb = np.clip(foreground_rgb, 0, 255).astype(np.uint8)
+
+    alpha = _u8_mask_or_empty(alpha_u8, shape, "alpha_u8")
+    background = _bool_mask_or_empty(background_mask, shape, "background_mask")
+    edge = _bool_mask_or_empty(edge_mask, shape, "edge_mask")
+    probability_u8 = _u8_mask_or_empty(probability, shape, "probability")
+    fringe_u8 = _u8_mask_or_empty(fringe_mask, shape, "fringe_mask")
+
+    spill_strength = _compute_key_spill_strength(rgb, screen_color)
+    foreground_core = _build_foreground_core_mask(alpha, background, probability_u8, fringe_u8, None, None, settings)
+    transition = _build_transition_repair_mask(
+        alpha,
+        edge,
+        fringe_u8,
+        spill_strength,
+        background,
+        None,
+        None,
+        foreground_core,
+        settings,
+    )
+    eligible = transition & foreground_valid & (alpha > 0)
+    if not np.any(eligible):
+        return original_rgb, repair_mask
+
+    source_linear = _srgb_u8_to_linear_f32(rgb)
+    foreground_linear = _srgb_u8_to_linear_f32(foreground_rgb)
+    screen_linear = _screen_linear_for_tile(shape, screen_color, screen_tile)
+    alpha_f = alpha.astype(np.float32) / 255.0
+    safe_alpha = np.maximum(alpha_f, 1.0 / 255.0)
+    foreground_est = (source_linear - (1.0 - alpha_f[:, :, None]) * screen_linear) / safe_alpha[:, :, None]
+    foreground_est = np.nan_to_num(foreground_est, nan=0.0, posinf=1.0, neginf=0.0)
+    foreground_est = np.clip(foreground_est, 0.0, 1.0).astype(np.float32, copy=False)
+
+    recon = alpha_f[:, :, None] * foreground_est + (1.0 - alpha_f[:, :, None]) * screen_linear
+    recon_error = np.linalg.norm(source_linear - recon, axis=2)
+    reconstruction_limit = max(float(settings.transition_reconstruction_error) * 1.25, 1e-4)
+    eligible &= recon_error <= reconstruction_limit
+    if not np.any(eligible):
+        return original_rgb, repair_mask
+
+    key_vec, key_vec_valid = _screen_chroma_unit_vectors(screen_linear)
+    foreground_luma = _linear_luma(foreground_est)
+    reference_luma = _linear_luma(foreground_linear)
+    foreground_chroma = foreground_est - foreground_luma[:, :, None]
+    vector_spill = np.maximum(np.sum(foreground_chroma * key_vec, axis=2), 0.0)
+    vector_spill = np.where(key_vec_valid, vector_spill, 0.0).astype(np.float32)
+
+    edge_strength = np.clip(alpha_f * (1.0 - alpha_f) * 4.0, 0.0, 1.0)
+    edge_strength = np.maximum(edge_strength, edge.astype(np.float32) * 0.45)
+    fringe_signal = fringe_u8.astype(np.float32) / 255.0
+    near_screen = (probability_u8.astype(np.float32) / 255.0) * np.clip(1.0 - alpha_f, 0.0, 1.0)
+    spill_gate = np.maximum.reduce(
+        (
+            np.clip(spill_strength, 0.0, 1.0),
+            _smoothstep(0.005, 0.18, vector_spill),
+            near_screen,
+            fringe_signal * 0.75,
+        )
+    )
+    transition_strength = np.maximum.reduce((edge_strength, fringe_signal, near_screen))
+    repair_strength = np.clip(transition_strength * np.maximum(spill_gate, 0.35), 0.0, 1.0)
+    repair_strength = np.where(eligible, repair_strength, 0.0).astype(np.float32)
+    if not np.any(repair_strength > 0):
+        return original_rgb, repair_mask
+
+    cleaned = foreground_est.copy()
+    despill_amount = _clip01(settings.key_vector_despill)
+    if despill_amount > 0:
+        cleaned -= key_vec * (vector_spill * despill_amount * repair_strength)[:, :, None]
+        cleaned = np.clip(cleaned, 0.0, 1.0)
+
+    pull_amount = _clip01(settings.foreground_reference_pull)
+    if pull_amount > 0:
+        pull = np.clip(repair_strength * spill_gate * pull_amount, 0.0, 1.0)
+        if np.any(pull > 0):
+            reference_luma_matched = _match_luma_linear(foreground_linear, _linear_luma(cleaned))
+            cleaned = cleaned * (1.0 - pull[:, :, None]) + reference_luma_matched * pull[:, :, None]
+
+    luma_preserve = _clip01(settings.preserve_foreground_luma)
+    if luma_preserve > 0:
+        preserve = np.clip(repair_strength * luma_preserve, 0.0, 1.0)
+        if np.any(preserve > 0):
+            luma_matched = _match_luma_linear(cleaned, reference_luma)
+            cleaned = cleaned * (1.0 - preserve[:, :, None]) + luma_matched * preserve[:, :, None]
+
+    cleaned = np.clip(np.nan_to_num(cleaned, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    repaired = _linear_f32_to_srgb_u8(cleaned)
+    changed = repair_strength > (1.0 / 255.0)
+    out = original_rgb.copy()
+    out[changed] = repaired[changed]
+    out[alpha <= 0] = 0
+
+    delta = np.max(np.abs(out.astype(np.int16) - original_rgb.astype(np.int16)), axis=2).astype(np.float32) / 255.0
+    repair_mask_f = np.maximum(repair_strength, delta)
+    repair_mask[repair_mask_f > 0] = np.rint(np.clip(repair_mask_f[repair_mask_f > 0], 0.0, 1.0) * 255.0).astype(np.uint8)
+    repair_mask[alpha <= 0] = 0
+    return out, repair_mask
+
+
 def _process_color_tile(
     rgb_tile: np.ndarray,
     alpha_u8: np.ndarray,
+    background_mask: np.ndarray,
     edge_mask: np.ndarray,
     probability: np.ndarray,
     fringe_mask: np.ndarray,
@@ -1899,6 +2122,8 @@ def _process_color_tile(
     nearest_inner_valid: np.ndarray | None,
     screen_color: tuple[int, int, int],
     settings: KeySettings,
+    transition_nearest_rgb: np.ndarray | None = None,
+    transition_nearest_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
     alpha = alpha_u8.astype(np.float32) / 255.0
@@ -1911,6 +2136,9 @@ def _process_color_tile(
     edge_strength = np.clip(alpha * (1.0 - alpha) * 4.0, 0.0, 1.0)
     edge_strength = np.maximum(edge_strength, edge_mask.astype(np.float32) * 0.35)
     live = alpha > 0.001
+    protected_core = None
+    if bool(settings.transition_unmix):
+        protected_core = _build_foreground_core_mask(alpha_u8, background_mask, probability, fringe_mask, None, None, settings)
 
     legacy_spill = _compute_despill_mask(alpha, edge_strength, probability, settings)
     fringe_signal = fringe_mask.astype(np.float32) / 255.0
@@ -1945,9 +2173,30 @@ def _process_color_tile(
     out[~live] = 0.0
     rgb_out = rgb_tile.copy()
     changed = live & (spill_mask > 0.0)
+    if protected_core is not None:
+        changed &= ~protected_core
     if np.any(changed):
         repaired = _linear_f32_to_srgb_u8(out)
         rgb_out[changed] = repaired[changed]
+
+    if bool(settings.transition_unmix):
+        transition_rgb, transition_mask = _repair_transition_unmix(
+            rgb_tile,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe_mask,
+            screen_color,
+            screen_tile,
+            nearest_inner_rgb if transition_nearest_rgb is None else transition_nearest_rgb,
+            nearest_inner_valid if transition_nearest_valid is None else transition_nearest_valid,
+            settings,
+        )
+        transition_changed = live & (transition_mask > 0)
+        if np.any(transition_changed):
+            rgb_out[transition_changed] = transition_rgb[transition_changed]
+            spill_mask = np.maximum(spill_mask, transition_mask.astype(np.float32) / 255.0)
     rgb_out[~live] = 0
     return rgb_out, np.rint(np.clip(spill_mask, 0.0, 1.0) * 255.0).astype(np.uint8)
 
