@@ -1,7 +1,7 @@
 # 06 - ImgKey v7 No-AI Classical GPU + Transition Unmix
 
 Date: 2026-05-18
-Status: In progress
+Status: Completed
 Owner: ImgKey Classical Keyer / Classical GPU Runtime
 Scope: Remove AI entirely, improve deterministic transition/fringe cleanup, and focus GPU work on classical CUDA acceleration.
 
@@ -801,7 +801,10 @@ Isolation:
 - Own final verification/build only. Do not introduce new feature work unless fixing a verification failure.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Completed final no-AI classical GPU v7 verification, diagnostics, default/GPU PyInstaller builds, built-EXE probes, archive exclusion checks, EXE size/SHA256 capture, and phase commit hygiene.
 
 
 #### P8.1 - Verification floor
@@ -829,7 +832,7 @@ Acceptance:
 - No generated artifacts are staged.
 
 Status:
-- Planned
+- Complete
 
 
 #### P8.2 - Build smoke
@@ -851,7 +854,7 @@ Acceptance:
 - GPU build contains no AI/model stack and passes CUDA probe on RTX machine.
 
 Status:
-- Planned
+- Complete
 
 
 #### P8.3 - Commit boundaries
@@ -876,14 +879,14 @@ Acceptance:
   - `Add transition unmix UI controls`.
 
 Status:
-- Planned
+- Complete
 
 
 ---
 
 ## 5) Immediate next step
 
-Planner can assign Phase 8 next to deep-worker: run full verification/build smoke and keep the branch clean for planner push.
+Phase 8 complete; planner can push the final phase commit after review.
 
 
 
@@ -893,4 +896,4 @@ Planner can assign Phase 8 next to deep-worker: run full verification/build smok
 
 
 Current:
-- Yes
+- No
