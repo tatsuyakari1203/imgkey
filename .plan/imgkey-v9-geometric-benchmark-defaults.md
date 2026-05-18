@@ -1,7 +1,7 @@
 # 09 - ImgKey Geometric Benchmark and Default Tuning
 
 Date: 2026-05-18
-Status: Planned
+Status: In progress
 Owner: ImgKey Classical Quality / Benchmarking
 Scope: Build a comprehensive synthetic asset benchmark, tune no-AI classical keyer defaults, and verify CPU/GPU parity.
 
@@ -73,10 +73,11 @@ Isolation:
 - Own `smoke_test.py` benchmark fixture generation/CLI and optional docs. Do not tune defaults yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
 
 #### P1.1 - Generate comprehensive ground-truth asset fixtures
 - Add deterministic fixture generator(s) in `smoke_test.py` or a small test helper:
@@ -108,10 +109,8 @@ Acceptance:
 - Existing smoke tests still pass.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
 
 #### P1.2 - Add benchmark CLI and diagnostics
 - Add CLI such as:
@@ -137,10 +136,11 @@ Acceptance:
   - composite error on black/white/gray/checker backgrounds.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+Progress:
+- 2026-05-19: Added deterministic geometry asset generation, multi-key composites, artifact-writing CLI, metrics, feature masks/labels, and geometry CPU/GPU comparison records under `.artifact/geometric-benchmark/`.
+
 
 ---
 
@@ -162,7 +162,8 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
 
 #### P2.1 - Add candidate profiles
 - Evaluate at least:
@@ -183,8 +184,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P2.2 - Tune score weights and stop conditions
 - Define score weights for asset-keying priorities:
@@ -210,8 +209,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
@@ -235,6 +232,7 @@ Status:
 Current:
 - No
 
+
 #### P3.1 - Update default or add named profile
 - If one profile wins robustly, update `APP_DEFAULT_SETTINGS`, reset behavior, and UI smoke expectations.
 - If screenshot strict profile is best only for graphic assets but risky elsewhere, add/rename preset such as `Asset Strict` while keeping safer `High Accuracy` default.
@@ -248,8 +246,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.2 - Promote benchmark gates
 - Add lightweight benchmark assertions to smoke tests so future changes cannot regress:
@@ -267,8 +263,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
@@ -291,6 +285,7 @@ Status:
 
 Current:
 - No
+
 
 #### P4.1 - Verification floor
 - Run:
@@ -322,11 +317,9 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
 ## 5) Immediate next step
 
-Start Phase 1 with `deep-worker`: add deterministic geometric benchmark generator and artifact-writing CLI, then commit/push before tuning defaults.
+Start Phase 2 with `deep-worker`: add candidate setting profiles and run the geometry benchmark report before any default changes.

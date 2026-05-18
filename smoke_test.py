@@ -49,6 +49,7 @@ EDGE_ARTIFACT_DIR = Path(".artifact") / "edge-repair-verification"
 ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
 TRANSITION_UNMIX_DIAGNOSTIC_DIR = Path(".artifact") / "transition-unmix-diagnostics"
 GPU_BENCHMARK_DIR = Path(".artifact") / "gpu-benchmarks"
+GEOMETRIC_BENCHMARK_DIR = Path(".artifact") / "geometric-benchmark"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -86,6 +87,32 @@ class DiagnosticFixture:
     remove_mask: np.ndarray | None = None
     alpha_hint: np.ndarray | None = None
     diagnostic_only: bool = True
+
+
+@dataclass(frozen=True)
+class GeometricBenchmarkAsset:
+    name: str
+    alpha: np.ndarray
+    foreground_rgb_template: np.ndarray
+    key_color_region: np.ndarray
+    feature_masks: dict[str, np.ndarray]
+    primary_feature_order: tuple[str, ...]
+    notes: str
+
+
+@dataclass(frozen=True)
+class GeometricBenchmarkCase:
+    name: str
+    background_name: str
+    key_color: tuple[int, int, int]
+    background_rgb: np.ndarray
+    source_rgb: np.ndarray
+    expected_alpha: np.ndarray
+    expected_foreground_rgb: np.ndarray
+    expected_rgba: np.ndarray
+    feature_masks: dict[str, np.ndarray]
+    settings: KeySettings
+    notes: str
 
 
 @contextmanager
@@ -1412,6 +1439,14 @@ def write_algorithm_upgrade_baseline() -> None:
     summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     print(f"wrote algorithm baseline metrics to {metrics_path}")
     print(f"wrote algorithm baseline summary to {summary_path}")
+
+
+def ensure_algorithm_upgrade_baseline() -> None:
+    metrics_path = ALGORITHM_BASELINE_DIR / "metrics.json"
+    if metrics_path.exists():
+        return
+    print(f"missing algorithm baseline at {metrics_path}; generating it for self-contained smoke checks")
+    write_algorithm_upgrade_baseline()
 
 
 def _transition_detail_region(fixture: DiagnosticFixture, result: KeyResult) -> np.ndarray:
@@ -3389,6 +3424,751 @@ def write_gpu_benchmarks() -> None:
     print(f"gpu benchmark summary written to {GPU_BENCHMARK_DIR / 'summary.json'}")
 
 
+GEOMETRIC_PRIMARY_FEATURES = (
+    "transparency_bands",
+    "dots_speckles",
+    "lines_1px",
+    "lines_2px",
+    "diagonal_lines",
+    "curves_rings",
+    "holes",
+    "interior_key_colored",
+    "hard_edges",
+    "anti_aliased_edges",
+)
+
+GEOMETRIC_COLOR_FEATURES = (
+    "foreground_color_red",
+    "foreground_color_white",
+    "foreground_color_black",
+    "foreground_color_gray",
+    "foreground_color_yellow",
+    "foreground_color_saturated",
+    "foreground_color_key",
+)
+
+
+def _geometric_circle_mask(shape: tuple[int, int], cx: float, cy: float, radius: float) -> np.ndarray:
+    yy, xx = np.indices(shape, dtype=np.float32)
+    return (xx - float(cx)) ** 2 + (yy - float(cy)) ** 2 <= float(radius) ** 2
+
+
+def _geometric_line_alpha(
+    shape: tuple[int, int],
+    points: list[tuple[int, int]],
+    *,
+    width: int = 1,
+    antialias: bool = False,
+) -> np.ndarray:
+    h, w = shape
+    if antialias:
+        return _draw_antialiased_alpha(
+            shape,
+            lambda draw, scale: draw.line(
+                [(int(x * scale), int(y * scale)) for x, y in points],
+                fill=255,
+                width=max(1, int(width * scale)),
+            ),
+            scale=6,
+        )
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).line(points, fill=255, width=max(1, int(width)))
+    return np.asarray(mask, dtype=np.float32) / 255.0
+
+
+def _geometric_ring_alpha(
+    shape: tuple[int, int],
+    outer_box: tuple[int, int, int, int],
+    inner_box: tuple[int, int, int, int],
+) -> np.ndarray:
+    outer = _draw_antialiased_alpha(
+        shape,
+        lambda draw, scale: draw.ellipse([int(v * scale) for v in outer_box], fill=255),
+        scale=6,
+    )
+    inner = _draw_antialiased_alpha(
+        shape,
+        lambda draw, scale: draw.ellipse([int(v * scale) for v in inner_box], fill=255),
+        scale=6,
+    )
+    return np.clip(outer - inner, 0.0, 1.0)
+
+
+def _geometric_expected_rgba(expected_rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    alpha_u8 = np.rint(np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgba = np.zeros((*alpha_u8.shape, 4), dtype=np.uint8)
+    visible = alpha_u8 > 0
+    rgba[visible, :3] = expected_rgb[visible]
+    rgba[:, :, 3] = alpha_u8
+    return rgba
+
+
+def generate_geometric_benchmark_asset() -> GeometricBenchmarkAsset:
+    shape = (360, 520)
+    h, w = shape
+    alpha = np.zeros(shape, dtype=np.float32)
+    foreground = np.zeros((h, w, 3), dtype=np.uint8)
+    key_color_region = np.zeros(shape, dtype=bool)
+    feature_masks: dict[str, np.ndarray] = {}
+
+    def feature(name: str) -> np.ndarray:
+        if name not in feature_masks:
+            feature_masks[name] = np.zeros(shape, dtype=bool)
+        return feature_masks[name]
+
+    def add_region(
+        region_alpha: np.ndarray,
+        color: tuple[int, int, int],
+        names: tuple[str, ...],
+        color_feature: str | None = None,
+        *,
+        key_colored: bool = False,
+    ) -> None:
+        visible = np.asarray(region_alpha, dtype=np.float32) > (0.5 / 255.0)
+        if not np.any(visible):
+            return
+        region = np.clip(region_alpha.astype(np.float32), 0.0, 1.0)
+        replace_pixels = visible & (region >= alpha)
+        alpha[visible] = np.maximum(alpha[visible], region[visible])
+        for group_name in GEOMETRIC_COLOR_FEATURES:
+            if group_name in feature_masks:
+                feature_masks[group_name][replace_pixels] = False
+        foreground[replace_pixels] = np.asarray(color, dtype=np.uint8)
+        for name in names:
+            feature(name)[visible] = True
+        if color_feature is not None:
+            feature(color_feature)[replace_pixels] = True
+        if key_colored:
+            key_color_region[replace_pixels] = True
+
+    # Hard-edged opaque solids and color groups.
+    hard_red = np.zeros(shape, dtype=np.float32)
+    hard_red[28:112, 30:128] = 1.0
+    add_region(hard_red, (230, 34, 28), ("hard_edges",), "foreground_color_red")
+
+    hard_yellow = np.zeros(shape, dtype=np.float32)
+    hard_yellow[34:122, 146:238] = 1.0
+    hard_yellow[70:96, 184:238] = 0.0
+    add_region(hard_yellow, (245, 214, 36), ("hard_edges",), "foreground_color_yellow")
+
+    # Opaque plate with true holes and key-colored foreground islands.
+    panel = np.zeros(shape, dtype=np.float32)
+    panel[134:238, 28:202] = 1.0
+    add_region(panel, (164, 164, 164), ("hard_edges", "holes_interior_key_regions"), "foreground_color_gray")
+    holes = (
+        _geometric_circle_mask(shape, 76, 182, 18)
+        | _geometric_circle_mask(shape, 118, 205, 10)
+        | ((np.indices(shape)[0] >= 154) & (np.indices(shape)[0] < 171) & (np.indices(shape)[1] >= 156) & (np.indices(shape)[1] < 184))
+    )
+    holes &= panel > 0
+    alpha[holes] = 0.0
+    foreground[holes] = 0
+    key_color_region[holes] = False
+    for group_name in GEOMETRIC_COLOR_FEATURES:
+        if group_name in feature_masks:
+            feature_masks[group_name][holes] = False
+    for name in ("holes", "holes_interior_key_regions"):
+        feature(name)[holes] = True
+
+    key_island = (_geometric_circle_mask(shape, 158, 178, 15) | ((np.indices(shape)[0] >= 207) & (np.indices(shape)[0] < 226) & (np.indices(shape)[1] >= 132) & (np.indices(shape)[1] < 190)))
+    key_island &= panel > 0
+    add_region(
+        key_island.astype(np.float32),
+        (0, 0, 0),
+        ("interior_key_colored", "holes_interior_key_regions", "hard_edges"),
+        "foreground_color_key",
+        key_colored=True,
+    )
+
+    # Analytic transparency ramps over several foreground colors.
+    ramp = np.linspace(0.08, 0.92, w, dtype=np.float32)
+    for y0, y1, color, color_name in (
+        (256, 274, (232, 42, 34), "foreground_color_red"),
+        (280, 298, (255, 255, 255), "foreground_color_white"),
+        (304, 322, (3, 3, 3), "foreground_color_black"),
+        (328, 344, (70, 70, 220), "foreground_color_saturated"),
+    ):
+        band = np.zeros(shape, dtype=np.float32)
+        band[y0:y1, 26:246] = ramp[26:246]
+        add_region(band, color, ("transparency_bands",), color_name)
+
+    # Deterministic dots and speckles: sub-3px details, mixed alpha, mixed colors.
+    rng = np.random.default_rng(20260519)
+    dot_colors = [
+        ((255, 255, 255), "foreground_color_white"),
+        ((2, 2, 2), "foreground_color_black"),
+        ((230, 40, 32), "foreground_color_red"),
+        ((250, 214, 28), "foreground_color_yellow"),
+        ((34, 208, 230), "foreground_color_saturated"),
+    ]
+    for index in range(86):
+        cx = int(rng.integers(284, 504))
+        cy = int(rng.integers(30, 134))
+        radius = int(rng.choice(np.asarray([1, 1, 1, 2, 2, 3], dtype=np.int32)))
+        dot_alpha = 0.52 if index % 7 == 0 else 1.0
+        color, color_name = dot_colors[index % len(dot_colors)]
+        add_region(
+            _geometric_circle_mask(shape, cx, cy, radius).astype(np.float32) * dot_alpha,
+            color,
+            ("dots_speckles",),
+            color_name,
+        )
+
+    # Single- and two-pixel barcode strokes.
+    line1_white = np.zeros(shape, dtype=np.float32)
+    line1_black = np.zeros(shape, dtype=np.float32)
+    line1_red = np.zeros(shape, dtype=np.float32)
+    for idx, x in enumerate(range(280, 360, 6)):
+        target = (line1_white, line1_black, line1_red)[idx % 3]
+        target[154:238, x] = 1.0
+    for idx, y in enumerate(range(160, 236, 9)):
+        target = (line1_white, line1_black, line1_red)[(idx + 1) % 3]
+        target[y, 366:504] = 1.0
+    add_region(line1_white, (255, 255, 255), ("lines_1px", "hard_edges"), "foreground_color_white")
+    add_region(line1_black, (0, 0, 0), ("lines_1px", "hard_edges"), "foreground_color_black")
+    add_region(line1_red, (230, 36, 32), ("lines_1px", "hard_edges"), "foreground_color_red")
+
+    line2_yellow = np.zeros(shape, dtype=np.float32)
+    line2_sat = np.zeros(shape, dtype=np.float32)
+    for idx, x in enumerate(range(276, 506, 14)):
+        target = line2_yellow if idx % 2 == 0 else line2_sat
+        target[244:322, x : x + 2] = 1.0
+    for idx, y in enumerate(range(250, 324, 14)):
+        target = line2_sat if idx % 2 == 0 else line2_yellow
+        target[y : y + 2, 276:506] = 1.0
+    add_region(line2_yellow, (248, 210, 36), ("lines_2px", "hard_edges"), "foreground_color_yellow")
+    add_region(line2_sat, (40, 210, 228), ("lines_2px", "hard_edges"), "foreground_color_saturated")
+
+    diagonal_hard = _geometric_line_alpha(shape, [(282, 332), (506, 250)], width=1)
+    add_region(diagonal_hard, (255, 255, 255), ("diagonal_lines", "lines_1px", "hard_edges"), "foreground_color_white")
+    diagonal_wide = _geometric_line_alpha(shape, [(284, 252), (505, 336)], width=2)
+    add_region(diagonal_wide, (0, 0, 0), ("diagonal_lines", "lines_2px", "hard_edges"), "foreground_color_black")
+    diagonal_soft = _geometric_line_alpha(shape, [(270, 142), (506, 224)], width=4, antialias=True)
+    add_region(diagonal_soft, (236, 44, 172), ("diagonal_lines", "anti_aliased_edges"), "foreground_color_saturated")
+
+    # Anti-aliased rings and curves generated by supersampling/downsampling.
+    ring = _geometric_ring_alpha(shape, (330, 246, 488, 344), (356, 270, 462, 320))
+    add_region(ring, (244, 210, 42), ("curves_rings", "anti_aliased_edges"), "foreground_color_yellow")
+
+    ellipse = _draw_antialiased_alpha(
+        shape,
+        lambda draw, scale: draw.ellipse([int(v * scale) for v in (342, 138, 492, 224)], fill=255),
+        scale=6,
+    )
+    add_region(ellipse, (186, 186, 186), ("curves_rings", "anti_aliased_edges"), "foreground_color_gray")
+
+    arc = _draw_antialiased_alpha(
+        shape,
+        lambda draw, scale: draw.arc(
+            [int(v * scale) for v in (238, 20, 506, 210)],
+            start=188,
+            end=342,
+            fill=255,
+            width=max(1, int(5 * scale)),
+        ),
+        scale=6,
+    )
+    add_region(arc, (255, 255, 255), ("curves_rings", "anti_aliased_edges"), "foreground_color_white")
+
+    transition_pixels = (alpha > 0.002) & (alpha < 0.998) & ~feature("transparency_bands")
+    feature("anti_aliased_edges")[transition_pixels] = True
+    key_color_region &= alpha > 0.0
+
+    ordered_names = GEOMETRIC_PRIMARY_FEATURES + GEOMETRIC_COLOR_FEATURES + ("holes_interior_key_regions",)
+    ordered_masks = {name: feature_masks[name] for name in ordered_names if name in feature_masks and np.any(feature_masks[name])}
+    return GeometricBenchmarkAsset(
+        name="geometric_asset_v1",
+        alpha=alpha,
+        foreground_rgb_template=foreground,
+        key_color_region=key_color_region,
+        feature_masks=ordered_masks,
+        primary_feature_order=GEOMETRIC_PRIMARY_FEATURES,
+        notes="Deterministic synthetic RGBA geometry fixture with analytic/supersampled alpha and per-feature masks.",
+    )
+
+
+def _geometric_benchmark_settings(key_color: tuple[int, int, int]) -> KeySettings:
+    return KeySettings(
+        key_color=key_color,
+        tolerance=0.45,
+        softness=0.01,
+        edge_blur=(32 - 1) / 4.0,
+        cleanup=0,
+        despill=0.70,
+        sample_size=10,
+        auto_border_sample=True,
+        auto_detect_key_color=False,
+        clip_background=0.97,
+        clip_foreground=0.00,
+        matte_gamma=2.20,
+        core_strength=0.38,
+        edge_refine_radius=32,
+        edge_softness=0.00,
+        erode_expand=-8,
+        despeckle_min_area=0,
+        aggressive_interior_removal=True,
+        decontaminate=0.50,
+        luminance_restore=0.76,
+        luminance_protect=0.76,
+        fringe_remove=0.75,
+        edge_color_repair=0.65,
+        inner_color_pull=0.45,
+        fringe_band_radius=3,
+        transition_unmix=True,
+        alpha_recover_strength=0.85,
+        key_vector_despill=0.75,
+        foreground_reference_pull=0.65,
+        gpu_acceleration="Off",
+    )
+
+
+def _geometric_background(
+    shape: tuple[int, int],
+    key_color: tuple[int, int, int],
+    *,
+    uneven: bool,
+) -> np.ndarray:
+    h, w = shape
+    background = np.zeros((h, w, 3), dtype=np.uint8)
+    background[:, :] = np.asarray(key_color, dtype=np.uint8)
+    if not uneven:
+        return background
+    x_grad = np.linspace(-1.0, 1.0, w, dtype=np.float32).reshape(1, w)
+    y_grad = np.linspace(-1.0, 1.0, h, dtype=np.float32).reshape(h, 1)
+    base = np.asarray(key_color, dtype=np.float32).reshape(1, 1, 3)
+    uneven_rgb = np.zeros((h, w, 3), dtype=np.float32)
+    uneven_rgb[:, :, 0] = base[:, :, 0] + 8.0 * x_grad + 5.0 * y_grad
+    uneven_rgb[:, :, 1] = base[:, :, 1] + 24.0 * x_grad + 15.0 * y_grad
+    uneven_rgb[:, :, 2] = base[:, :, 2] - 20.0 * x_grad + 12.0 * y_grad
+    return np.clip(uneven_rgb, 0, 255).astype(np.uint8)
+
+
+def geometric_benchmark_cases() -> list[GeometricBenchmarkCase]:
+    asset = generate_geometric_benchmark_asset()
+    specs = [
+        ("blue_flat", (30, 80, 235), False),
+        ("green_flat", (0, 220, 50), False),
+        ("cyan_flat", (0, 190, 210), False),
+        ("blue_uneven_gradient", (30, 80, 235), True),
+        ("green_uneven_gradient", (0, 220, 50), True),
+        ("cyan_uneven_gradient", (0, 190, 210), True),
+    ]
+    cases: list[GeometricBenchmarkCase] = []
+    for background_name, key_color, uneven in specs:
+        expected_foreground = asset.foreground_rgb_template.copy()
+        expected_foreground[asset.key_color_region] = np.asarray(key_color, dtype=np.uint8)
+        background = _geometric_background(asset.alpha.shape, key_color, uneven=uneven)
+        source = _composite_rgb_linear(background, expected_foreground, asset.alpha)
+        expected_rgba = _geometric_expected_rgba(expected_foreground, asset.alpha)
+        case_name = f"geometric_{background_name}"
+        cases.append(
+            GeometricBenchmarkCase(
+                name=case_name,
+                background_name=background_name,
+                key_color=key_color,
+                background_rgb=background,
+                source_rgb=source,
+                expected_alpha=asset.alpha,
+                expected_foreground_rgb=expected_foreground,
+                expected_rgba=expected_rgba,
+                feature_masks=asset.feature_masks,
+                settings=_geometric_benchmark_settings(key_color),
+                notes=f"{asset.notes} Background: {background_name}.",
+            )
+        )
+    return cases
+
+
+def _geometric_alpha_metrics(expected_alpha: np.ndarray, actual_alpha: np.ndarray, mask: np.ndarray) -> dict[str, int | float]:
+    mask = mask.astype(bool, copy=False)
+    if not np.any(mask):
+        return {
+            "count": 0,
+            "alpha_mae": 0.0,
+            "alpha_mae_u8": 0.0,
+            "alpha_max_abs_error": 0,
+            "alpha_precision": 1.0,
+            "alpha_recall": 1.0,
+            "false_background_loss_pixels": 0,
+            "false_foreground_leak_pixels": 0,
+            "false_background_leak_pixels": 0,
+            "false_background_loss_rate": 0.0,
+            "false_foreground_leak_rate": 0.0,
+        }
+    expected_u8 = np.rint(np.clip(expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    expected = expected_u8[mask].astype(np.int16)
+    actual = actual_alpha[mask].astype(np.int16)
+    abs_delta = np.abs(actual - expected)
+    expected_visible = expected > 0
+    actual_visible = actual > 0
+    true_positive = expected_visible & actual_visible
+    false_loss = expected_visible & ~actual_visible
+    false_leak = ~expected_visible & actual_visible
+    expected_visible_count = int(np.count_nonzero(expected_visible))
+    actual_visible_count = int(np.count_nonzero(actual_visible))
+    expected_background_count = int(expected.size - expected_visible_count)
+    return {
+        "count": int(expected.size),
+        "alpha_mae": float(np.mean(abs_delta) / 255.0),
+        "alpha_mae_u8": float(np.mean(abs_delta)),
+        "alpha_max_abs_error": int(abs_delta.max()),
+        "alpha_precision": float(np.count_nonzero(true_positive) / actual_visible_count) if actual_visible_count else 1.0,
+        "alpha_recall": float(np.count_nonzero(true_positive) / expected_visible_count) if expected_visible_count else 1.0,
+        "false_background_loss_pixels": int(np.count_nonzero(false_loss)),
+        "false_foreground_leak_pixels": int(np.count_nonzero(false_leak)),
+        "false_background_leak_pixels": int(np.count_nonzero(false_leak)),
+        "false_background_loss_rate": float(np.count_nonzero(false_loss) / expected_visible_count) if expected_visible_count else 0.0,
+        "false_foreground_leak_rate": float(np.count_nonzero(false_leak) / expected_background_count) if expected_background_count else 0.0,
+    }
+
+
+def _geometric_rgb_error(
+    result_rgba: np.ndarray,
+    expected_rgb: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, int | float]:
+    mask = mask.astype(bool, copy=False)
+    if not np.any(mask):
+        return {"count": 0, "mean_abs_error": 0.0, "max_abs_error": 0, "mean_l2_error": 0.0}
+    delta = np.abs(result_rgba[mask, :3].astype(np.int16) - expected_rgb[mask].astype(np.int16))
+    l2 = np.linalg.norm(delta.astype(np.float32), axis=1)
+    return {
+        "count": int(delta.shape[0]),
+        "mean_abs_error": float(np.mean(delta)),
+        "max_abs_error": int(delta.max()),
+        "mean_l2_error": float(np.mean(l2)),
+    }
+
+
+def _geometric_region_metrics(
+    case: GeometricBenchmarkCase,
+    result: KeyResult,
+    mask: np.ndarray,
+) -> dict[str, Any]:
+    expected_u8 = np.rint(np.clip(case.expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    mask = mask.astype(bool, copy=False)
+    translucent = mask & (expected_u8 > 0) & (expected_u8 < 255) & (result.alpha > 0)
+    visible = mask & (expected_u8 > 0) & (result.alpha > 0)
+    core = mask & (expected_u8 >= 254) & (result.alpha >= 250)
+    return {
+        "alpha": _geometric_alpha_metrics(case.expected_alpha, result.alpha, mask),
+        "rgb_error_visible": _geometric_rgb_error(result.rgba, case.expected_foreground_rgb, visible),
+        "rgb_error_translucent": _geometric_rgb_error(result.rgba, case.expected_foreground_rgb, translucent),
+        "foreground_core_rgb_delta": _geometric_rgb_error(result.rgba, case.expected_foreground_rgb, core),
+        "composite_error": composite_black_white_gray_error(result.rgba, case.expected_rgba, mask),
+    }
+
+
+def _geometric_masked_recall(case: GeometricBenchmarkCase, result: KeyResult, mask: np.ndarray) -> dict[str, int | float]:
+    expected = np.where(mask.astype(bool, copy=False), case.expected_alpha, 0.0)
+    return alpha_detail_recall(expected, result.alpha)
+
+
+def _geometric_case_metrics(case: GeometricBenchmarkCase, result: KeyResult) -> dict[str, Any]:
+    shape = case.expected_alpha.shape
+    whole = np.ones(shape, dtype=bool)
+    background = case.expected_alpha <= 0.002
+    anti_edge = case.feature_masks.get("anti_aliased_edges", np.zeros(shape, dtype=bool))
+    curves = case.feature_masks.get("curves_rings", np.zeros(shape, dtype=bool))
+    edge_mask = anti_edge | curves
+    thin_mask = (
+        case.feature_masks.get("lines_1px", np.zeros(shape, dtype=bool))
+        | case.feature_masks.get("lines_2px", np.zeros(shape, dtype=bool))
+        | case.feature_masks.get("diagonal_lines", np.zeros(shape, dtype=bool))
+    )
+    dots_mask = case.feature_masks.get("dots_speckles", np.zeros(shape, dtype=bool))
+    feature_metrics = {
+        name: _geometric_region_metrics(case, result, mask)
+        for name, mask in case.feature_masks.items()
+        if np.any(mask)
+    }
+    return {
+        "shape": list(case.source_rgb.shape),
+        "settings": asdict(case.settings),
+        "feature_counts": {name: int(np.count_nonzero(mask)) for name, mask in case.feature_masks.items()},
+        "whole": _geometric_region_metrics(case, result, whole),
+        "features": feature_metrics,
+        "thin_line_recall": _geometric_masked_recall(case, result, thin_mask),
+        "dot_preservation": _geometric_masked_recall(case, result, dots_mask),
+        "background_leak": background_alpha_leak(result.alpha, background),
+        "edge_key_color_residual": edge_key_residual(result.rgba, case.key_color, edge_mask),
+        "transparent_rgb_residual": transparent_rgb_zero(result.rgba),
+        "result_gpu_acceleration": result.gpu_acceleration,
+    }
+
+
+def _geometric_alpha_diff_heatmap(actual_alpha: np.ndarray, expected_alpha: np.ndarray) -> np.ndarray:
+    expected_u8 = np.rint(np.clip(expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    delta = actual_alpha.astype(np.int16) - expected_u8.astype(np.int16)
+    positive = np.clip(delta, 0, 255).astype(np.uint8)
+    negative = np.clip(-delta, 0, 255).astype(np.uint8)
+    magnitude = np.clip(np.abs(delta), 0, 255).astype(np.uint8)
+    heat = np.zeros((*actual_alpha.shape, 3), dtype=np.uint8)
+    heat[:, :, 0] = positive
+    heat[:, :, 1] = magnitude // 2
+    heat[:, :, 2] = negative
+    return heat
+
+
+def _geometric_rgb_diff_heatmap(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    delta = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+    magnitude = np.clip(np.mean(delta, axis=2) * 4.0, 0, 255).astype(np.uint8)
+    heat = np.zeros_like(actual)
+    heat[:, :, 0] = magnitude
+    heat[:, :, 1] = magnitude // 3
+    return heat
+
+
+def _geometric_error_overlay(source: np.ndarray, actual_alpha: np.ndarray, expected_alpha: np.ndarray) -> np.ndarray:
+    expected_u8 = np.rint(np.clip(expected_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    overlay = source.copy()
+    loss = (expected_u8 > 0) & (actual_alpha == 0)
+    leak = (expected_u8 == 0) & (actual_alpha > 0)
+    large = np.abs(actual_alpha.astype(np.int16) - expected_u8.astype(np.int16)) > 48
+    overlay[large] = (255, 210, 0)
+    overlay[loss] = (255, 0, 0)
+    overlay[leak] = (0, 96, 255)
+    return overlay
+
+
+def _write_geometric_feature_artifacts(asset: GeometricBenchmarkAsset) -> None:
+    masks_path = GEOMETRIC_BENCHMARK_DIR / "geometric_feature_masks.npz"
+    np.savez_compressed(
+        masks_path,
+        **{name: mask.astype(np.uint8) for name, mask in asset.feature_masks.items()},
+    )
+    labels = np.zeros(asset.alpha.shape, dtype=np.uint8)
+    for index, name in enumerate(asset.primary_feature_order, start=1):
+        mask = asset.feature_masks.get(name)
+        if mask is not None:
+            labels[(labels == 0) & mask] = index
+    label_colors = np.asarray(
+        [
+            (0, 0, 0),
+            (255, 128, 0),
+            (255, 255, 0),
+            (255, 255, 255),
+            (190, 190, 190),
+            (255, 0, 180),
+            (0, 220, 255),
+            (140, 80, 255),
+            (0, 180, 80),
+            (255, 0, 0),
+            (0, 100, 255),
+        ],
+        dtype=np.uint8,
+    )
+    label_rgb = label_colors[np.clip(labels, 0, len(label_colors) - 1)]
+    _save_rgb(GEOMETRIC_BENCHMARK_DIR / "geometric_feature_labels.png", label_rgb)
+    (GEOMETRIC_BENCHMARK_DIR / "geometric_feature_labels.json").write_text(
+        json.dumps(
+            {
+                "asset": asset.name,
+                "primary_labels": {str(index): name for index, name in enumerate(asset.primary_feature_order, start=1)},
+                "feature_counts": {name: int(np.count_nonzero(mask)) for name, mask in asset.feature_masks.items()},
+                "masks_npz": masks_path.name,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_geometric_case_artifacts(case: GeometricBenchmarkCase, result: KeyResult) -> None:
+    prefix = GEOMETRIC_BENCHMARK_DIR / case.name
+    _save_rgb(prefix.with_name(f"{case.name}_source.png"), case.source_rgb)
+    _save_rgb(prefix.with_name(f"{case.name}_background.png"), case.background_rgb)
+    _save_rgba(prefix.with_name(f"{case.name}_expected_result.png"), case.expected_rgba)
+    _save_mask(prefix.with_name(f"{case.name}_expected_alpha.png"), case.expected_rgba[:, :, 3])
+    expected_foreground_preview = case.expected_foreground_rgb.copy()
+    expected_foreground_preview[case.expected_rgba[:, :, 3] == 0] = 0
+    _save_rgb(prefix.with_name(f"{case.name}_expected_foreground.png"), expected_foreground_preview)
+
+    _save_rgba(prefix.with_name(f"{case.name}_imgkey_result.png"), result.rgba)
+    _save_mask(prefix.with_name(f"{case.name}_imgkey_alpha.png"), result.alpha)
+    _save_rgb(prefix.with_name(f"{case.name}_alpha_diff_heatmap.png"), _geometric_alpha_diff_heatmap(result.alpha, case.expected_alpha))
+    _save_rgb(prefix.with_name(f"{case.name}_error_overlay.png"), _geometric_error_overlay(case.source_rgb, result.alpha, case.expected_alpha))
+
+    for background_name, color in (("black", (0, 0, 0)), ("white", (255, 255, 255)), ("gray", (128, 128, 128)), ("checker", None)):
+        actual = checkerboard_composite(result.rgba) if color is None else _solid_composite(result.rgba, color)
+        expected = checkerboard_composite(case.expected_rgba) if color is None else _solid_composite(case.expected_rgba, color)
+        _save_rgb(prefix.with_name(f"{case.name}_imgkey_on_{background_name}.png"), actual)
+        _save_rgb(prefix.with_name(f"{case.name}_expected_on_{background_name}.png"), expected)
+        _save_rgb(prefix.with_name(f"{case.name}_diff_on_{background_name}.png"), _geometric_rgb_diff_heatmap(actual, expected))
+        _save_rgb(prefix.with_name(f"{case.name}_compare_on_{background_name}.png"), np.concatenate([expected, actual], axis=1))
+
+
+def _geometric_gpu_parity(cases: list[GeometricBenchmarkCase]) -> dict[str, Any]:
+    gpu_accel = importlib.import_module("gpu_accel")
+    availability = gpu_accel.is_available(refresh=True)
+    parity: dict[str, Any] = {
+        "backend": {"id": "compact_cuda_dll", "name": "compact CUDA DLL"},
+        "availability": availability,
+        "status": "skipped",
+        "reason": availability.get("reason"),
+        "message": availability.get("message"),
+        "cases": {},
+    }
+    if not availability.get("available"):
+        return parity
+
+    max_rgba_diff = 0
+    max_alpha_diff = 0
+    used_case_count = 0
+    for case in cases:
+        parity_cpu_settings = replace(
+            case.settings,
+            auto_border_sample=False,
+            local_screen_model=False,
+            gpu_acceleration="Off",
+        )
+        parity_gpu_settings = replace(parity_cpu_settings, gpu_acceleration="Force GPU")
+        cpu_result = process_key_image(case.source_rgb, parity_cpu_settings)
+        gpu_result = process_key_image(case.source_rgb, parity_gpu_settings)
+        cpu_metrics = _geometric_case_metrics(case, cpu_result)
+        gpu_metrics = _geometric_case_metrics(case, gpu_result)
+        diff = np.abs(cpu_result.rgba.astype(np.int16) - gpu_result.rgba.astype(np.int16))
+        case_rgba_diff = int(diff.max())
+        case_alpha_diff = int(diff[:, :, 3].max())
+        gpu_stats = gpu_result.gpu_acceleration or {}
+        used_tiles = int(gpu_stats.get("used_tiles", 0)) if isinstance(gpu_stats, dict) else 0
+        used_case_count += int(used_tiles > 0)
+        max_rgba_diff = max(max_rgba_diff, case_rgba_diff)
+        max_alpha_diff = max(max_alpha_diff, case_alpha_diff)
+        parity["cases"][case.name] = {
+            "max_rgba_diff_vs_cpu": case_rgba_diff,
+            "max_alpha_diff_vs_cpu": case_alpha_diff,
+            "used_tiles": used_tiles,
+            "gpu_acceleration": gpu_stats,
+            "metric_deltas_vs_cpu": {
+                "alpha_mae": float(gpu_metrics["whole"]["alpha"]["alpha_mae"] - cpu_metrics["whole"]["alpha"]["alpha_mae"]),
+                "thin_line_visible_recall": float(gpu_metrics["thin_line_recall"]["visible_recall"] - cpu_metrics["thin_line_recall"]["visible_recall"]),
+                "dot_visible_recall": float(gpu_metrics["dot_preservation"]["visible_recall"] - cpu_metrics["dot_preservation"]["visible_recall"]),
+            },
+        }
+
+    parity.update(
+        {
+            "status": "measured",
+            "reason": None,
+            "message": "Geometry CPU/GPU parity completed.",
+            "within_tolerance": bool(max_rgba_diff <= 2 and max_alpha_diff <= 1 and used_case_count > 0),
+            "max_rgba_diff_vs_cpu": max_rgba_diff,
+            "max_alpha_diff_vs_cpu": max_alpha_diff,
+            "cases_with_gpu_tiles": used_case_count,
+        }
+    )
+    return parity
+
+
+def _geometric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
+    case_records = metrics["cases"]
+    case_summaries: dict[str, Any] = {}
+    alpha_mae_values: list[float] = []
+    thin_values: list[float] = []
+    dot_values: list[float] = []
+    total_background_leak = 0
+    worst_alpha_case = None
+    worst_alpha_value = -1.0
+    for case_name, record in case_records.items():
+        case_metrics = record["metrics"]
+        alpha_mae = float(case_metrics["whole"]["alpha"]["alpha_mae"])
+        thin_recall = float(case_metrics["thin_line_recall"]["visible_recall"])
+        dot_recall = float(case_metrics["dot_preservation"]["visible_recall"])
+        leak_pixels = int(case_metrics["background_leak"]["leaking_pixels"])
+        alpha_mae_values.append(alpha_mae)
+        thin_values.append(thin_recall)
+        dot_values.append(dot_recall)
+        total_background_leak += leak_pixels
+        if alpha_mae > worst_alpha_value:
+            worst_alpha_value = alpha_mae
+            worst_alpha_case = case_name
+        case_summaries[case_name] = {
+            "alpha_mae": alpha_mae,
+            "alpha_precision": case_metrics["whole"]["alpha"]["alpha_precision"],
+            "alpha_recall": case_metrics["whole"]["alpha"]["alpha_recall"],
+            "thin_line_visible_recall": thin_recall,
+            "dot_visible_recall": dot_recall,
+            "background_leaking_pixels": leak_pixels,
+            "foreground_core_rgb_mean_abs_error": case_metrics["whole"]["foreground_core_rgb_delta"]["mean_abs_error"],
+            "edge_key_residual_p95": case_metrics["edge_key_color_residual"]["p95_positive_excess"],
+            "transparent_rgb_max": case_metrics["transparent_rgb_residual"]["max_rgb_when_transparent"],
+        }
+    return {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --write-geometric-benchmark",
+        "artifact_dir": str(GEOMETRIC_BENCHMARK_DIR),
+        "case_count": len(case_records),
+        "feature_counts": metrics["feature_counts"],
+        "aggregate": {
+            "alpha_mae_mean": float(np.mean(alpha_mae_values)) if alpha_mae_values else 0.0,
+            "alpha_mae_max": float(np.max(alpha_mae_values)) if alpha_mae_values else 0.0,
+            "worst_alpha_case": worst_alpha_case,
+            "thin_line_visible_recall_min": float(np.min(thin_values)) if thin_values else 1.0,
+            "dot_visible_recall_min": float(np.min(dot_values)) if dot_values else 1.0,
+            "background_leaking_pixels_total": total_background_leak,
+        },
+        "gpu_parity": metrics["gpu_parity"],
+        "cases": case_summaries,
+    }
+
+
+def write_geometric_benchmark() -> None:
+    GEOMETRIC_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"writing geometric benchmark diagnostics to {GEOMETRIC_BENCHMARK_DIR}")
+    asset = generate_geometric_benchmark_asset()
+    cases = geometric_benchmark_cases()
+    _write_geometric_feature_artifacts(asset)
+    all_metrics: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --write-geometric-benchmark",
+        "asset": asset.name,
+        "notes": asset.notes,
+        "feature_counts": {name: int(np.count_nonzero(mask)) for name, mask in asset.feature_masks.items()},
+        "feature_mask_artifact": "geometric_feature_masks.npz",
+        "feature_label_artifact": "geometric_feature_labels.png",
+        "cases": {},
+        "gpu_parity": None,
+    }
+
+    for case in cases:
+        result = process_key_image(case.source_rgb, case.settings)
+        metrics = _geometric_case_metrics(case, result)
+        all_metrics["cases"][case.name] = {
+            "background_name": case.background_name,
+            "key_color": case.key_color,
+            "notes": case.notes,
+            "metrics": metrics,
+            "artifacts": {
+                "source": f"{case.name}_source.png",
+                "expected_alpha": f"{case.name}_expected_alpha.png",
+                "expected_foreground": f"{case.name}_expected_foreground.png",
+                "imgkey_result": f"{case.name}_imgkey_result.png",
+                "imgkey_alpha": f"{case.name}_imgkey_alpha.png",
+                "alpha_diff_heatmap": f"{case.name}_alpha_diff_heatmap.png",
+                "error_overlay": f"{case.name}_error_overlay.png",
+            },
+        }
+        _write_geometric_case_artifacts(case, result)
+        print(
+            f"geometric {case.name}: alpha_mae={metrics['whole']['alpha']['alpha_mae']:.4f} "
+            f"thin_recall={metrics['thin_line_recall']['visible_recall']:.3f} "
+            f"dot_recall={metrics['dot_preservation']['visible_recall']:.3f} "
+            f"bg_leak={metrics['background_leak']['leaking_pixels']}"
+        )
+
+    all_metrics["gpu_parity"] = _geometric_gpu_parity(cases)
+    summary = _geometric_summary(all_metrics)
+    metrics_path = GEOMETRIC_BENCHMARK_DIR / "metrics.json"
+    summary_path = GEOMETRIC_BENCHMARK_DIR / "summary.json"
+    metrics_path.write_text(json.dumps(_json_ready(all_metrics), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path.write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"wrote geometric benchmark metrics to {metrics_path}")
+    print(f"wrote geometric benchmark summary to {summary_path}")
+
+
 def run_app_ui_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -3792,6 +4572,7 @@ def main(argv: list[str] | None = None) -> None:
         "--write-edge-repair-diagnostics",
         "--write-algorithm-baseline",
         "--write-transition-unmix-diagnostics",
+        "--write-geometric-benchmark",
         "--gpu-parity",
         "--gpu-benchmark",
     }
@@ -3799,7 +4580,8 @@ def main(argv: list[str] | None = None) -> None:
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--gpu-parity] [--gpu-benchmark]; "
+            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--write-geometric-benchmark] "
+            "[--gpu-parity] [--gpu-benchmark]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -3810,6 +4592,7 @@ def main(argv: list[str] | None = None) -> None:
     run_v4_edge_repair_tests()
     run_transition_unmix_baseline_tests()
     if not writing_algorithm_baseline:
+        ensure_algorithm_upgrade_baseline()
         run_phase2_linear_color_tests()
         run_phase3_guided_alpha_tests()
         run_phase4_tile_local_screen_tests()
@@ -3831,6 +4614,8 @@ def main(argv: list[str] | None = None) -> None:
         write_algorithm_upgrade_baseline()
     if "--write-transition-unmix-diagnostics" in args:
         write_transition_unmix_diagnostics()
+    if "--write-geometric-benchmark" in args:
+        write_geometric_benchmark()
     if "--gpu-parity" in args:
         run_gpu_parity_tests()
     if "--gpu-benchmark" in args:
