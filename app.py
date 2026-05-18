@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QSplashScreen,
     QStatusBar,
     QTextEdit,
     QToolBar,
@@ -108,6 +109,56 @@ APP_DEFAULT_SETTINGS = KeySettings(
     inner_color_pull=0.45,
     fringe_band_radius=3,
 )
+
+
+def update_boot_splash(message: str) -> None:
+    """Update PyInstaller's boot splash when the frozen onefile build has it."""
+
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+
+        pyi_splash.update_text(str(message))
+    except Exception:
+        pass
+
+
+def close_boot_splash() -> None:
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
+def create_qt_startup_splash() -> QSplashScreen:
+    pixmap = QPixmap(560, 300)
+    pixmap.fill(QColor("#0B0D10"))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.fillRect(0, 0, 560, 300, QColor("#0B0D10"))
+    painter.fillRect(0, 0, 560, 5, QColor("#47D18C"))
+    painter.setPen(QColor("#E7ECF3"))
+    title_font = painter.font()
+    title_font.setPointSize(28)
+    title_font.setBold(True)
+    painter.setFont(title_font)
+    painter.drawText(34, 88, "ImgKey")
+    subtitle_font = painter.font()
+    subtitle_font.setPointSize(12)
+    subtitle_font.setBold(False)
+    painter.setFont(subtitle_font)
+    painter.setPen(QColor("#AAB4C2"))
+    painter.drawText(36, 122, "Large image chroma keyer")
+    painter.drawText(36, 156, "Loading interface and controls…")
+    painter.setPen(QColor("#47D18C"))
+    painter.drawRoundedRect(36, 196, 488, 12, 6, 6)
+    painter.fillRect(38, 198, 180, 8, QColor("#47D18C"))
+    painter.end()
+    splash = QSplashScreen(pixmap)
+    splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    splash.showMessage("Starting ImgKey…", Qt.AlignLeft | Qt.AlignBottom, QColor("#E7ECF3"))
+    return splash
 
 
 def app_default_settings() -> KeySettings:
@@ -2567,13 +2618,25 @@ def main(argv: list[str] | None = None) -> int:
     if headless_result is not None:
         return headless_result
 
+    update_boot_splash("Loading Qt runtime…")
     app = QApplication(argv)
     app.setApplicationName("ImgKey")
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor("#0B0D10"))
     app.setPalette(palette)
+    qt_splash = create_qt_startup_splash()
+    qt_splash.show()
+    app.processEvents()
+    update_boot_splash("Building ImgKey interface…")
+    qt_splash.showMessage("Building ImgKey interface…", Qt.AlignLeft | Qt.AlignBottom, QColor("#E7ECF3"))
+    app.processEvents()
     window = MainWindow()
+    update_boot_splash("Showing ImgKey window…")
+    qt_splash.showMessage("Showing ImgKey window…", Qt.AlignLeft | Qt.AlignBottom, QColor("#E7ECF3"))
     window.show()
+    app.processEvents()
+    QTimer.singleShot(0, lambda splash=qt_splash, win=window: splash.finish(win))
+    QTimer.singleShot(0, close_boot_splash)
     return app.exec()
 
 

@@ -8,6 +8,12 @@ All notable changes to ImgKey are documented here.
 
 - Separate GPU packaging scaffolding: `ImgKey-GPU.spec` for CUDA runtime/probe builds and `ImgKey-GPU-BiRefNet.spec` for the BiRefNet-only worker/adapter build path.
 - CUDA 12.8 GPU requirement files and GPU build notes covering RTX 50-series constraints, local/offline BiRefNet model paths, manifest/license gates, and clean-target testing.
+- PyInstaller and Qt startup splashes for GPU builds so large onefile extraction/startup no longer appears frozen.
+
+### Changed
+
+- BiRefNet `global_plus_roi` now performs bounded high-resolution ROI passes and conservative alpha post-processing to preserve foreground/detail with less erosion.
+- Hybrid BiRefNet alpha merge is less aggressive about clamping weak BiRefNet detail to background while preserving confident screen background clamps.
 
 ### Notes
 

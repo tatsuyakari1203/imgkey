@@ -17,6 +17,23 @@ SUPPORTED_MODES = frozenset({"global_only", "global_plus_roi"})
 SUPPORTED_PRECISIONS = frozenset({"fp16", "float16", "fp32", "float32"})
 IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+POSTPROCESS_SETTINGS = {
+    "enabled": True,
+    "sure_background_threshold": 3,
+    "midtone_threshold": 8,
+    "midtone_gamma": 0.72,
+    "close_radius": 1,
+    "dilate_radius": 1,
+    "dilate_support_threshold": 24,
+    "dilate_max_delta": 18,
+    "feather_radius": 2,
+}
+ROI_SETTINGS = {
+    "max_count": 8,
+    "max_total_pixels": 8_000_000,
+    "min_candidate_pixels": 96,
+    "max_rgb_edge_pixels": 20_000_000,
+}
 
 ProgressCallback = Callable[..., Any]
 CancelCallback = Callable[[], bool]
@@ -151,19 +168,24 @@ def generate_alpha_hint(
 ) -> dict[str, Any]:
     """Generate a BiRefNet alpha hint from an RGB image.
 
-    Phase 3 supports ``global_only`` inference. ``global_plus_roi`` is accepted
-    for API stability and currently returns the global result plus structured ROI
-    metadata documenting that Phase 6 classical edge/conflict masks will drive
-    real ROI refinement later.
+    ``global_only`` runs a bounded global pass, then applies conservative alpha
+    post-processing. ``global_plus_roi`` runs the same global pass, selects a
+    capped set of edge/detail ROIs from the global alpha and nearby RGB edges,
+    runs high-resolution crop inference for those ROIs, and max-blends the crop
+    alpha back into the global alpha before final post-processing.
     """
 
     tile_info = {
         "requested_mode": mode,
-        "implemented_mode": "global_only",
+        "implemented_mode": mode if mode in SUPPORTED_MODES else "unvalidated",
         "tile_size": int(tile_size),
         "tile_overlap": int(tile_overlap),
-        "roi_strategy": "global_fallback_until_phase6_classical_roi_masks",
+        "roi_strategy": "alpha_edge_detail_rois" if mode == "global_plus_roi" else "disabled_global_only",
+        "roi_limits": dict(ROI_SETTINGS),
         "roi_count": 0,
+        "roi_candidates": 0,
+        "rois": [],
+        "postprocess": dict(POSTPROCESS_SETTINGS),
     }
 
     try:
@@ -206,8 +228,8 @@ def generate_alpha_hint(
         tile_info["device"] = str(torch_device)
         if mode == "global_plus_roi":
             tile_info["roi_note"] = (
-                "Phase 3 does not invent ROI crops from raw RGB. Future phases may pass classical edge/conflict masks; "
-                "until then global_plus_roi conservatively returns the global BiRefNet pass."
+                "Runs a global pass, selects bounded alpha/RGB-edge detail ROIs, runs crop inference, "
+                "max-blends crop alpha into the global alpha, then applies conservative post-processing."
             )
 
         with _offline_hf_environment():
@@ -225,21 +247,58 @@ def generate_alpha_hint(
                 model.half()
 
             _notify_progress(progress_callback, 0.55, "Running global BiRefNet pass")
-            tensor = _prepare_tensor(rgb, inference_shape, torch, torch_device, use_fp16)
             if _is_cancelled(cancel_callback):
                 return _error_result("BiRefNet inference cancelled before forward pass.", "cancelled", tile_info)
-            with torch.inference_mode():
-                output = model(tensor)
-            pred = _select_prediction_tensor(output, torch)
-            alpha_small = _prediction_to_numpy_alpha(pred)
+            alpha_small = _run_model_alpha(rgb, inference_shape, model, torch, torch_device, use_fp16)
+            _clear_torch_cache(torch, torch_device)
 
-        _notify_progress(progress_callback, 0.85, "Upscaling BiRefNet alpha hint")
-        alpha_hint = _resize_alpha_u8(alpha_small, (h, w))
+            _notify_progress(progress_callback, 0.72, "Upscaling BiRefNet alpha hint")
+            alpha_hint = _resize_alpha_u8(alpha_small, (h, w))
+
+            if mode == "global_plus_roi":
+                _notify_progress(progress_callback, 0.76, "Selecting BiRefNet detail ROIs")
+                rois = _select_refinement_rois(alpha_hint, rgb, tile_size=int(tile_size), tile_overlap=int(tile_overlap))
+                tile_info["roi_candidates"] = len(rois)
+                roi_alpha = alpha_hint
+                if rois:
+                    roi_alpha = alpha_hint.copy()
+                    roi_max_side = max(256, min(int(max_side), max(256, int(tile_size) if tile_size else 1024)))
+                    total_rois = len(rois)
+                    for idx, roi in enumerate(rois, start=1):
+                        if _is_cancelled(cancel_callback):
+                            return _error_result(f"BiRefNet inference cancelled before ROI pass {idx}.", "cancelled", tile_info)
+                        y0, y1, x0, x1 = roi
+                        crop = rgb[y0:y1, x0:x1]
+                        crop_shape = _fit_size_for_inference(y1 - y0, x1 - x0, roi_max_side)
+                        _notify_progress(progress_callback, 0.76 + 0.16 * (idx - 1) / max(1, total_rois), f"Running BiRefNet ROI pass {idx}/{total_rois}")
+                        crop_small = _run_model_alpha(crop, crop_shape, model, torch, torch_device, use_fp16)
+                        crop_alpha = _resize_alpha_u8(crop_small, (y1 - y0, x1 - x0))
+                        crop_alpha = _postprocess_alpha_u8(crop_alpha)
+                        blend_stats = _blend_roi_alpha(roi_alpha, crop_alpha, roi, feather=max(8, min(int(tile_overlap) // 2 if tile_overlap else 32, 96)))
+                        tile_info["rois"].append(
+                            {
+                                "index": idx,
+                                "box_xyxy": [int(x0), int(y0), int(x1), int(y1)],
+                                "crop_shape": [int(y1 - y0), int(x1 - x0)],
+                                "inference_shape": [int(crop_shape[0]), int(crop_shape[1])],
+                                **blend_stats,
+                            }
+                        )
+                        _clear_torch_cache(torch, torch_device)
+                tile_info["roi_count"] = len(tile_info["rois"])
+                tile_info["implemented_mode"] = "global_plus_roi" if tile_info["roi_count"] else "global_plus_roi_no_candidate"
+                alpha_hint = roi_alpha
+
+        _notify_progress(progress_callback, 0.94, "Post-processing BiRefNet alpha hint")
+        before_postprocess = alpha_hint
+        alpha_hint = _postprocess_alpha_u8(alpha_hint)
+        tile_info["postprocess_stats"] = _alpha_change_stats(before_postprocess, alpha_hint)
+        _notify_progress(progress_callback, 0.98, "Finalizing BiRefNet alpha hint")
         _notify_progress(progress_callback, 1.0, "BiRefNet alpha hint complete")
         return {
             "ok": True,
             "alpha_hint": alpha_hint,
-            "message": "BiRefNet global alpha hint generated from a validated local snapshot.",
+            "message": "BiRefNet alpha hint generated from a validated local snapshot with conservative detail-preserving post-processing.",
             "tile_info": tile_info,
             "model": {
                 "backend": "birefnet",
@@ -382,6 +441,32 @@ def _prepare_tensor(rgb: np.ndarray, shape: tuple[int, int], torch_module: Any, 
     return tensor.half() if use_fp16 else tensor.float()
 
 
+def _run_model_alpha(
+    rgb: np.ndarray,
+    inference_shape: tuple[int, int],
+    model: Any,
+    torch_module: Any,
+    torch_device: Any,
+    use_fp16: bool,
+) -> np.ndarray:
+    tensor = _prepare_tensor(rgb, inference_shape, torch_module, torch_device, use_fp16)
+    with torch_module.inference_mode():
+        output = model(tensor)
+    pred = _select_prediction_tensor(output, torch_module)
+    alpha = _prediction_to_numpy_alpha(pred)
+    del tensor, output, pred
+    return alpha
+
+
+def _clear_torch_cache(torch_module: Any, torch_device: Any) -> None:
+    try:
+        device_type = getattr(torch_device, "type", str(torch_device).split(":", 1)[0])
+        if str(device_type).lower() == "cuda" and hasattr(torch_module, "cuda"):
+            torch_module.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _resize_rgb_u8(rgb: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     from PIL import Image
 
@@ -403,6 +488,250 @@ def _resize_alpha_u8(alpha: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     image = Image.fromarray(alpha_u8, mode="L")
     resample = getattr(Image, "Resampling", Image).BILINEAR
     return np.asarray(image.resize((int(target_w), int(target_h)), resample=resample), dtype=np.uint8)
+
+
+def _postprocess_alpha_u8(alpha: Any) -> np.ndarray:
+    """Conservatively lift/repair BiRefNet alpha without broad expansion.
+
+    The intent is to counter the common global-pass erosion caused by one-pass
+    downscaling while keeping exact background nearly fixed.  Operations only
+    raise alpha near existing support; hard background remains zeroed.
+    """
+
+    alpha_u8 = ensure_alpha_u8(alpha, np.asarray(alpha).shape[:2])
+    if alpha_u8.size == 0:
+        return alpha_u8
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except Exception:
+        return _postprocess_alpha_numpy_fallback(alpha_u8)
+
+    settings = POSTPROCESS_SETTINGS
+    sure_bg = int(settings["sure_background_threshold"])
+    midtone = int(settings["midtone_threshold"])
+    gamma = float(settings["midtone_gamma"])
+    close_radius = int(settings["close_radius"])
+    dilate_radius = int(settings["dilate_radius"])
+    support_threshold = int(settings["dilate_support_threshold"])
+    max_delta = int(settings["dilate_max_delta"])
+    feather_radius = int(settings["feather_radius"])
+
+    out = alpha_u8.copy()
+    mid_mask = (alpha_u8 >= midtone) & (alpha_u8 < 250)
+    if np.any(mid_mask):
+        lifted = np.power(alpha_u8.astype(np.float32) / 255.0, gamma) * 255.0
+        out[mid_mask] = np.maximum(out[mid_mask], np.rint(lifted[mid_mask]).astype(np.uint8))
+
+    if close_radius > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_radius * 2 + 1, close_radius * 2 + 1))
+        closed = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel)
+        close_support = cv2.dilate((alpha_u8 >= midtone).astype(np.uint8), kernel) > 0
+        out[close_support] = np.maximum(out[close_support], closed[close_support])
+
+    if dilate_radius > 0 and max_delta > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_radius * 2 + 1, dilate_radius * 2 + 1))
+        dilated = cv2.dilate(out, kernel).astype(np.int16)
+        support = cv2.dilate((alpha_u8 >= support_threshold).astype(np.uint8), kernel) > 0
+        # Do not create fresh alpha from exact/near-exact background. This keeps
+        # massive background expansion out while still thickening eroded edges.
+        expansion = support & (alpha_u8 > sure_bg) & (alpha_u8 < 250)
+        capped = np.minimum(dilated, out.astype(np.int16) + max_delta)
+        out[expansion] = np.maximum(out[expansion].astype(np.int16), capped[expansion]).astype(np.uint8)
+
+    if feather_radius > 0:
+        # Bilateral filtering feathers quantized crop/global seams while the
+        # max() guard prevents the filter from eroding foreground detail.
+        d = feather_radius * 2 + 1
+        feathered = cv2.bilateralFilter(out, d=d, sigmaColor=28, sigmaSpace=max(1, feather_radius))
+        edge = (out >= midtone) & (out <= 247)
+        if np.any(edge):
+            blended = np.rint(out.astype(np.float32) * 0.72 + feathered.astype(np.float32) * 0.28).astype(np.uint8)
+            out[edge] = np.maximum(out[edge], blended[edge])
+
+    out[alpha_u8 <= sure_bg] = 0
+    out[alpha_u8 >= 252] = 255
+    return np.ascontiguousarray(out)
+
+
+def _postprocess_alpha_numpy_fallback(alpha_u8: np.ndarray) -> np.ndarray:
+    out = alpha_u8.copy()
+    sure_bg = int(POSTPROCESS_SETTINGS["sure_background_threshold"])
+    midtone = int(POSTPROCESS_SETTINGS["midtone_threshold"])
+    gamma = float(POSTPROCESS_SETTINGS["midtone_gamma"])
+    mid_mask = (alpha_u8 >= midtone) & (alpha_u8 < 250)
+    if np.any(mid_mask):
+        lifted = np.power(alpha_u8.astype(np.float32) / 255.0, gamma) * 255.0
+        out[mid_mask] = np.maximum(out[mid_mask], np.rint(lifted[mid_mask]).astype(np.uint8))
+    out[alpha_u8 <= sure_bg] = 0
+    out[alpha_u8 >= 252] = 255
+    return np.ascontiguousarray(out)
+
+
+def _select_refinement_rois(
+    alpha: Any,
+    rgb: Any | None = None,
+    *,
+    tile_size: int = 1024,
+    tile_overlap: int = 192,
+) -> list[tuple[int, int, int, int]]:
+    alpha_u8 = ensure_alpha_u8(alpha, np.asarray(alpha).shape[:2])
+    h, w = alpha_u8.shape
+    if h <= 0 or w <= 0:
+        return []
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except Exception:
+        return []
+
+    soft_band = (alpha_u8 >= 8) & (alpha_u8 <= 247)
+    grad_x = cv2.Sobel(alpha_u8, cv2.CV_16S, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(alpha_u8, cv2.CV_16S, 0, 1, ksize=3)
+    alpha_edge = (np.abs(grad_x) + np.abs(grad_y)) > 24
+    candidate = soft_band | alpha_edge
+
+    if rgb is not None and h * w <= int(ROI_SETTINGS["max_rgb_edge_pixels"]):
+        try:
+            rgb_u8 = ensure_rgb_u8(rgb)
+            gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+            rgb_edges = cv2.Canny(gray, 50, 125) > 0
+            near_alpha = cv2.dilate((alpha_u8 >= 10).astype(np.uint8), np.ones((9, 9), dtype=np.uint8)) > 0
+            candidate |= rgb_edges & near_alpha
+        except Exception:
+            pass
+
+    if not np.any(candidate):
+        return []
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    candidate_u8 = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+    candidate_u8 = cv2.dilate(candidate_u8, kernel, iterations=1)
+    contours, _hier = cv2.findContours(candidate_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
+    roi_side = max(256, min(1536, int(tile_size) if tile_size else 1024))
+    padding = max(16, min(int(tile_overlap) if tile_overlap else 96, roi_side // 4))
+    min_pixels = int(ROI_SETTINGS["min_candidate_pixels"])
+    boxes: list[tuple[int, int, int, int, int]] = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bw <= 0 or bh <= 0:
+            continue
+        x0 = max(0, x - padding)
+        y0 = max(0, y - padding)
+        x1 = min(w, x + bw + padding)
+        y1 = min(h, y + bh + padding)
+        for sy0, sy1, sx0, sx1 in _split_roi_box(y0, y1, x0, x1, roi_side=roi_side, overlap=padding):
+            score = int(np.count_nonzero(candidate_u8[sy0:sy1, sx0:sx1]))
+            if score < min_pixels:
+                continue
+            boxes.append((score, sy0, sy1, sx0, sx1))
+
+    boxes.sort(key=lambda item: item[0], reverse=True)
+    selected: list[tuple[int, int, int, int]] = []
+    total_pixels = 0
+    max_count = int(ROI_SETTINGS["max_count"])
+    max_total = int(ROI_SETTINGS["max_total_pixels"])
+    for _score, y0, y1, x0, x1 in boxes:
+        roi = (int(y0), int(y1), int(x0), int(x1))
+        if any(_roi_iou(roi, existing) > 0.82 for existing in selected):
+            continue
+        pixels = max(0, y1 - y0) * max(0, x1 - x0)
+        if selected and total_pixels + pixels > max_total:
+            continue
+        selected.append(roi)
+        total_pixels += pixels
+        if len(selected) >= max_count:
+            break
+    return selected
+
+
+def _split_roi_box(
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    *,
+    roi_side: int,
+    overlap: int,
+) -> list[tuple[int, int, int, int]]:
+    if y1 <= y0 or x1 <= x0:
+        return []
+    if (y1 - y0) <= roi_side and (x1 - x0) <= roi_side:
+        return [(y0, y1, x0, x1)]
+    step = max(64, roi_side - max(0, overlap))
+    out: list[tuple[int, int, int, int]] = []
+    yy = y0
+    while yy < y1:
+        sy1 = min(y1, yy + roi_side)
+        sy0 = max(y0, sy1 - roi_side)
+        xx = x0
+        while xx < x1:
+            sx1 = min(x1, xx + roi_side)
+            sx0 = max(x0, sx1 - roi_side)
+            out.append((sy0, sy1, sx0, sx1))
+            if sx1 >= x1:
+                break
+            xx += step
+        if sy1 >= y1:
+            break
+        yy += step
+    return out
+
+
+def _roi_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ay0, ay1, ax0, ax1 = a
+    by0, by1, bx0, bx1 = b
+    iy0 = max(ay0, by0)
+    iy1 = min(ay1, by1)
+    ix0 = max(ax0, bx0)
+    ix1 = min(ax1, bx1)
+    inter = max(0, iy1 - iy0) * max(0, ix1 - ix0)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ay1 - ay0) * max(0, ax1 - ax0)
+    area_b = max(0, by1 - by0) * max(0, bx1 - bx0)
+    return float(inter) / float(max(1, area_a + area_b - inter))
+
+
+def _blend_roi_alpha(full_alpha: np.ndarray, crop_alpha: Any, roi: tuple[int, int, int, int], *, feather: int = 48) -> dict[str, Any]:
+    y0, y1, x0, x1 = roi
+    target = full_alpha[y0:y1, x0:x1]
+    crop = ensure_alpha_u8(crop_alpha, target.shape)
+    before = target.copy()
+    improved = np.maximum(target, crop)
+    if feather > 0:
+        weight = _roi_feather_weight(target.shape, feather)
+        blended = np.rint(target.astype(np.float32) * (1.0 - weight) + improved.astype(np.float32) * weight).astype(np.uint8)
+        target[:, :] = np.maximum(target, blended)
+    else:
+        target[:, :] = improved
+    return _alpha_change_stats(before, target)
+
+
+def _roi_feather_weight(shape: tuple[int, int], feather: int) -> np.ndarray:
+    h, w = shape
+    if h <= 0 or w <= 0:
+        return np.zeros(shape, dtype=np.float32)
+    yy, xx = np.ogrid[:h, :w]
+    dist_y = np.minimum(yy + 1, h - yy)
+    dist_x = np.minimum(xx + 1, w - xx)
+    dist = np.minimum(dist_y, dist_x).astype(np.float32)
+    return np.clip(dist / float(max(1, feather)), 0.0, 1.0)
+
+
+def _alpha_change_stats(before: np.ndarray, after: np.ndarray) -> dict[str, Any]:
+    before_i = before.astype(np.int16, copy=False)
+    after_i = after.astype(np.int16, copy=False)
+    delta = after_i - before_i
+    changed = delta != 0
+    raised = delta > 0
+    return {
+        "changed_pixels": int(np.count_nonzero(changed)),
+        "raised_pixels": int(np.count_nonzero(raised)),
+        "max_raise": int(delta[raised].max()) if np.any(raised) else 0,
+        "mean_raise": float(delta[raised].mean()) if np.any(raised) else 0.0,
+    }
 
 
 def _resolve_device(torch_module: Any, device: str, precision: str) -> tuple[Any, bool, str | None]:

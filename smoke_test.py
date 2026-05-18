@@ -2310,6 +2310,28 @@ def run_birefnet_adapter_manifest_tests() -> None:
         "alpha helper must convert float masks to HxW uint8"
     )
 
+    eroded = np.zeros((72, 72), dtype=np.uint8)
+    eroded[18:54, 18:54] = 130
+    eroded[34:38, 34:38] = 24
+    eroded[18:54, 18] = 42
+    eroded[18:54, 53] = 42
+    repaired = adapter._postprocess_alpha_u8(eroded)
+    assert repaired.shape == eroded.shape and repaired.dtype == np.uint8, "postprocess must preserve alpha shape/dtype"
+    assert int(repaired[20, 18]) > int(eroded[20, 18]), "postprocess should raise eroded edge midtones"
+    assert int(repaired[35, 35]) > int(eroded[35, 35]), "postprocess should soften small eroded holes"
+    assert int(repaired[0, 0]) == 0, "postprocess must not expand exact background"
+
+    alpha_roi = np.zeros((160, 180), dtype=np.uint8)
+    alpha_roi[40:120, 70:110] = 210
+    alpha_roi[58:105, 110:114] = 70
+    rgb_roi = np.full((160, 180, 3), [0, 220, 50], dtype=np.uint8)
+    rgb_roi[40:120, 70:114] = [190, 60, 40]
+    rois = adapter._select_refinement_rois(alpha_roi, rgb_roi, tile_size=96, tile_overlap=24)
+    assert 1 <= len(rois) <= adapter.ROI_SETTINGS["max_count"], f"global_plus_roi selector should return bounded detail ROIs, got {rois}"
+    assert any(y0 <= 58 and y1 >= 105 and x0 <= 110 and x1 >= 114 for y0, y1, x0, x1 in rois), (
+        "ROI selector should cover the eroded detail edge"
+    )
+
     after_validation = {name for name in heavy_modules if name in sys.modules}
     assert after_validation == before, f"BiRefNet manifest/validation tests must not import heavy runtimes: {after_validation - before}"
 
@@ -2755,6 +2777,7 @@ def run_v6_hybrid_trimap_tests() -> None:
     fringe_pt = (8, 28)
     spill_pt = (28, 8)
     keep_spill_pt = (8, 48)
+    weak_biref_detail_pt = (16, 42)
 
     alpha[fg_pt] = 255
     screen_prob[fg_pt] = 10
@@ -2788,6 +2811,10 @@ def run_v6_hybrid_trimap_tests() -> None:
     alpha[spill_pt] = 128
     screen_prob[spill_pt] = 60
     spill_prob[spill_pt] = 180
+
+    alpha[weak_biref_detail_pt] = 0
+    biref[weak_biref_detail_pt] = 40
+    screen_prob[weak_biref_detail_pt] = 250
 
     alpha[keep_spill_pt] = 128
     screen_prob[keep_spill_pt] = 60
@@ -2839,6 +2866,8 @@ def run_v6_hybrid_trimap_tests() -> None:
     assert result.unmix_region[spill_pt], "mid-alpha spill pixel should be unmix candidate"
     assert result.spill_region[keep_spill_pt], "manual keep does not hide spill diagnostics"
     assert not result.despill_region[keep_spill_pt], "manual keep must protect from aggressive despill"
+    assert result.unknown[weak_biref_detail_pt], "weak BiRefNet detail on screen should stay unknown, not get clamped to background"
+    assert not result.known_bg[weak_biref_detail_pt], "BiRefNet low-mid detail must avoid aggressive known-bg erosion"
 
     assert not np.any(result.known_bg & result.known_fg), "known_bg/known_fg must be mutually exclusive"
     assert not np.any(result.known_bg & result.unknown), "known_bg/unknown must be mutually exclusive"
@@ -2978,10 +3007,10 @@ def run_v6_hybrid_alpha_mode_tests() -> None:
         remove > 127,
     )
 
-    expected_conflict_w = (128.0 - 64.0) / (220.0 - 64.0)
+    expected_conflict_w = (128.0 - 32.0) / (200.0 - 32.0)
     expected_conflict_w = expected_conflict_w * expected_conflict_w * (3.0 - 2.0 * expected_conflict_w)
     expected_conflict = int(round(255.0 * (1.0 - expected_conflict_w) + 128.0 * expected_conflict_w))
-    expected_unknown_w = (160.0 - 64.0) / (220.0 - 64.0)
+    expected_unknown_w = (160.0 - 32.0) / (200.0 - 32.0)
     expected_unknown_w = expected_unknown_w * expected_unknown_w * (3.0 - 2.0 * expected_unknown_w)
     expected_unknown = int(round(32.0 * (1.0 - expected_unknown_w) + 160.0 * expected_unknown_w))
 

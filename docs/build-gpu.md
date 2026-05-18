@@ -20,6 +20,7 @@ python -m PyInstaller --noconfirm --clean ImgKey.spec
 ## 2. GPU runtime `ImgKey-GPU.exe`
 
 Includes PyTorch CUDA for probing the GPU, but no Transformers/BiRefNet model stack and no model weights.
+The GPU specs use PyInstaller's boot splash (`packaging/imgkey_splash.png`) so onefile extraction shows visible progress before the Qt UI can start.
 
 ```powershell
 python -m venv .venv-gpu
@@ -35,6 +36,7 @@ python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
 ## 3. GPU BiRefNet `ImgKey-GPU-BiRefNet.exe`
 
 Includes PyTorch CUDA plus the BiRefNet-only worker/adapter path. It never downloads model weights at runtime.
+The onefile EXE can still spend noticeable time extracting the multi-GB CUDA/model payload before Python starts; the PyInstaller splash is the earliest visible UI, then the in-app Qt splash appears while the main window is constructed.
 
 ```powershell
 python -m venv .venv-gpu-birefnet
@@ -76,6 +78,8 @@ $sourceImage = "D:\test-images\green-screen-source.png"  # replace with an exist
 } | ConvertTo-Json | Set-Content -LiteralPath ".artifact\birefnet-request.json" -Encoding UTF8
 python ai_worker.py --request .artifact\birefnet-request.json --json
 ```
+
+`mode=global_plus_roi` now runs a global pass, bounded high-resolution alpha/detail ROI passes, and conservative alpha post-processing. The worker response and diagnostics include `details.tile_info.implemented_mode`, ROI counts/boxes, and `postprocess_stats` so quality changes can be verified without opening the GUI.
 
 ## RTX 5060 Ti / Blackwell constraints
 

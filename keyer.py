@@ -666,7 +666,11 @@ def _merge_hybrid_alpha(
     if np.any(fg):
         alpha[fg] = np.maximum(classical, biref)[fg]
     if np.any(unknown):
-        w = _smoothstep(64.0, 220.0, biref.astype(np.float32))
+        # BiRefNet can be conservative/eroded on high-detail foreground edges,
+        # especially after a global downscale. Start the unknown-region blend
+        # earlier than the original 64/220 ramp so useful midtones survive, but
+        # keep known_bg clamps authoritative to avoid broad screen leakage.
+        w = _smoothstep(32.0, 200.0, biref.astype(np.float32))
         blended = classical.astype(np.float32) * (1.0 - w) + biref.astype(np.float32) * w
         alpha[unknown] = np.rint(np.clip(blended[unknown], 0.0, 255.0)).astype(np.uint8)
     _apply_hybrid_automatic_clamps(alpha, classical, biref, trimap)

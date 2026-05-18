@@ -86,12 +86,24 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
+splash = Splash(
+    'packaging/imgkey_splash.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(36, 268),
+    text_size=12,
+    text_color='#E7ECF3',
+    text_default='Extracting ImgKey GPU BiRefNet bundle…',
+    always_on_top=True,
+)
 
 exe = EXE(
     pyz,
     a.scripts,
+    splash,
     a.binaries,
     a.datas,
+    splash.binaries,
     [],
     name='ImgKey-GPU-BiRefNet',
     debug=False,
