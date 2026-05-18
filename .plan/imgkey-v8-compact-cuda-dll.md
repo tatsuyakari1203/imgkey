@@ -1,7 +1,7 @@
 # 08 - ImgKey Compact Classical GPU DLL
 
 Date: 2026-05-18
-Status: In progress
+Status: Completed
 Owner: ImgKey Classical GPU Runtime
 Scope: Replace the large torch-based GPU build with a compact NVIDIA CUDA DLL backend while keeping ImgKey no-AI.
 
@@ -419,7 +419,7 @@ Isolation:
 - Verification/build only; no feature expansion.
 
 Status:
-- Planned
+- Completed
 
 
 #### P4.1 - Verification floor
@@ -446,25 +446,20 @@ Acceptance:
 - `ImgKey.exe` remains lightweight/no GPU runtime.
 - `ImgKey-GPU.exe` is compact and no-torch.
 - CPU/GPU parity passes or cleanly falls back with documented reason.
-- Final branch clean and pushed.
+- Final branch clean and ready for planner push.
 
 Status:
-- Planned
+- Completed
+
+Progress:
+- Completed 2026-05-18. Final verification passed: native DLL rebuild, CPU smoke, GPU parity, GPU benchmark, runtime probe, py_compile, import check, dependency/no-AI guards, default no-torch import guard, native DLL export/dependency inspection, default and GPU PyInstaller builds, EXE probes, sanitized-PATH GPU probe, GPU GUI lifetime probe, and archive checks. `dist\ImgKey.exe` is 100,128,472 bytes (95.49 MiB), SHA256 `fc7703425099e0200198718edb760a74e400774509beb81823adcec49caa329f`; archive has no GPU DLL, torch/nvidia Python stack, cudart, or model stack. `dist\ImgKey-GPU.exe` is 102,042,819 bytes (97.32 MiB), SHA256 `dbbe955a14f3941aa3ce70c702fb4f6a94000e17b8d073e4dcb6602a1f7b0efd`; archive contains `imgkey_cuda.dll` and no torch/nvidia Python stack/cudart/model entries. DLL exports are unmangled and depend only on MSVC/UCRT/Windows DLLs; no `cudart64_*.dll` dependency. Planner push remains pending per handoff.
 
 
 ---
 
 ## 6) Immediate next step
 
-Continue with Phase 4/P4.1: run final verification and cleanup, including the default `ImgKey.exe` build, before planner pushes the final branch.
-
-
-
-
-
-
-
-
+Phase 4 is complete and ready for planner push after the phase commit.
 
 Current:
-- Yes
+- No
