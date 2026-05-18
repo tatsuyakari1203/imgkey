@@ -21,6 +21,7 @@ env/
 # Build/package outputs
 build/
 dist/
+native/imgkey_cuda/build/
 *.egg-info/
 wheelhouse/
 wheels/

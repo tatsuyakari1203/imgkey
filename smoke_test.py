@@ -3040,34 +3040,40 @@ def run_gpu_accel_backend_tests() -> None:
     after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert after_import == before, f"importing gpu_accel must not import heavy runtimes: {after_import - before}"
 
-    def missing_torch_loader() -> object:
-        raise ImportError("No module named 'torch'")
-
-    unavailable = gpu_accel.is_available(torch_loader=missing_torch_loader, refresh=True)
+    missing_dll = Path("native/imgkey_cuda/build/missing-imgkey-cuda.dll")
+    unavailable = gpu_accel.is_available(dll_path=missing_dll, refresh=True)
     assert unavailable["available"] is False
     assert unavailable["status"] == "unavailable"
-    assert unavailable["reason"] == "torch_import_failed"
-    assert unavailable["backend"] == "torch_cuda"
+    assert unavailable["reason"] == "cuda_unavailable"
+    assert unavailable["backend"] == "cuda_dll"
 
     rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((32, 48))
-    fallback = gpu_accel.process_color_tile_gpu(
-        rgb,
-        alpha_u8,
-        background_mask,
-        edge_mask,
-        probability,
-        fringe,
-        None,
-        foreground,
-        nearest_valid,
-        key_color,
-        settings,
-        force_gpu=False,
-        torch_loader=missing_torch_loader,
+    transition_strength = gpu_accel.transition_repair_strength_mask_v1(
+        rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings
     )
-    assert fallback["ok"] is False and fallback["used"] is False
-    assert fallback["reason"] == "torch_import_failed"
-    assert "CPU" in fallback["message"] or "cpu" in fallback["message"].lower()
+    foreground_valid_u8 = np.ascontiguousarray(nearest_valid.astype(np.uint8) * 255)
+
+    invalid_calls = [
+        ("rgb dtype", lambda: gpu_accel.transition_repair_dll_v1(rgb.astype(np.float32), alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings, dll_path=missing_dll)),
+        ("rgb contiguity", lambda: gpu_accel.transition_repair_dll_v1(rgb[:, :, ::-1], alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings, dll_path=missing_dll)),
+        ("alpha dimensionality", lambda: gpu_accel.transition_repair_dll_v1(rgb, alpha_u8[:, :, None], transition_strength, foreground, foreground_valid_u8, key_color, settings, dll_path=missing_dll)),
+        ("mask shape", lambda: gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength[:-1], foreground, foreground_valid_u8[:-1], key_color, settings, dll_path=missing_dll)),
+    ]
+    for label, call in invalid_calls:
+        try:
+            call()
+        except (TypeError, ValueError):
+            pass
+        else:  # pragma: no cover - guard failure path
+            raise AssertionError(f"CUDA DLL Python validation failed to reject {label}")
+
+    try:
+        gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings, dll_path=missing_dll)
+    except gpu_accel.CudaDllUnavailable:
+        pass
+    else:  # pragma: no cover - guard failure path
+        raise AssertionError("valid CUDA DLL call with a missing DLL path must fail before ctypes launch")
+
     radius_disabled = gpu_accel.process_color_tile_gpu(
         rgb,
         alpha_u8,
@@ -3081,10 +3087,43 @@ def run_gpu_accel_backend_tests() -> None:
         key_color,
         replace(settings, foreground_reference_radius=0),
         force_gpu=True,
-        torch_loader=missing_torch_loader,
     )
     assert radius_disabled["used"] is False
     assert radius_disabled["reason"] == "reference_radius_disabled"
+
+    availability = gpu_accel.is_available(refresh=True)
+    if availability.get("available"):
+        cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+        max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+        assert max_rgb_diff <= 2, f"CUDA DLL smoke RGB parity max diff too high: {max_rgb_diff}"
+        assert max_mask_diff <= 2, f"CUDA DLL smoke mask parity max diff too high: {max_mask_diff}"
+        backend = gpu_accel._load_cuda_dll()
+        status = int(backend.library.imgkey_cuda_transition_repair_v1(None, None, None, None, None, None, None, None))
+        assert status == gpu_accel.IMGKEY_CUDA_INVALID_ARGUMENT
+        assert "params" in backend.last_error().lower()
+        out_rgb = np.empty_like(rgb)
+        out_mask = np.empty_like(alpha_u8)
+        bad_version = gpu_accel._params_for_call(rgb, alpha_u8, transition_strength, out_rgb, key_color, settings)
+        bad_version.version = 999
+        try:
+            backend.transition_repair(bad_version, rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, out_rgb, out_mask)
+        except gpu_accel.CudaDllError as exc:
+            assert exc.status == gpu_accel.IMGKEY_CUDA_UNSUPPORTED_VERSION
+        else:  # pragma: no cover - guard failure path
+            raise AssertionError("CUDA DLL ABI accepted an unsupported params version")
+        bad_stride = gpu_accel._params_for_call(rgb, alpha_u8, transition_strength, out_rgb, key_color, settings)
+        bad_stride.rgb_stride_bytes = 0
+        try:
+            backend.transition_repair(bad_stride, rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, out_rgb, out_mask)
+        except gpu_accel.CudaDllError as exc:
+            assert exc.status == gpu_accel.IMGKEY_CUDA_INVALID_ARGUMENT
+        else:  # pragma: no cover - guard failure path
+            raise AssertionError("CUDA DLL ABI accepted an invalid RGB stride")
+    else:
+        print(f"CUDA DLL smoke parity skipped: {availability.get('reason')} - {availability.get('message')}")
+
     preview_fallback = gpu_accel.process_preview_gpu()
     assert preview_fallback["reason"] == "not_implemented"
     assert preview_fallback["used"] is False
@@ -3101,17 +3140,17 @@ def run_gpu_parity_tests() -> None:
         return
 
     rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((128, 192))
-    cpu_rgb, cpu_mask = _repair_transition_unmix(
+    transition_strength = gpu_accel.transition_repair_strength_mask_v1(
+        rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings
+    )
+    foreground_valid_u8 = np.ascontiguousarray(nearest_valid.astype(np.uint8) * 255)
+    cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(
         rgb,
         alpha_u8,
-        background_mask,
-        edge_mask,
-        probability,
-        fringe,
-        key_color,
-        None,
+        transition_strength,
         foreground,
-        nearest_valid,
+        foreground_valid_u8,
+        key_color,
         settings,
     )
     gpu = gpu_accel.process_color_tile_gpu(
@@ -3137,36 +3176,11 @@ def run_gpu_parity_tests() -> None:
     assert max_rgb_diff <= 2, f"GPU transition RGB parity max diff too high: {max_rgb_diff}"
     assert max_mask_diff <= 2, f"GPU transition mask parity max diff too high: {max_mask_diff}"
 
-    cpu_tile, cpu_spill = _process_color_tile(
-        rgb,
-        alpha_u8,
-        background_mask,
-        edge_mask,
-        probability,
-        fringe,
-        None,
-        foreground,
-        nearest_valid,
-        key_color,
-        replace(settings, gpu_acceleration="Off"),
-    )
-    gpu_tile, gpu_spill = _process_color_tile(
-        rgb,
-        alpha_u8,
-        background_mask,
-        edge_mask,
-        probability,
-        fringe,
-        None,
-        foreground,
-        nearest_valid,
-        key_color,
-        replace(settings, gpu_acceleration="Force GPU"),
-    )
-    max_tile_diff = int(np.max(np.abs(cpu_tile.astype(np.int16) - gpu_tile.astype(np.int16))))
-    max_spill_diff = int(np.max(np.abs(cpu_spill.astype(np.int16) - gpu_spill.astype(np.int16))))
-    assert max_tile_diff <= 2, f"integrated GPU tile RGB parity max diff too high: {max_tile_diff}"
-    assert max_spill_diff <= 2, f"integrated GPU spill mask parity max diff too high: {max_spill_diff}"
+    dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+    max_direct_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+    max_direct_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+    assert max_direct_rgb_diff <= 2, f"direct CUDA DLL RGB parity max diff too high: {max_direct_rgb_diff}"
+    assert max_direct_mask_diff <= 2, f"direct CUDA DLL mask parity max diff too high: {max_direct_mask_diff}"
 
     disabled_settings = replace(settings, gpu_acceleration="Force GPU", foreground_reference_radius=0)
     disabled = gpu_accel.process_color_tile_gpu(
@@ -3235,7 +3249,7 @@ def run_gpu_parity_tests() -> None:
     print(
         "gpu parity ok "
         f"device={availability.get('device')} max_rgb_diff={max_rgb_diff} "
-        f"max_mask_diff={max_mask_diff} max_tile_diff={max_tile_diff}"
+        f"max_mask_diff={max_mask_diff} max_direct_rgb_diff={max_direct_rgb_diff}"
     )
 
 

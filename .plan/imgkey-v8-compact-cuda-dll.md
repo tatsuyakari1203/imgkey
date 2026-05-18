@@ -1,7 +1,7 @@
 # 08 - ImgKey Compact Classical GPU DLL
 
 Date: 2026-05-18
-Status: Planned
+Status: In progress
 Owner: ImgKey Classical GPU Runtime
 Scope: Replace the large torch-based GPU build with a compact NVIDIA CUDA DLL backend while keeping ImgKey no-AI.
 
@@ -108,10 +108,8 @@ Isolation:
 - Own `native/imgkey_cuda/`, `.gitignore`, and minimal ctypes probe/test scaffolding. Do not change PyInstaller packaging yet.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
 
 #### P1.0 - Toolchain and architecture gate
 - Before accepting the DLL prototype, inspect:
@@ -134,10 +132,11 @@ Acceptance:
 - Execution does not proceed past P1.0 if a new toolkit install is required and not approved.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
+Progress:
+- Completed 2026-05-18. CUDA 12.6 (`nvcc` V12.6.20) lists through `compute_90`, not `compute_120`/`sm_120`. A `compute_90` PTX forward-JIT probe launched on RTX 5060 Ti / compute 12.0 and returned the expected kernel result, so no toolkit install was required for Phase 1.
+
 
 #### P1.1 - Add buildable CUDA DLL source and script
 - Create native source exposing a tiny C ABI:
@@ -227,10 +226,11 @@ Acceptance:
 - Built DLL and intermediates are untracked.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+Progress:
+- Completed 2026-05-18. Added `native/imgkey_cuda/` source/header/build script/README. `build.ps1` locates VS BuildTools and CUDA, logs `cl`/`nvcc`, builds `imgkey_cuda.dll` under the ignored native build folder, and `dumpbin /exports` shows unmangled C ABI names.
+
 
 #### P1.2 - Add Python loader and parity harness
 - Update `gpu_accel.py` to prefer the CUDA DLL backend over torch.
@@ -244,13 +244,17 @@ Acceptance:
 - Existing CPU smoke tests pass when DLL is absent.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+Progress:
+- Completed 2026-05-18. Replaced `gpu_accel.py` with a lazy ctypes CUDA DLL backend (no torch import), added Python validation and smoke parity coverage, and verified ctypes version/device_count plus real kernel parity on the local RTX 5060 Ti.
+
 
 ---
 
+
+Current:
+- Yes
 ### Phase 2 - Replace torch GPU path with compact DLL backend
 
 Category:
@@ -268,8 +272,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P2.1 - Make DLL backend the only active GPU implementation
 - Remove active torch CUDA kernel usage from `gpu_accel.py`.
@@ -289,8 +291,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P2.2 - Benchmark compact DLL backend
 - Add/update benchmark output under `.artifact/gpu-benchmarks/`:
@@ -305,11 +305,12 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+Current:
+- No
 ### Phase 3 - Compact GPU packaging
 
 Category:
@@ -327,8 +328,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.1 - Remove torch from GPU requirements/spec
 - Update `requirements-gpu-runtime-cu128.txt` into a compact no-PyTorch GPU packaging note or delete/replace it if no Python package is required.
@@ -351,8 +350,6 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P3.2 - Build and size gate
 - Build:
@@ -377,11 +374,12 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
+
+Current:
+- No
 ### Phase 4 - Final verification and cleanup
 
 Category:
@@ -399,8 +397,6 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
 
 #### P4.1 - Verification floor
 - Run:
@@ -431,11 +427,13 @@ Acceptance:
 Status:
 - Planned
 
-Current:
-- No
 
 ---
 
 ## 6) Immediate next step
 
-Start Phase 1/P1.0 with `deep-worker`: run the toolchain and architecture gate first. Do not proceed to P1.1/P1.2 prototype work if compute 12.0 support requires a new CUDA Toolkit install that has not been explicitly approved.
+Continue with Phase 2/P2.1: replace the remaining torch-oriented runtime/probe/benchmark surfaces with the compact DLL backend. Do not change PyInstaller packaging until Phase 3.
+
+
+Current:
+- No
