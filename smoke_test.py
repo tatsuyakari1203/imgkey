@@ -3003,6 +3003,45 @@ def run_app_ui_tests() -> None:
         assert window.output_mode.findText("Classical") >= 0
         assert window.output_mode.findText("Imported Matte") >= 0
         assert window.alpha_hint_mask is None
+        defaults = app_module.APP_DEFAULT_SETTINGS
+        assert window.transition_unmix.text() == "Transition Unmix"
+        assert window.transition_unmix.isChecked() is bool(defaults.transition_unmix)
+        assert abs(float(window.alpha_recover.value()) - defaults.alpha_recover_strength) < 1e-9
+        assert abs(float(window.key_vector_despill.value()) - defaults.key_vector_despill) < 1e-9
+        assert abs(float(window.foreground_reference_pull.value()) - defaults.foreground_reference_pull) < 1e-9
+        ui_settings = window.current_settings()
+        assert ui_settings.transition_unmix is bool(defaults.transition_unmix)
+        assert abs(ui_settings.alpha_recover_strength - defaults.alpha_recover_strength) < 1e-9
+        assert abs(ui_settings.key_vector_despill - defaults.key_vector_despill) < 1e-9
+        assert abs(ui_settings.foreground_reference_pull - defaults.foreground_reference_pull) < 1e-9
+
+        window.transition_unmix.setChecked(False)
+        window.alpha_recover.set_value(0.0, emit=False)
+        window.key_vector_despill.set_value(0.0, emit=False)
+        window.foreground_reference_pull.set_value(0.0, emit=False)
+        window.apply_preset("High Accuracy")
+        ui_settings = window.current_settings()
+        assert ui_settings.transition_unmix is bool(defaults.transition_unmix)
+        assert abs(ui_settings.alpha_recover_strength - defaults.alpha_recover_strength) < 1e-9
+        assert abs(ui_settings.key_vector_despill - defaults.key_vector_despill) < 1e-9
+        assert abs(ui_settings.foreground_reference_pull - defaults.foreground_reference_pull) < 1e-9
+
+        window.full_rgb = np.zeros((4, 5, 3), dtype=np.uint8)
+        before_zoom = window.canvas.transform().m11()
+        generation = window._preview_generation
+        window.transition_unmix.setChecked(False)
+        assert window._preview_generation == generation + 1, "transition toggle must schedule preview"
+        assert window.canvas.transform().m11() == before_zoom, "transition toggle must not reset viewer zoom"
+        assert not window.alpha_recover.isEnabled(), "transition sliders should disable when transition unmix is off"
+        window._preview_timer.stop()
+        window.transition_unmix.setChecked(True)
+        window._preview_timer.stop()
+        generation = window._preview_generation
+        window.alpha_recover.set_value(0.84)
+        assert window._preview_generation == generation + 1, "transition slider must schedule preview"
+        assert window.canvas.transform().m11() == before_zoom, "transition slider must not reset viewer zoom"
+        window._preview_timer.stop()
+        window.full_rgb = None
         forbidden = ("Bi" + "RefNet", "Corridor" + "Key", "A" + "I Hint", "Hy" + "brid" + " Bi" + "RefNet")
         for phrase in forbidden:
             assert all(phrase not in mode for mode in app_module.VIEW_MODES), f"removed phrase leaked into view modes: {phrase}"

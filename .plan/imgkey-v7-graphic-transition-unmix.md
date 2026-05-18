@@ -619,7 +619,10 @@ Isolation:
 - Own `app.py` inspector controls and UI smoke probe. No AI UI changes.
 
 Status:
-- Planned
+- Complete
+
+Progress:
+- 2026-05-18: Added no-AI transition-unmix controls under Spill Cleanup, wired them into `KeySettings`, presets/defaults, tooltips, and headless UI probe coverage.
 
 
 #### P5.1 - Add transition repair controls
@@ -639,7 +642,7 @@ Acceptance:
 - Reset/preset paths restore the approved High Accuracy Graphic defaults plus v7 transition defaults.
 
 Status:
-- Planned
+- Complete
 
 
 ---
@@ -650,7 +653,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 6 - Classical GPU runtime and kernels
 
 Category:
@@ -732,7 +735,7 @@ Status:
 
 
 Current:
-- No
+- Yes
 ### Phase 7 - No-AI packaging
 
 Category:
@@ -871,7 +874,7 @@ Status:
 
 ## 5) Immediate next step
 
-Planner can assign Phase 5 next: add classical transition-unmix UI controls and defaults without reintroducing AI UI surface.
+Planner can assign Phase 6 next to deep-worker: define and verify the no-AI classical GPU backend/runtime path.
 
 
 

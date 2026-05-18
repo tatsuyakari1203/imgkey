@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QAbstractSpinBox,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -101,6 +102,10 @@ APP_DEFAULT_SETTINGS = KeySettings(
     edge_color_repair=0.65,
     inner_color_pull=0.45,
     fringe_band_radius=3,
+    transition_unmix=True,
+    alpha_recover_strength=0.85,
+    key_vector_despill=0.75,
+    foreground_reference_pull=0.65,
 )
 
 
@@ -1010,6 +1015,12 @@ class MainWindow(QMainWindow):
         self.inner_color_pull = SliderRow("Inner Color Pull", 0.00, 1.00, self.settings.inner_color_pull, step=0.01)
         self.fringe_band = SliderRow("Fringe Band", 0, 12, self.settings.fringe_band_radius, step=1, integer=True)
         self.luminance_restore = SliderRow("Luminance Restore", 0.00, 1.00, self.settings.luminance_restore, step=0.01)
+        self.transition_unmix = QCheckBox("Transition Unmix")
+        self.transition_unmix.setObjectName("TransitionUnmixCheck")
+        self.transition_unmix.setChecked(bool(self.settings.transition_unmix))
+        self.alpha_recover = SliderRow("Alpha Recover", 0.00, 1.00, self.settings.alpha_recover_strength, step=0.01)
+        self.key_vector_despill = SliderRow("Key Vector Despill", 0.00, 1.00, self.settings.key_vector_despill, step=0.01)
+        self.foreground_reference_pull = SliderRow("FG Color Pull", 0.00, 1.00, self.settings.foreground_reference_pull, step=0.01)
         self._set_control_tooltip(self.despill, "Legacy spill cleanup signal; higher values reduce key-color cast in repaired edge pixels.")
         self._set_control_tooltip(self.decontaminate, "Blends repaired edge RGB more strongly where the old screen color contaminated the foreground.")
         self._set_control_tooltip(self.fringe_remove, "Strength of key-color fringe/channel removal in soft edge pixels.")
@@ -1017,6 +1028,11 @@ class MainWindow(QMainWindow):
         self._set_control_tooltip(self.inner_color_pull, "Pulls contaminated edge RGB toward the nearest clean opaque foreground color.")
         self._set_control_tooltip(self.fringe_band, "Pixel width around the alpha edge eligible for fringe color repair.")
         self._set_control_tooltip(self.luminance_restore, "Luminance protection for spill cleanup and edge color repair; higher keeps perceived brightness.")
+        self.transition_unmix.setToolTip("Repair semi-transparent graphic transitions by unmixing key-screen color without reducing alpha.")
+        self._set_control_tooltip(self.alpha_recover, "Raises plausible transition alpha toward the solved foreground coverage; never lowers alpha.")
+        self._set_control_tooltip(self.key_vector_despill, "Removes remaining key-color chroma along the sampled screen vector in repaired transitions.")
+        self._set_control_tooltip(self.foreground_reference_pull, "Pulls repaired transition color toward nearby clean foreground while preserving luminance.")
+        self.transition_unmix.toggled.connect(self._on_transition_unmix_toggled)
         self._connect_slider_rows(
             self.despill,
             self.decontaminate,
@@ -1025,6 +1041,9 @@ class MainWindow(QMainWindow):
             self.inner_color_pull,
             self.fringe_band,
             self.luminance_restore,
+            self.alpha_recover,
+            self.key_vector_despill,
+            self.foreground_reference_pull,
         )
         for row in (
             self.despill,
@@ -1036,6 +1055,10 @@ class MainWindow(QMainWindow):
             self.luminance_restore,
         ):
             layout.addWidget(row)
+        layout.addWidget(self.transition_unmix)
+        for row in (self.alpha_recover, self.key_vector_despill, self.foreground_reference_pull):
+            layout.addWidget(row)
+        self._sync_transition_unmix_controls()
         parent.addWidget(section)
 
     def _add_output_section(self, parent: QVBoxLayout) -> None:
@@ -1167,6 +1190,18 @@ class MainWindow(QMainWindow):
         for widget in (row.label, row.value_label, row.slider, row.spin):
             widget.setToolTip(text)
 
+    def _on_transition_unmix_toggled(self, checked: bool) -> None:
+        del checked
+        self._sync_transition_unmix_controls()
+        self.schedule_preview()
+
+    def _sync_transition_unmix_controls(self) -> None:
+        if not hasattr(self, "transition_unmix"):
+            return
+        enabled = self.transition_unmix.isChecked()
+        for row in (self.alpha_recover, self.key_vector_despill, self.foreground_reference_pull):
+            row.setEnabled(enabled)
+
     def _apply_theme(self) -> None:
         self.setStyleSheet(
             """
@@ -1213,6 +1248,8 @@ class MainWindow(QMainWindow):
             QPushButton#SecondaryToggleButton { background: transparent; color: #9AA6B6; border-color: #2A3038; text-align: left; }
             QPushButton#SecondaryToggleButton:hover, QPushButton#SecondaryToggleButton:checked { background: #151922; color: #E7ECF3; }
             QFrame#SecondaryPanel { background: #151922; border: 1px solid #2A3038; border-radius: 5px; }
+            QCheckBox { background: transparent; color: #E7ECF3; spacing: 8px; padding: 3px 0px; font-weight: 600; }
+            QCheckBox:disabled { color: #5D6775; }
             QComboBox, QSpinBox, QDoubleSpinBox { background: #101318; color: #E7ECF3; border: 1px solid #2A3038; border-radius: 5px; padding: 5px 8px; min-height: 24px; }
             QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #3A4350; }
             QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #4F8CFF; }
@@ -1371,6 +1408,10 @@ class MainWindow(QMainWindow):
             edge_color_repair=float(self.edge_color_repair.value()),
             inner_color_pull=float(self.inner_color_pull.value()),
             fringe_band_radius=int(self.fringe_band.value()),
+            transition_unmix=bool(self.transition_unmix.isChecked()),
+            alpha_recover_strength=float(self.alpha_recover.value()),
+            key_vector_despill=float(self.key_vector_despill.value()),
+            foreground_reference_pull=float(self.foreground_reference_pull.value()),
             luminance_protect=float(self.luminance_restore.value()),
             preview_scale=float(self.current_display_scale),
             use_tiling=True,
@@ -1944,6 +1985,9 @@ class MainWindow(QMainWindow):
                 self.inner_color_pull: 0.20,
                 self.fringe_band: 2,
                 self.luminance_restore: 0.20,
+                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
+                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
+                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
             },
             "Clean": {
                 self.screen_tolerance: 0.18,
@@ -1959,6 +2003,9 @@ class MainWindow(QMainWindow):
                 self.inner_color_pull: 0.35,
                 self.fringe_band: 3,
                 self.luminance_restore: 0.35,
+                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
+                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
+                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
             },
             "High Accuracy": {
                 self.screen_tolerance: APP_DEFAULT_SETTINGS.tolerance,
@@ -1978,10 +2025,17 @@ class MainWindow(QMainWindow):
                 self.inner_color_pull: APP_DEFAULT_SETTINGS.inner_color_pull,
                 self.fringe_band: APP_DEFAULT_SETTINGS.fringe_band_radius,
                 self.luminance_restore: APP_DEFAULT_SETTINGS.luminance_restore,
+                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
+                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
+                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
             },
         }
         for row, value in presets[name].items():
             row.set_value(value, emit=False)
+        self.transition_unmix.blockSignals(True)
+        self.transition_unmix.setChecked(bool(APP_DEFAULT_SETTINGS.transition_unmix))
+        self.transition_unmix.blockSignals(False)
+        self._sync_transition_unmix_controls()
         if name == "High Accuracy":
             self.key_mode.blockSignals(True)
             self.key_mode.setCurrentText(APP_DEFAULT_KEY_MODE)
