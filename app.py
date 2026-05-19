@@ -108,6 +108,8 @@ APP_DEFAULT_SETTINGS = KeySettings(
     alpha_recover_strength=0.90,
     key_vector_despill=0.85,
     foreground_reference_pull=0.75,
+    screen_cleanup_strength=1.00,
+    screen_cleanup_similarity=8,
     gpu_acceleration="Off",
 )
 
@@ -1424,6 +1426,12 @@ class MainWindow(QMainWindow):
             alpha_recover_strength=float(self.alpha_recover.value()),
             key_vector_despill=float(self.key_vector_despill.value()),
             foreground_reference_pull=float(self.foreground_reference_pull.value()),
+            screen_cleanup_strength=(
+                APP_DEFAULT_SETTINGS.screen_cleanup_strength
+                if self.policy.currentText() == "Aggressive Interior Removal"
+                else 0.0
+            ),
+            screen_cleanup_similarity=APP_DEFAULT_SETTINGS.screen_cleanup_similarity,
             gpu_acceleration=self.gpu_acceleration.currentText() if hasattr(self, "gpu_acceleration") else "Off",
             luminance_protect=float(self.luminance_restore.value()),
             preview_scale=float(self.current_display_scale),

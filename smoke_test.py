@@ -203,6 +203,8 @@ def _graphic_transition_settings(key_color: tuple[int, int, int]) -> KeySettings
         edge_color_repair=0.65,
         inner_color_pull=0.45,
         fringe_band_radius=3,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
     )
 
 
@@ -2453,9 +2455,12 @@ def run_transition_unmix_baseline_tests() -> None:
         known_background, foreground_core, soft_edge = _fixture_masks(fixture)
         detail_region = _transition_detail_region(fixture, result)
         alpha_delta = result.alpha.astype(np.int16) - baseline.alpha.astype(np.int16)
-        assert int(alpha_delta[detail_region].min()) >= 0, (
-            f"{fixture.name}: transition alpha recovery must never erode detail alpha"
-        )
+        screen_like_detail = detail_region & (result.screen_probability >= int(round(fixture.settings.clip_background * 255.0)))
+        protected_detail = detail_region & ~screen_like_detail
+        if np.any(protected_detail):
+            assert int(alpha_delta[protected_detail].min()) >= 0, (
+                f"{fixture.name}: transition alpha recovery must not erode non-screen detail alpha"
+            )
         total_recovered_pixels += int(np.count_nonzero(alpha_delta[detail_region] > 0))
         confident_background = np.zeros(result.alpha.shape, dtype=bool)
         if result.background_mask is not None and result.edge_mask is not None:
@@ -2475,6 +2480,7 @@ def run_transition_unmix_baseline_tests() -> None:
             f"{fixture.name}: transparent output RGB must stay zero, max={transparent['max_rgb_when_transparent']}"
         )
         assert metrics["transparent_rgb_residual_max"] == 0, f"{fixture.name}: transparent RGB residual must be zero"
+        assert leak["max_alpha"] == 0, f"{fixture.name}: screen-like known background must clean to alpha zero: {leak}"
         if core_delta["count"]:
             assert core_delta["max_delta"] <= 8, f"{fixture.name}: hard/core RGB drift too high: {core_delta}"
         foreground_delta = metrics["foreground_core_rgb_delta"]
@@ -2503,15 +2509,25 @@ def run_transition_unmix_baseline_tests() -> None:
         assert residual["p95_positive_excess"] <= baseline_residual["p95_positive_excess"], (
             f"{fixture.name}: transition RGB repair worsened p95 key residual: {baseline_residual} -> {residual}"
         )
+        baseline_has_residual = (
+            baseline_residual["mean_positive_excess"] > 0
+            or baseline_residual["p95_positive_excess"] > 0
+            or baseline_residual["max_positive_excess"] > 0
+        )
         improved = (
             residual["mean_positive_excess"] < baseline_residual["mean_positive_excess"]
             or residual["p95_positive_excess"] < baseline_residual["p95_positive_excess"]
             or residual["max_positive_excess"] < baseline_residual["max_positive_excess"]
         )
-        assert improved, f"{fixture.name}: transition key residual should decrease: {baseline_residual} -> {residual}"
-        assert residual["mean_positive_excess"] < baseline_residual["mean_positive_excess"], (
-            f"{fixture.name}: transition key residual mean must decrease: {baseline_residual} -> {residual}"
-        )
+        if baseline_has_residual:
+            assert improved, f"{fixture.name}: transition key residual should decrease: {baseline_residual} -> {residual}"
+            assert residual["mean_positive_excess"] < baseline_residual["mean_positive_excess"], (
+                f"{fixture.name}: transition key residual mean must decrease: {baseline_residual} -> {residual}"
+            )
+        else:
+            assert residual["mean_positive_excess"] == 0 and residual["max_positive_excess"] == 0, (
+                f"{fixture.name}: screen cleanup should leave no transition key residual: {baseline_residual} -> {residual}"
+            )
         _assert_transition_composites_do_not_worsen(fixture, baseline_metrics, metrics)
         improved_residual_count += 1
 
@@ -3749,6 +3765,8 @@ def _geometric_current_default_settings(key_color: tuple[int, int, int]) -> KeyS
         alpha_recover_strength=0.90,
         key_vector_despill=0.85,
         foreground_reference_pull=0.75,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
         gpu_acceleration="Off",
     )
 
@@ -3784,6 +3802,8 @@ def _geometric_strict_asset_settings(key_color: tuple[int, int, int]) -> KeySett
         alpha_recover_strength=1.00,
         key_vector_despill=1.00,
         foreground_reference_pull=1.00,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
     )
 
 
@@ -3814,6 +3834,8 @@ def _geometric_moderated_strict_settings(key_color: tuple[int, int, int]) -> Key
         alpha_recover_strength=0.92,
         key_vector_despill=0.90,
         foreground_reference_pull=0.85,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
     )
 
 
@@ -3844,6 +3866,8 @@ def _geometric_green_cyan_safe_settings(key_color: tuple[int, int, int]) -> KeyS
         alpha_recover_strength=0.90,
         key_vector_despill=0.85,
         foreground_reference_pull=0.75,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
     )
 
 
@@ -4877,6 +4901,8 @@ def run_app_ui_tests() -> None:
             "alpha_recover_strength": 0.90,
             "key_vector_despill": 0.85,
             "foreground_reference_pull": 0.75,
+            "screen_cleanup_strength": 1.00,
+            "screen_cleanup_similarity": 8,
         }
         for attr, expected in promoted_expected.items():
             actual = getattr(defaults, attr)

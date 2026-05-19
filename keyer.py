@@ -113,6 +113,12 @@ class KeySettings:
     transition_alpha_max: int = 253
     preserve_foreground_luma: float = 0.85
 
+    # v9 screen-residue cleanup. Off by default so connected-background mode can
+    # still preserve disconnected key-colored foreground unless the app/profile
+    # opts into aggressive cleanup explicitly.
+    screen_cleanup_strength: float = 0.0
+    screen_cleanup_similarity: int = 8
+
     # Optional no-AI compact CUDA DLL acceleration. Default is CPU/off so library
     # callers and tests never load the DLL unless they opt in explicitly.
     gpu_acceleration: str = "Off"
@@ -537,10 +543,33 @@ def _build_global_matte(
 
     alpha = _refine_alpha_guided(rgb, alpha, edge_mask, background, probability, fg_threshold, bg_threshold, settings)
 
-    alpha = _apply_original_alpha(alpha, original_alpha)
     screen_map = _estimate_screen_map(rgb, probability >= bg_threshold, screen_color, settings)
     _report(progress_callback, 0.17, "screen model")
     _raise_if_cancelled(cancel_callback)
+    alpha = _apply_original_alpha(alpha, original_alpha)
+    alpha, screen_cleanup = _apply_screen_residue_alpha_cleanup(
+        rgb,
+        alpha,
+        probability,
+        screen_color,
+        screen_map,
+        settings,
+        keep_mask,
+        remove_mask,
+        alpha_hint,
+        progress_callback,
+        cancel_callback,
+    )
+    if screen_cleanup is not None and np.any(screen_cleanup):
+        background |= screen_cleanup
+        edge_mask[screen_cleanup] = False
+        if keep_mask is not None:
+            background &= ~keep_mask
+            edge_mask[keep_mask] = False
+        if remove_mask is not None:
+            remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+            background |= remove_effective
+            edge_mask[remove_effective] = False
     fringe_mask = _build_fringe_mask(rgb, alpha, edge_mask, probability, screen_color, settings, progress_callback, cancel_callback)
     _report(progress_callback, 0.175, "fringe map")
     _raise_if_cancelled(cancel_callback)
@@ -978,6 +1007,85 @@ def _refine_alpha_guided(
     out[(probability >= bg_threshold) & background & ~edge_mask] = 0
     out[(probability <= fg_threshold) & (~background) & ~edge_mask] = 255
     return out
+
+
+def _apply_screen_residue_alpha_cleanup(
+    rgb: np.ndarray,
+    alpha_u8: np.ndarray,
+    probability: np.ndarray,
+    screen_color: tuple[int, int, int],
+    screen_map: np.ndarray | None,
+    settings: KeySettings,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    alpha_hint: np.ndarray | None,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Lower alpha for live pixels that are still indistinguishable from screen.
+
+    This is a hard-screen/detail two-pass cleanup: the normal trimap/recovery pass
+    remains free to preserve soft and thin foreground detail, then this pass only
+    removes pixels that are both high screen-probability and RGB-close to the
+    sampled/local screen plate. Manual keep and strong imported matte foreground
+    remain authoritative.
+    """
+
+    strength = _clip01(settings.screen_cleanup_strength)
+    if strength <= 0.0:
+        return alpha_u8, None
+    if rgb.shape[:2] != alpha_u8.shape or probability.shape != alpha_u8.shape:
+        raise ValueError("screen cleanup inputs must share image height/width")
+    if screen_map is not None and screen_map.shape[:2] != alpha_u8.shape:
+        raise ValueError("screen_map must match alpha shape")
+
+    bg_threshold = int(round(_clip01(settings.clip_background) * 255.0))
+    similarity = max(0, int(settings.screen_cleanup_similarity))
+    h, w = alpha_u8.shape
+    out = alpha_u8.copy()
+    cleanup = np.zeros((h, w), dtype=bool)
+
+    protected = np.zeros((h, w), dtype=bool)
+    hint_foreground = _alpha_hint_foreground_mask(alpha_hint, settings)
+    if hint_foreground is not None:
+        protected |= hint_foreground
+    if keep_mask is not None:
+        protected |= keep_mask
+    if remove_mask is not None:
+        remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+        out[remove_effective] = 0
+
+    fallback_screen = np.asarray(screen_color, dtype=np.int16).reshape(1, 1, 3)
+    stripe_rows = max(96, min(h, 512))
+    stripes = list(range(0, h, stripe_rows))
+    total = max(1, len(stripes))
+    for index, y0 in enumerate(stripes, start=1):
+        _raise_if_cancelled(cancel_callback)
+        y1 = min(h, y0 + stripe_rows)
+        live = (out[y0:y1] > 0) & (probability[y0:y1] >= bg_threshold) & (~protected[y0:y1])
+        if not np.any(live):
+            continue
+        if screen_map is None:
+            diff = np.max(np.abs(rgb[y0:y1].astype(np.int16) - fallback_screen), axis=2)
+        else:
+            diff = np.max(np.abs(rgb[y0:y1].astype(np.int16) - screen_map[y0:y1].astype(np.int16)), axis=2)
+        target = live & (diff <= similarity)
+        if not np.any(target):
+            continue
+        if strength >= 0.999:
+            out_block = out[y0:y1]
+            out_block[target] = 0
+        else:
+            out_block = out[y0:y1]
+            lowered = np.rint(out_block[target].astype(np.float32) * (1.0 - strength)).astype(np.uint8)
+            out_block[target] = np.minimum(out_block[target], lowered)
+        cleanup_block = cleanup[y0:y1]
+        cleanup_block[target & (out_block == 0)] = True
+        _report(progress_callback, 0.171 + 0.003 * (index / total), "screen cleanup")
+
+    if not np.any(cleanup):
+        return alpha_u8, None
+    return out, cleanup
 
 
 def _expanded_mask_bounds(mask: np.ndarray, margin: int, shape: tuple[int, int]) -> tuple[int, int, int, int]:
