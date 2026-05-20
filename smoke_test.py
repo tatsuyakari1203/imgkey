@@ -3030,8 +3030,13 @@ def run_gpu_runtime_probe_tests() -> None:
     missing_probe = gpu_runtime.probe_gpu(gpu_accel_probe=missing_dll_probe, nvidia_smi_probe=lambda: fake_smi, run_kernel_smoke=False)
     backend_ids = [item["id"] for item in missing_probe["backend_registry"]["backends"]]
     assert "cuda_compat" in backend_ids
+    assert "vulkan_compute" in backend_ids
     cuda_registry = next(item for item in missing_probe["backend_registry"]["backends"] if item["id"] == "cuda_compat")
     assert cuda_registry["legacy_backend"]["id"] == "compact_cuda_dll"
+    vulkan_registry = next(item for item in missing_probe["backend_registry"]["backends"] if item["id"] == "vulkan_compute")
+    assert vulkan_registry["available"] is False
+    assert vulkan_registry["reason"] in {"vulkan_toolchain_incomplete", "vulkan_backend_deferred", "vulkan_runtime_unavailable", "vulkan_loader_unavailable"}
+    assert "runtime_probe" in vulkan_registry and "toolchain" in vulkan_registry
     missing_selected = missing_probe["backend_registry"]["selected_backend"]
     if missing_selected["available"]:
         assert missing_probe["status"] == "available"
@@ -3080,9 +3085,12 @@ def run_gpu_runtime_probe_tests() -> None:
 
     for probe in (missing_probe, dll_probe):
         round_tripped = json.loads(json.dumps(probe))
-        for key in ("schema_version", "status", "message", "backend", "backend_registry", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke", "native_toolchain"):
+        for key in ("schema_version", "status", "message", "backend", "backend_registry", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke", "native_toolchain", "vulkan_runtime"):
             assert key in round_tripped, f"gpu runtime probe JSON missing {key}"
         assert round_tripped["native_toolchain"]["packaging_decision"]["status"] == "deferred"
+        assert round_tripped["native_toolchain"]["components"]["vulkan"]["enabled"] is True
+        assert round_tripped["native_toolchain"]["vulkan_gate"]["status"] in {"ready", "blocked"}
+        assert round_tripped["vulkan_runtime"]["status"] in {"available", "unavailable"}
         assert "torch" not in round_tripped, "compact DLL runtime probe must not expose a torch probe section"
 
     after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
@@ -3275,6 +3283,59 @@ def run_gpu_backend_registry_tests() -> None:
     assert fake_result["used"] is True and fake_result["backend"] == "fake_native"
     assert np.array_equal(fake_result["rgb"][alpha_u8 > 0], rgb[alpha_u8 > 0])
     assert np.count_nonzero(fake_result["repair_mask"]) == 0
+
+    missing_vulkan = gpu_backend.VulkanComputeBackend(
+        toolchain_probe=lambda: {
+            "components": {
+                "vulkan": {
+                    "enabled": True,
+                    "available": False,
+                    "headers": None,
+                    "import_lib": None,
+                    "loader_dll": None,
+                    "message": "test Vulkan headers/import lib missing",
+                }
+            },
+            "vulkan_gate": {
+                "status": "blocked",
+                "reason": "vulkan_toolchain_incomplete",
+                "message": "test Vulkan headers/import lib missing",
+            },
+        },
+        runtime_probe=lambda: {
+            "schema_version": 1,
+            "probe": "imgkey_vulkan_runtime",
+            "status": "unavailable",
+            "available": False,
+            "reason": "vulkan_loader_unavailable",
+            "message": "test Vulkan loader missing",
+            "device_count": 0,
+            "compute_device_count": 0,
+            "devices": [],
+        },
+    )
+    missing_vulkan_info = missing_vulkan.probe(refresh=True)
+    assert missing_vulkan_info["id"] == "vulkan_compute"
+    assert missing_vulkan_info["available"] is False
+    assert missing_vulkan_info["status"] == "deferred"
+    assert missing_vulkan_info["reason"] == "vulkan_toolchain_incomplete"
+    assert missing_vulkan_info["runtime_probe"]["reason"] == "vulkan_loader_unavailable"
+    vulkan_session = missing_vulkan.begin_render(settings, rgb.shape, force_gpu=True)
+    vulkan_result = vulkan_session.process_full_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+    )
+    vulkan_session.end_render()
+    assert vulkan_result["used"] is False and vulkan_result["reason"] == "vulkan_backend_deferred"
 
     d3d12 = gpu_backend.D3D12ComputeBackend()
     d3d12_info = d3d12.probe(refresh=True)
@@ -3561,6 +3622,7 @@ def write_gpu_benchmarks() -> None:
     availability = gpu_accel.is_available(refresh=True)
     d3d12 = gpu_backend.D3D12ComputeBackend()
     d3d12_info = d3d12.probe(refresh=True)
+    vulkan_info = gpu_backend.VulkanComputeBackend().probe(refresh=True)
     GPU_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {
         "generated_by": "python smoke_test.py --gpu-benchmark",
@@ -3571,11 +3633,13 @@ def write_gpu_benchmarks() -> None:
         "availability": {
             "cuda_compat": availability,
             "d3d12_compute": d3d12_info,
+            "vulkan_compute": vulkan_info,
         },
         "notes": [
             "CPU remains the correctness reference.",
             "CUDA DLL timings include host/device copies performed inside imgkey_cuda_transition_repair_v1.",
             "D3D12 timings use the persistent D3D12 context. Full-color tiles larger than the native-call safety budget are split into TDR-bounded persistent-buffer subdispatches.",
+            "Vulkan is optional/experimental. If the SDK headers/import lib or installed loader/device are missing, the benchmark records a clean deferred/unavailable probe and does not run Vulkan timings.",
         ],
         "benchmarks": {},
     }
@@ -5945,6 +6009,7 @@ def run_import_compile_tests() -> None:
         Path("gpu_accel.py"),
         Path("gpu_runtime.py"),
         Path("native_toolchain.py"),
+        Path("vulkan_runtime.py"),
         Path("screen_analysis.py"),
     ]
     engine_dir = Path("imgkey_engine")
@@ -5961,6 +6026,7 @@ def run_import_compile_tests() -> None:
     importlib.import_module("gpu_accel")
     importlib.import_module("gpu_runtime")
     importlib.import_module("native_toolchain")
+    importlib.import_module("vulkan_runtime")
 
 
 def run_removed_surface_tests() -> None:
@@ -6066,6 +6132,7 @@ def run_source_surface_guard() -> None:
         Path("gpu_accel.py"),
         Path("gpu_runtime.py"),
         Path("native_toolchain.py"),
+        Path("vulkan_runtime.py"),
         Path("screen_analysis.py"),
         Path("ImgKey.spec"),
         Path("ImgKey-GPU.spec"),

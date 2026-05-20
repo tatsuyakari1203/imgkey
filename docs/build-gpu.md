@@ -99,13 +99,13 @@ Test generated EXEs on a clean Windows x64 target with an NVIDIA driver only: no
 2. `ImgKey-GPU.exe --gpu-probe --json` reports compact CUDA DLL availability or a clear driver/runtime error, with extraction splash/progress visible during onefile startup.
 3. Confirm `build/`, `dist/`, wheels, caches, and `.artifact/` outputs remain ignored and are not committed.
 
-## Phase 4/5 native backend gate
+## Phase 4/5/7 native backend gate
 
 `gpu_backend.py` now owns the backend-neutral Python protocol and wraps the
 existing compact CUDA DLL as the `cuda_compat` backend. `native/imgkey_gpu/`
-defines the C ABI contract and ships a D3D12 compute MVP for identity,
-constant-screen transition repair, and `screen_tile` local-plate transition repair.
-Vulkan remains deferred.
+defines the C ABI contract and ships a D3D12 compute backend for identity,
+transition repair, `screen_tile` local-plate inputs, and the fused full color tile
+path. Vulkan remains optional/experimental behind the same backend registry gate.
 
 Run the gate report with:
 
@@ -119,9 +119,20 @@ The JSON includes:
 - `native_toolchain.components.msvc` for MSVC Build Tools;
 - `native_toolchain.components.windows_sdk` for Windows SDK DirectX headers/libs;
 - `native_toolchain.components.shader_compilers` for DXC/FXC build-time shader compilers;
-- `native_toolchain.components.vulkan` only as a disabled-by-default future gate;
+- `native_toolchain.components.vulkan` for the Vulkan SDK header/import-lib/loader
+  gate;
+- `vulkan_runtime` and `backend_registry.backends[].runtime_probe` for a
+  no-SDK runtime-load probe of the installed Vulkan loader/driver;
 - `native_toolchain.components.dependency_audit` for `dumpbin` or `llvm-objdump`;
 - `native_toolchain.packaging_decision` for the one-EXE merge gate.
+
+Phase 7 gate result on the current local machine: `vulkan-1.dll` was present,
+but Vulkan SDK headers and `vulkan-1.lib` were missing, so no Vulkan native tile
+backend was built. This is a clean deferred state: D3D12 remains the primary GPU
+backend, CPU remains the fallback, and packaged apps must not require the Vulkan
+SDK, DXC, shader compilers, or validation layers. A later Vulkan implementation
+must compile HLSL to SPIR-V at build time with DXC only after the SDK header/import
+library gate is satisfied.
 
 Current decision: one-EXE CPU/GPU merging is **deferred**. Keep `ImgKey.exe` as
 the lightweight default build and `ImgKey-GPU.exe` as the optional compact CUDA

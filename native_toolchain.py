@@ -236,23 +236,48 @@ def _probe_vulkan(*, enabled: bool) -> dict[str, Any]:
         "enabled": enabled,
         "available": False,
         "vulkan_sdk": os.environ.get("VULKAN_SDK"),
+        "sdk_roots": [],
         "headers": None,
         "import_lib": None,
         "loader_dll": None,
-        "strategy": "Do not ship the Vulkan SDK. If enabled later, build against headers/import lib and runtime-load the installed Vulkan loader/driver.",
-        "message": "Vulkan probe disabled until the Vulkan phase is enabled.",
+        "strategy": "Do not ship the Vulkan SDK. Build against headers/import lib only when present, compile SPIR-V at build time, and runtime-load the installed Vulkan loader/driver.",
+        "shader_policy": "Use DXC -spirv at build time only; packaged apps must not depend on DXC, shader compiler binaries, or Vulkan SDK files.",
+        "validation_layers_policy": "Validation layers are development-only diagnostics and must never be packaged.",
+        "message": "Vulkan toolchain probe disabled.",
     }
     if not enabled:
         return result
-    sdk = Path(result["vulkan_sdk"]) if result["vulkan_sdk"] else None
+    sdk_roots: list[Path] = []
+    for env_name in ("VULKAN_SDK", "VK_SDK_PATH"):
+        value = os.environ.get(env_name)
+        if value:
+            sdk_roots.append(Path(value))
+    sdk_roots.extend(Path(path) for path in glob.glob(r"C:\VulkanSDK\*"))
+    program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    program_files_x86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    sdk_roots.extend(Path(path) for path in glob.glob(str(Path(program_files) / "VulkanSDK" / "*")))
+    sdk_roots.extend(Path(path) for path in glob.glob(str(Path(program_files_x86) / "VulkanSDK" / "*")))
+    unique_sdk_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in sdk_roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            resolved = root.expanduser()
+        key = str(resolved).casefold()
+        if key not in seen and resolved.exists():
+            seen.add(key)
+            unique_sdk_roots.append(resolved)
     header_candidates = []
     lib_candidates = []
-    if sdk is not None:
+    for sdk in unique_sdk_roots:
         header_candidates.append(sdk / "Include" / "vulkan" / "vulkan.h")
         lib_candidates.append(sdk / "Lib" / "vulkan-1.lib")
+        lib_candidates.append(sdk / "Lib" / "vulkan" / "vulkan-1.lib")
     loader_candidates = []
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     loader_candidates.append(system_root / "System32" / "vulkan-1.dll")
+    loader_candidates.append(system_root / "SysWOW64" / "vulkan-1.dll")
     for raw in os.environ.get("PATH", "").split(os.pathsep):
         if raw:
             loader_candidates.append(Path(raw) / "vulkan-1.dll")
@@ -261,6 +286,7 @@ def _probe_vulkan(*, enabled: bool) -> dict[str, Any]:
     loader = next((path for path in loader_candidates if path.is_file()), None)
     result.update(
         {
+            "sdk_roots": [str(path) for path in unique_sdk_roots],
             "headers": str(header) if header else None,
             "import_lib": str(import_lib) if import_lib else None,
             "loader_dll": str(loader) if loader else None,
@@ -286,7 +312,8 @@ def _one_exe_decision(components: dict[str, Any]) -> dict[str, Any]:
 
 def probe_native_toolchain(*, vulkan_enabled: bool | None = None) -> dict[str, Any]:
     if vulkan_enabled is None:
-        vulkan_enabled = str(os.environ.get("IMGKEY_ENABLE_VULKAN_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
+        raw_vulkan_enabled = os.environ.get("IMGKEY_ENABLE_VULKAN_PROBE")
+        vulkan_enabled = True if raw_vulkan_enabled is None else str(raw_vulkan_enabled).strip().lower() in {"1", "true", "yes", "on"}
     components = {
         "msvc": _probe_msvc(),
         "windows_sdk": _probe_windows_sdk(),
@@ -302,6 +329,11 @@ def probe_native_toolchain(*, vulkan_enabled: bool | None = None) -> dict[str, A
         "status": status,
         "platform": sys.platform,
         "components": components,
+        "vulkan_gate": {
+            "status": "ready" if components["vulkan"].get("available") else ("disabled" if not components["vulkan"].get("enabled") else "blocked"),
+            "reason": None if components["vulkan"].get("available") else ("vulkan_probe_disabled" if not components["vulkan"].get("enabled") else "vulkan_toolchain_incomplete"),
+            "message": components["vulkan"].get("message"),
+        },
         "packaging_decision": _one_exe_decision(components),
     }
     report["message"] = "Native D3D12 build/audit toolchain appears ready." if status == "ready" else "Native D3D12 build/audit toolchain is incomplete on this machine."

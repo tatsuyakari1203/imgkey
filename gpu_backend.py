@@ -88,6 +88,10 @@ _ERROR_REASONS = {
     "d3d12_unavailable",
     "d3d12_context_failed",
     "d3d12_execution_failed",
+    "vulkan_toolchain_incomplete",
+    "vulkan_backend_deferred",
+    "vulkan_runtime_unavailable",
+    "vulkan_loader_unavailable",
     "tile_too_large",
     "gpu_exception",
 }
@@ -1257,6 +1261,175 @@ class D3D12ComputeSession:
         self.context = None
 
 
+class VulkanComputeBackend:
+    backend_id = "vulkan_compute"
+    backend_name = "Vulkan compute backend"
+    capabilities = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.PERSISTENT_SESSION | BackendCapability.RGB_ONLY | BackendCapability.FULL_COLOR_TILE
+
+    def __init__(self, *, toolchain_probe: Callable[[], dict[str, Any]] | None = None, runtime_probe: Callable[[], dict[str, Any]] | None = None):
+        self._toolchain_probe = toolchain_probe
+        self._runtime_probe = runtime_probe
+        self._last_availability: dict[str, Any] | None = None
+
+    def probe(self, *, refresh: bool = False) -> dict[str, Any]:
+        del refresh
+        try:
+            if self._toolchain_probe is not None:
+                toolchain = self._toolchain_probe()
+            else:
+                import native_toolchain
+
+                toolchain = native_toolchain.probe_native_toolchain(vulkan_enabled=True)
+        except Exception as exc:
+            toolchain = {
+                "vulkan_gate": {
+                    "status": "blocked",
+                    "reason": "vulkan_toolchain_probe_failed",
+                    "message": f"Vulkan toolchain probe failed: {type(exc).__name__}: {exc}",
+                },
+                "components": {
+                    "vulkan": {
+                        "enabled": True,
+                        "available": False,
+                        "message": f"Vulkan toolchain probe failed: {type(exc).__name__}: {exc}",
+                    }
+                },
+            }
+        try:
+            if self._runtime_probe is not None:
+                runtime = self._runtime_probe()
+            else:
+                import vulkan_runtime
+
+                runtime = vulkan_runtime.probe_vulkan_runtime()
+        except Exception as exc:
+            runtime = {
+                "schema_version": 1,
+                "probe": "imgkey_vulkan_runtime",
+                "status": "unavailable",
+                "available": False,
+                "reason": "vulkan_runtime_probe_failed",
+                "message": f"Vulkan runtime probe failed: {type(exc).__name__}: {exc}. CPU/D3D12 fallback remains active.",
+                "device_count": 0,
+                "compute_device_count": 0,
+                "devices": [],
+            }
+
+        vulkan_toolchain = ((toolchain.get("components") or {}).get("vulkan") or {}) if isinstance(toolchain, dict) else {}
+        gate = (toolchain.get("vulkan_gate") or {}) if isinstance(toolchain, dict) else {}
+        toolchain_ready = bool(vulkan_toolchain.get("available"))
+        runtime_ready = bool(runtime.get("available"))
+        if not toolchain_ready:
+            reason = str(gate.get("reason") or "vulkan_toolchain_incomplete")
+            message = (
+                "Vulkan compute backend deferred: Vulkan SDK headers/import lib are not available for a real native build. "
+                f"Runtime probe status={runtime.get('status')} reason={runtime.get('reason')}; "
+                "D3D12 remains primary and CPU fallback remains active."
+            )
+            status = "deferred"
+        elif not runtime_ready:
+            reason = str(runtime.get("reason") or "vulkan_runtime_unavailable")
+            message = (
+                "Vulkan compute backend deferred: build-time Vulkan pieces are present, but the installed Vulkan loader/device runtime is unavailable. "
+                f"{runtime.get('message') or 'CPU/D3D12 fallback remains active.'}"
+            )
+            status = "unavailable"
+        else:
+            reason = "vulkan_backend_deferred"
+            message = (
+                "Vulkan runtime and build gate are present, but the Vulkan tile shader/context backend has not been implemented in this build. "
+                "D3D12 remains primary and CPU fallback remains active."
+            )
+            status = "deferred"
+        result = {
+            "id": self.backend_id,
+            "name": self.backend_name,
+            "api_version": IMGKEY_GPU_BACKEND_API_VERSION,
+            "status": status,
+            "available": False,
+            "reason": reason,
+            "message": message,
+            "capability_mask": int(self.capabilities),
+            "capabilities": capability_names(self.capabilities),
+            "device": None,
+            "device_index": None,
+            "device_count": int(runtime.get("compute_device_count") or runtime.get("device_count") or 0),
+            "version": None,
+            "toolchain": vulkan_toolchain,
+            "runtime_probe": runtime,
+            "packaging_policy": "Packaged ImgKey must not depend on Vulkan SDK, DXC, shader compilers, or validation layers; it may runtime-load only the installed Vulkan loader/driver.",
+            "primary_backend": False,
+        }
+        self._last_availability = dict(result)
+        return result
+
+    def begin_render(self, settings: Any, image_shape: tuple[int, int] | tuple[int, int, int], *, force_gpu: bool = False) -> "VulkanComputeSession":
+        return VulkanComputeSession(self, settings, image_shape, force_gpu=force_gpu)
+
+
+class VulkanComputeSession:
+    def __init__(self, backend: VulkanComputeBackend, settings: Any, image_shape: tuple[int, int] | tuple[int, int, int], *, force_gpu: bool = False):
+        self.backend = backend
+        self.backend_id = backend.backend_id
+        self.backend_name = backend.backend_name
+        self.settings = settings
+        self.image_shape = tuple(int(v) for v in image_shape[:2])
+        self.force_gpu = bool(force_gpu)
+        self.ended = False
+
+    def process_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_fg_rgb: np.ndarray | None,
+        nearest_fg_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+    ) -> dict[str, Any]:
+        del rgb_tile, alpha_tile, background_mask, edge_mask, probability, fringe_mask, screen_tile, nearest_fg_rgb, nearest_fg_valid, screen_color, settings
+        return _fallback_result(
+            "vulkan_backend_deferred",
+            "Vulkan compute tile backend is deferred by the Phase 7 gate; D3D12/CPU fallback remains active.",
+            backend=self.backend_id,
+            backend_name=self.backend_name,
+            availability=self.backend._last_availability,
+        )
+
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        del rgb_tile, alpha_tile, background_mask, edge_mask, probability, fringe_mask, screen_tile, nearest_inner_rgb, nearest_inner_valid, screen_color, settings, transition_nearest_rgb, transition_nearest_valid
+        return _fallback_result(
+            "vulkan_backend_deferred",
+            "Vulkan full color tile backend is deferred by the Phase 7 gate; D3D12/CPU fallback remains active.",
+            backend=self.backend_id,
+            backend_name=self.backend_name,
+            availability=self.backend._last_availability,
+        )
+
+    def end_render(self) -> None:
+        self.ended = True
+
+
 class FakeNativeBackend:
     backend_id = "fake_native"
     backend_name = "fake native backend"
@@ -1446,7 +1619,7 @@ class FakeNativeCAbi:
 
 
 def registered_backends() -> list[GpuBackend]:
-    return [D3D12ComputeBackend(), CudaCompatBackend()]
+    return [D3D12ComputeBackend(), VulkanComputeBackend(), CudaCompatBackend()]
 
 
 def probe_backends(
@@ -1457,7 +1630,7 @@ def probe_backends(
     cuda_probe: Callable[..., dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if backends is None:
-        backends = [D3D12ComputeBackend(), CudaCompatBackend(cuda_probe=cuda_probe)]
+        backends = [D3D12ComputeBackend(), VulkanComputeBackend(), CudaCompatBackend(cuda_probe=cuda_probe)]
     results: list[dict[str, Any]] = []
     for backend in backends:
         try:

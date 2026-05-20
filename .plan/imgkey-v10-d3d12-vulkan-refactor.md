@@ -626,10 +626,10 @@ Isolation:
 - Own Vulkan backend only; no algorithm changes unless parity requires shared shader fixes.
 
 Status:
-- Deferred pending Vulkan start gate
+- Completed as deferred by Vulkan SDK/toolchain gate
 
 Current:
-- Yes
+- No
 
 #### P7.1 - Vulkan probe/context and SPIR-V shader path
 - Hard stop before this milestone: do not start Vulkan until D3D12 MVP has passed parity, performance, packaging dependency audit, and backend ABI review.
@@ -643,7 +643,7 @@ Acceptance:
 - Packaged app does not require Vulkan SDK; only installed Vulkan driver/loader.
 
 Status:
-- Planned
+- Completed as probe/deferred
 
 Current:
 - No
@@ -656,7 +656,7 @@ Acceptance:
 - Vulkan passes geometric/transition parity on a machine with Vulkan driver, or is marked experimental with explicit skip when no compatible device exists.
 
 Status:
-- Planned
+- Deferred
 
 Current:
 - No
@@ -681,7 +681,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P8.1 - Verification matrix
 - Run:
@@ -713,4 +713,11 @@ Current:
 
 ## 6) Immediate next step
 
-Phase 7 is the current deferred gate. Planner should decide whether to open Vulkan implementation now that the D3D12 full tile pipeline has parity/perf evidence, or keep Vulkan deferred and move to Phase 8 release hardening.
+Phase 8 is current. Phase 7 executed the Vulkan hard gate: D3D12 remains primary; Vulkan native tile implementation is deferred until Vulkan SDK headers/import libraries are available without installing new dependencies.
+
+Phase 7 progress notes:
+- Vulkan hard gate failed for native implementation on this machine: MSVC, Windows SDK, DXC/FXC, dumpbin, and `vulkan-1.dll` were present, but `VULKAN_SDK`, Vulkan SDK roots, `vulkan/vulkan.h`, and `vulkan-1.lib` were missing. Per constraint, no dependencies were installed and no fake native Vulkan tile backend was built.
+- Added a real no-SDK runtime Vulkan probe that runtime-loads `vulkan-1.dll` and enumerates physical devices/queue families through `ctypes`. Local runtime probe found `C:\WINDOWS\System32\vulkan-1.dll`, Vulkan API `1.4.321`, and one compute-capable NVIDIA GeForce RTX 5060 Ti device, but the backend registry reports `vulkan_compute` as `deferred` with reason `vulkan_toolchain_incomplete` because the build gate is incomplete.
+- Added `gpu_backend.VulkanComputeBackend` as an explicit optional/deferred backend behind the same ABI/registry contract. It reports capabilities and clean fallback/deferred status but never claims availability or runs tile work without a real native Vulkan implementation. D3D12 remains selected before Vulkan; CPU fallback remains unchanged.
+- Updated native toolchain/runtime probe JSON, smoke coverage, GPU benchmark metadata, and build docs so missing Vulkan SDK/header/import-lib conditions produce clean skip/fallback telemetry and validation layers/shader compilers remain development/build-time only, never packaged.
+- Phase 7 verification passed locally for deferred path: native toolchain/Vulkan gate report, runtime Vulkan probe, smoke, GPU parity, runtime GPU probe JSON, py_compile/import/no-heavy/default startup guards, and `git diff --check`.

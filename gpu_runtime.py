@@ -15,6 +15,7 @@ from typing import Any
 
 import gpu_backend
 import native_toolchain
+import vulkan_runtime
 
 
 NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
@@ -95,6 +96,14 @@ def _base_probe() -> dict[str, Any]:
             "probe": "imgkey_native_gpu_toolchain",
             "status": "not_run",
             "message": "Native toolchain probe has not run.",
+        },
+        "vulkan_runtime": {
+            "schema_version": vulkan_runtime.VULKAN_RUNTIME_SCHEMA_VERSION,
+            "probe": "imgkey_vulkan_runtime",
+            "status": "not_run",
+            "available": False,
+            "reason": "not_run",
+            "message": "Vulkan runtime probe has not run.",
         },
     }
 
@@ -297,7 +306,7 @@ def _apply_cuda_dll_availability(result: dict[str, Any], availability: dict[str,
 def _apply_backend_registry(result: dict[str, Any], availability: dict[str, Any]) -> None:
     try:
         cuda_backend = gpu_backend.CudaCompatBackend(cuda_probe=lambda **_: availability)
-        backend_objects = [gpu_backend.D3D12ComputeBackend(), cuda_backend]
+        backend_objects = [gpu_backend.D3D12ComputeBackend(), gpu_backend.VulkanComputeBackend(), cuda_backend]
         backends = gpu_backend.probe_backends(backends=backend_objects, include_cpu=True)
         selection = gpu_backend.select_backend(
             "Auto",
@@ -339,6 +348,20 @@ def _apply_native_toolchain_probe(result: dict[str, Any]) -> None:
             "probe": "imgkey_native_gpu_toolchain",
             "status": "error",
             "message": f"Native toolchain probe failed: {type(exc).__name__}: {exc}",
+        }
+
+
+def _apply_vulkan_runtime_probe(result: dict[str, Any]) -> None:
+    try:
+        result["vulkan_runtime"] = vulkan_runtime.probe_vulkan_runtime()
+    except Exception as exc:  # pragma: no cover - defensive probe isolation
+        result["vulkan_runtime"] = {
+            "schema_version": vulkan_runtime.VULKAN_RUNTIME_SCHEMA_VERSION,
+            "probe": "imgkey_vulkan_runtime",
+            "status": "unavailable",
+            "available": False,
+            "reason": "vulkan_runtime_probe_failed",
+            "message": f"Vulkan runtime probe failed: {type(exc).__name__}: {exc}. CPU/D3D12 fallback remains active.",
         }
 
 
@@ -482,6 +505,7 @@ def probe_gpu(
     _apply_cuda_dll_availability(result, availability)
     _apply_backend_registry(result, availability)
     _apply_native_toolchain_probe(result)
+    _apply_vulkan_runtime_probe(result)
     selected_backend = _selected_registry_backend(result)
     if not result["cuda_dll"]["available"]:
         if selected_backend is not None:
@@ -551,6 +575,12 @@ def format_probe_human(result: dict[str, Any]) -> str:
         "native toolchain: "
         f"status={toolchain.get('status')} one_exe={decision.get('status')} "
         f"approved={decision.get('approved')}"
+    )
+    vulkan = result.get("vulkan_runtime", {})
+    lines.append(
+        "vulkan runtime: "
+        f"status={vulkan.get('status')} available={vulkan.get('available')} "
+        f"reason={vulkan.get('reason')} devices={vulkan.get('compute_device_count', vulkan.get('device_count'))}"
     )
     return "\n".join(lines)
 
