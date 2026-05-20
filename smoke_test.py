@@ -3087,7 +3087,10 @@ def run_gpu_runtime_probe_tests() -> None:
         round_tripped = json.loads(json.dumps(probe))
         for key in ("schema_version", "status", "message", "backend", "backend_registry", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke", "native_toolchain", "vulkan_runtime"):
             assert key in round_tripped, f"gpu runtime probe JSON missing {key}"
-        assert round_tripped["native_toolchain"]["packaging_decision"]["status"] == "deferred"
+        decision = round_tripped["native_toolchain"]["packaging_decision"]
+        assert decision["status"] in {"approved", "pending_native_build", "blocked"}
+        assert decision["primary_artifact"] == "dist/ImgKey.exe"
+        assert decision["bundled_native_backend"] == "imgkey_gpu.dll"
         assert round_tripped["native_toolchain"]["components"]["vulkan"]["enabled"] is True
         assert round_tripped["native_toolchain"]["vulkan_gate"]["status"] in {"ready", "blocked"}
         assert round_tripped["vulkan_runtime"]["status"] in {"available", "unavailable"}
@@ -6098,20 +6101,29 @@ def run_packaging_flavor_tests() -> None:
         "corridor" + "key",
         "Corridor" + "Key",
     }
-    assert {"torch", "nvidia"}.issubset(default_excludes), "default spec must exclude CUDA runtime packages"
+    assert {"torch", "nvidia"}.issubset(default_excludes), "primary spec must exclude CUDA/runtime package stacks"
     assert not (shared_optional_excludes - default_excludes), f"default spec missing excludes: {sorted(shared_optional_excludes - default_excludes)}"
     assert {"torch", "nvidia", "cupy", "pycuda", "pyopencl"}.issubset(gpu_excludes), "GPU spec must exclude Python GPU package stacks"
     assert not (shared_optional_excludes - gpu_excludes), f"GPU spec missing excludes: {sorted(shared_optional_excludes - gpu_excludes)}"
 
+    default_spec_text = Path("ImgKey.spec").read_text(encoding="utf-8")
+    assert "imgkey_gpu.dll" in default_spec_text, "primary spec must bundle the native D3D12 GPU DLL"
+    assert "native/imgkey_gpu/build.ps1 -Clean" in default_spec_text, "primary spec must document the native D3D12 build prerequisite"
+    assert "native_gpu_binaries()" in default_spec_text, "primary spec must use explicit native GPU binary collection"
+    assert "collect_dynamic_libs" not in default_spec_text, "primary spec must not collect Python GPU package libraries"
+    assert "imgkey_cuda.dll" not in default_spec_text, "primary ImgKey.exe must not bundle the legacy CUDA compatibility DLL"
+    assert "'gpu_backend'" in default_spec_text and "'gpu_runtime'" in default_spec_text, "primary spec must include backend probe helper modules"
+    assert "'torch'" not in default_spec_text.partition("hiddenimports=")[2].partition("]")[0], "primary hidden imports must not include torch"
+    assert "name='ImgKey'" in default_spec_text, "primary spec must build ImgKey.exe"
+
     gpu_spec_text = Path("ImgKey-GPU.spec").read_text(encoding="utf-8")
     assert "datas=[]" in gpu_spec_text, "GPU spec should not bundle extra data files"
-    assert "'gpu_accel'" in gpu_spec_text and "'gpu_runtime'" in gpu_spec_text, "GPU spec must include GPU helper modules"
-    assert "imgkey_cuda.dll" in gpu_spec_text, "GPU spec must bundle the compact CUDA DLL"
+    assert "'gpu_accel'" in gpu_spec_text and "'gpu_runtime'" in gpu_spec_text, "legacy GPU spec must include GPU helper modules"
+    assert "imgkey_cuda.dll" in gpu_spec_text, "legacy GPU spec must bundle the compact CUDA DLL"
     assert "collect_dynamic_libs" not in gpu_spec_text, "GPU spec must not collect Python CUDA package libraries"
     assert "'torch'" not in gpu_spec_text.partition("hiddenimports=")[2].partition("]")[0], "GPU hidden imports must not include torch"
-    assert "Splash(" in gpu_spec_text and "packaging/imgkey_splash.png" in gpu_spec_text, "GPU spec must keep onefile splash/progress"
-    assert "name='ImgKey-GPU'" in gpu_spec_text, "GPU spec must build ImgKey-GPU.exe"
-    assert "name='ImgKey'" in Path("ImgKey.spec").read_text(encoding="utf-8"), "default spec must build ImgKey.exe"
+    assert "Splash(" in gpu_spec_text and "packaging/imgkey_splash.png" in gpu_spec_text, "legacy GPU spec must keep onefile splash/progress"
+    assert "name='ImgKey-GPU'" in gpu_spec_text, "legacy GPU spec must build ImgKey-GPU.exe"
 
     requirement_lines = [
         line.strip()

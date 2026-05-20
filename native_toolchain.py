@@ -298,15 +298,55 @@ def _probe_vulkan(*, enabled: bool) -> dict[str, Any]:
 
 
 def _one_exe_decision(components: dict[str, Any]) -> dict[str, Any]:
-    del components
+    frozen = bool(getattr(sys, "frozen", False))
+    required_ready = frozen or bool(
+        components.get("msvc", {}).get("available")
+        and components.get("windows_sdk", {}).get("available")
+        and components.get("shader_compilers", {}).get("available")
+        and components.get("dependency_audit", {}).get("available")
+    )
+    if frozen:
+        runtime_root = Path(str(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)))
+        native_dll = runtime_root / "imgkey_gpu.dll"
+        exe_path = Path(sys.executable).resolve()
+    else:
+        repo_root = Path(__file__).resolve().parent
+        native_dll = repo_root / "native" / "imgkey_gpu" / "build" / "imgkey_gpu.dll"
+        exe_path = repo_root / "dist" / "ImgKey.exe"
+    native_dll_mb = native_dll.stat().st_size / (1024 * 1024) if native_dll.is_file() else None
+    exe_mb = exe_path.stat().st_size / (1024 * 1024) if exe_path.is_file() else None
+    over_hard_stop = exe_mb is not None and exe_mb > ONE_EXE_HARD_STOP_MB
+    status = "approved"
+    approved = True
+    reason = "Primary release packaging is the single ImgKey.exe bundle with imgkey_gpu.dll and CPU fallback."
+    if not required_ready:
+        status = "blocked"
+        approved = False
+        reason = "Native D3D12 build/audit toolchain is incomplete; keep CPU fallback/source builds until the toolchain is ready."
+    elif not native_dll.is_file():
+        status = "pending_native_build"
+        approved = False
+        reason = "Run native/imgkey_gpu/build.ps1 -Clean before building the primary ImgKey.exe release artifact."
+    elif over_hard_stop:
+        status = "blocked"
+        approved = False
+        reason = f"dist/ImgKey.exe is {exe_mb:.2f} MB, above the {ONE_EXE_HARD_STOP_MB} MB hard stop."
+
     return {
-        "status": "deferred",
-        "approved": False,
+        "status": status,
+        "approved": approved,
         "preferred_max_mb": ONE_EXE_PREFERRED_MAX_MB,
         "hard_stop_mb": ONE_EXE_HARD_STOP_MB,
-        "reason": "D3D12 MVP binaries may be built locally, but release one-EXE merge still needs size measurements, dependency audit, sanitized-PATH EXE fallback evidence, and explicit approval.",
-        "policy": "Keep the current lightweight ImgKey.exe plus optional ImgKey-GPU.exe policy until backend evidence satisfies the size/dependency/fallback gates.",
+        "reason": reason,
+        "policy": "Use ImgKey.exe as the primary one-file CPU+D3D12 release artifact; keep ImgKey-GPU.exe only as a legacy/dev CUDA compatibility build when explicitly needed.",
         "spec_changes_required_now": False,
+        "primary_artifact": "dist/ImgKey.exe",
+        "bundled_native_backend": "imgkey_gpu.dll",
+        "native_dll_exists": native_dll.is_file(),
+        "native_dll_mb": round(native_dll_mb, 3) if native_dll_mb is not None else None,
+        "exe_exists": exe_path.is_file(),
+        "exe_mb": round(exe_mb, 3) if exe_mb is not None else None,
+        "cuda_legacy_artifact": "dist/ImgKey-GPU.exe (dev/legacy only)",
     }
 
 

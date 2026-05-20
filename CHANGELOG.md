@@ -7,11 +7,12 @@ All notable changes to ImgKey are documented here.
 ### Changed
 
 - Removed the retired assisted-matte product/runtime surface so ImgKey is classical-only before v7 transition cleanup work.
-- Kept two build flavors: default `ImgKey.exe` and optional CUDA tensor-runtime `ImgKey-GPU.exe`.
-- Locked the optional GPU packaging requirement to the torch CUDA runtime and tightened PyInstaller excludes for optional companion/scientific packages.
+- Promoted `ImgKey.exe` to the single primary CPU+D3D12 release artifact with bundled `imgkey_gpu.dll` and automatic CPU fallback; `ImgKey-GPU.exe` is now legacy/dev-only CUDA compatibility packaging.
+- Locked the primary packaging surface to classical dependencies plus the compact native D3D12 DLL, with PyInstaller guards against Torch/model/CUDA Python runtimes and optional companion/scientific packages.
 - Renamed retained manual matte import UI to **Imported Matte**.
 - Promoted the geometric-benchmark `green_cyan_safe` profile as the default **High Accuracy** settings and added smoke gates for geometry detail, leak, edge residual, and CPU/GPU parity.
 - Updated smoke tests, docs, packaging specs, and release workflow for the classical-only surface.
+- Added backend-neutral D3D12/Vulkan/CUDA probe documentation and one-EXE release hardening checks.
 
 ## v1.1.0 - 2026-05-17
 

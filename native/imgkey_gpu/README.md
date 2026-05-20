@@ -15,6 +15,11 @@ or FXC at build time. Shader compiler outputs and DLL/linker artifacts are writt
 under ignored `native/imgkey_gpu/build/`; the packaged app must not rely on a
 runtime shader compiler.
 
+`ImgKey.spec` bundles the resulting `imgkey_gpu.dll` into the primary one-file
+`ImgKey.exe` release artifact. End-user machines need only Windows platform D3D12
+runtime support for acceleration; CPU fallback remains available when D3D12 is not
+usable.
+
 Native kernels:
 
 - `imgkey_gpu_identity_rgba_v1`: byte-exact RGBA upload/dispatch/readback smoke.

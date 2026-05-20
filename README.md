@@ -2,7 +2,7 @@
 
 ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The default build is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks.
 
-Public Windows builds are limited to `ImgKey.exe` for the default CPU path and `ImgKey-GPU.exe` for the optional CUDA tensor-runtime path.
+The public Windows release artifact is `ImgKey.exe`: a one-file CPU+D3D12 build with automatic CPU fallback. `ImgKey-GPU.exe` is retained only as a legacy/development CUDA compatibility package.
 
 ## Quick start
 
@@ -53,7 +53,11 @@ python app.py
 python smoke_test.py
 python smoke_test.py --write-geometric-benchmark
 python smoke_test.py --write-edge-repair-diagnostics
-python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+python smoke_test.py --gpu-parity
+python smoke_test.py --gpu-benchmark
+python -m gpu_runtime --probe --json
+$files = @("app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py", "gpu_accel.py", "gpu_backend.py", "native_toolchain.py", "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py") + (Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py").FullName
+python -m py_compile @files
 python -c "import app, keyer; print('import ok')"
 ```
 
@@ -65,20 +69,22 @@ python smoke_test.py --write-diagnostics
 
 Edge repair diagnostics include before/after PNGs and black/white/gray/checkerboard composites under `.artifact/edge-repair-verification/`.
 
-## Build default EXE
+## Build primary EXE
 
-`ImgKey.spec` is the packaging source of truth. It builds `dist\ImgKey.exe` as a one-file, windowed app from `app.py` and keeps the default bundle lightweight.
+`ImgKey.spec` is the packaging source of truth. It builds `dist\ImgKey.exe` as a one-file, windowed CPU+D3D12 app from `app.py`, bundles `native/imgkey_gpu/build/imgkey_gpu.dll`, and keeps Torch/model/CUDA Python runtimes out of the release bundle.
 
 ```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File native/imgkey_gpu/build.ps1 -Clean
 python -m PyInstaller --noconfirm --clean ImgKey.spec
+.\dist\ImgKey.exe --gpu-probe --json
 $p = Start-Process -FilePath ".\dist\ImgKey.exe" -PassThru
 Start-Sleep -Seconds 6
 if ($p.HasExited) { exit 1 } else { Stop-Process -Id $p.Id }
 ```
 
-## Build optional GPU runtime EXE
+## Legacy CUDA compatibility EXE
 
-`ImgKey-GPU.spec` builds `dist\ImgKey-GPU.exe` with PyTorch CUDA tensor-runtime/probe support and visible onefile startup splash/progress. See `docs/build-gpu.md` for exact clean-environment install/build commands and RTX 50-series / CUDA 12.8 constraints.
+`ImgKey-GPU.spec` builds `dist\ImgKey-GPU.exe` with the old compact CUDA DLL backend for development/compatibility comparisons. It is not the primary release artifact. See `docs/build-gpu.md` for native backend packaging, fallback, and audit commands.
 
 ## Release workflow
 
@@ -91,4 +97,4 @@ git tag v1.1.0
 git push origin v1.1.0
 ```
 
-The workflow runs on `windows-latest`, installs the default dependencies, runs the smoke/import checks, builds with `ImgKey.spec`, and uploads `ImgKey-<version>-windows-x64.exe` to the GitHub Release.
+The workflow runs on `windows-latest`, installs the default dependencies, builds the native D3D12 DLL, runs smoke/import checks, builds with `ImgKey.spec`, probes the generated EXE, and uploads `ImgKey-<version>-windows-x64.exe` to the GitHub Release.

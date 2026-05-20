@@ -1,7 +1,7 @@
 # 10 - ImgKey D3D12/Vulkan Backend Refactor
 
 Date: 2026-05-20
-Status: In progress
+Status: Completed
 Owner: ImgKey Native GPU + App Architecture
 Scope: Refactor ImgKey away from god components and CUDA-specific GPU seams toward a backend-neutral, one-EXE CPU/GPU app with D3D12 as the primary Windows-native GPU backend and Vulkan as an optional portable backend.
 
@@ -42,6 +42,10 @@ The GPU rewrite is not just a shader port. It must also remove current architect
 - `smoke_test.py` (~5.3k lines): smoke tests, benchmark generators, diagnostics, packaging guards, UI probes, private helper tests. Risk: protects behavior well, but imports many private `keyer.py` internals, so refactor needs compatibility shims.
 - `gpu_accel.py` (~770 lines): concrete compact CUDA backend, ctypes ABI, validation, CPU mirror, transition repair dispatch. Risk: it is not a backend abstraction and duplicates keyer color math.
 
+
+
+Current:
+- No
 ### Current GPU bottlenecks
 
 - GPU is optional/off by default and currently CUDA-only.
@@ -54,6 +58,10 @@ The GPU rewrite is not just a shader port. It must also remove current architect
 
 ## 3) Technical direction
 
+
+
+Current:
+- No
 ### Decision
 
 - Do not make CUDA mandatory.
@@ -63,6 +71,10 @@ The GPU rewrite is not just a shader port. It must also remove current architect
 - Vulkan is valuable for portability and cross-vendor compute, but on Windows it adds loader/ICD/synchronization complexity; implement after D3D12 and only through the same backend contract.
 - D3D11 compute may be used as a pragmatic compatibility fallback/prototype if D3D12 implementation risk blocks progress, but it is not the final target of this plan.
 
+
+
+Current:
+- No
 ### Shader/tooling strategy
 
 - Use HLSL as the shared shader source where possible.
@@ -70,6 +82,10 @@ The GPU rewrite is not just a shader port. It must also remove current architect
 - Vulkan: compile HLSL to SPIR-V with DXC (`-spirv`) after binding layout is stabilized.
 - Prefer buffers/structured buffers for parity and simple ctypes-style tile data before optimizing texture paths.
 
+
+
+Current:
+- No
 ### Native ABI direction
 
 Create `native/imgkey_gpu/` with a stable C ABI:
@@ -108,6 +124,10 @@ Capabilities must be explicit:
 - Do not break existing benchmark/diagnostic commands while extracting modules; keep re-export shims if tests still import private helpers.
 - `.claude/`, `.artifact/`, `build/`, `dist/`, native build outputs, and caches must not be staged unless explicitly intended.
 
+
+
+Current:
+- No
 ### Definitions / gates
 
 - Compact size target: one-EXE CPU/GPU release should stay below `150 MB` preferred and `250 MB` hard stop unless the user explicitly approves a larger runtime.
@@ -131,6 +151,10 @@ Phase commit rule:
 - Before commits inspect `git status --short --branch`, `git diff`, and `git log --oneline -10`.
 - Do not stage generated artifacts/build outputs.
 
+
+
+Current:
+- No
 ### Phase 1 - Baseline profiling and behavior freeze
 
 Category:
@@ -148,8 +172,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P1.1 - Add pipeline timing report
 - Add timing instrumentation for:
@@ -178,8 +201,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P1.2 - Freeze visual and parity baselines
 - Generate current geometric benchmark, tuning summary, GPU benchmark, transition diagnostics.
@@ -196,8 +218,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Added `python smoke_test.py --write-perf-baseline`, writing `.artifact/perf/pipeline_baseline.{json,txt}` plus generated source/export PNGs under `.artifact/perf/` only. The profiler wraps current keyer functions at CLI time and records image load, preview resize, global matte, full/local screen model, global/tile-local nearest-inner reference, transition alpha recovery, per-tile color render, PNG export, and compact CUDA combined transfer/dispatch/readback timing without changing keyer behavior.
@@ -208,6 +229,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 2 - Engine module extraction without behavior change
 
 Category:
@@ -225,8 +250,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P2.1 - Extract pure leaf modules
 - Extract low-risk helpers first:
@@ -242,8 +266,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P2.2 - Extract matte/screen/reference/color phases
 - Extract:
@@ -272,8 +295,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Extracted engine-owned dataclasses/types, color math, image I/O, tiling utilities, matte helpers, screen model/screen plate logic, foreground references, transition-alpha recovery, and color-repair/tile color functions into `imgkey_engine/` modules without changing the `keyer.py` import surface.
@@ -283,6 +305,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 3 - UI/controller refactor without UX change
 
 Category:
@@ -300,8 +326,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P3.1 - Split UI primitives and controllers
 - Extract:
@@ -326,8 +351,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Extracted viewer/display primitives into `ui/canvas.py`, reusable controls into `ui/widgets.py`, settings/default/preset mapping into `ui/settings_mapper.py`, preview worker orchestration into `ui/preview_controller.py`, export worker orchestration into `ui/export_controller.py`, and lazy GPU probe subprocess handling into `ui/gpu_probe_controller.py`.
@@ -337,6 +361,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 4 - Backend-neutral native GPU abstraction
 
 Category:
@@ -354,8 +382,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P4.1 - Add backend protocol and session lifecycle
 - Replace direct `gpu_accel.process_color_tile_gpu()` calls with a backend registry/session API:
@@ -382,8 +409,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P4.2 - Native toolchain and packaging decision gate
 - Add a native toolchain probe/report for:
@@ -411,8 +437,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Added `gpu_backend.py` as the backend-neutral registry/session layer with `probe_backends()`, `select_backend()`, `begin_render()`, `process_color_tile()`, and `end_render()`; `CudaCompatBackend` wraps the existing compact CUDA DLL while `gpu_accel.py` remains the concrete CUDA compatibility shim.
@@ -424,6 +449,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 5 - D3D12 compute MVP
 
 Category:
@@ -441,8 +470,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P5.1 - D3D12 identity backend
 - Implement D3D12 device selection, adapter probe, context lifecycle, command queue/list/fence, descriptor/root signature/PSO setup.
@@ -458,8 +486,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P5.2 - D3D12 constant-screen transition kernel
 - Port current CUDA transition repair and screen-residue cleanup to D3D12 compute.
@@ -471,8 +498,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P5.3 - D3D12 `screen_tile` / local plate support
 - Add D3D12 support for per-pixel/per-tile local screen plate inputs.
@@ -494,8 +520,7 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Added `native/imgkey_gpu/imgkey_gpu.cpp`, `imgkey_gpu_color.hlsl`, and `build.ps1` to build `imgkey_gpu.dll` with MSVC, Windows SDK D3D12/DXGI libs, and DXC/FXC build-time shader compilation. Shader bytecode is embedded in the DLL; generated `.cso`/headers/DLL/import libs stay under ignored `native/imgkey_gpu/build/`.
@@ -508,6 +533,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 6 - Full GPU tile color pipeline
 
 Category:
@@ -525,8 +554,7 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P6.1 - GPU linear conversion / unmix foundation
 - Move the linear/sRGB conversion and base unmix math into backend-supported tile kernels.
@@ -538,8 +566,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P6.2 - GPU despill/luma/color cleanup
 - Move:
@@ -557,8 +584,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P6.3 - GPU nearest-inner/transition-reference integration
 - Integrate existing nearest-inner reference inputs into the GPU tile pipeline.
@@ -570,8 +596,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P6.4 - Screen tile/local plate + screen cleanup fusion
 - Fuse local screen plate, screen cleanup, and transition repair into one backend-supported tile graph where possible.
@@ -584,8 +609,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 #### P6.5 - Persistent buffers and batching
 - Add render-session persistent buffers sized for max tile.
@@ -598,8 +622,7 @@ Acceptance:
 Status:
 - Completed
 
-Current:
-- No
+
 
 Progress notes:
 - Added native ABI/color-tile v2 capability `full_color_tile` plus D3D12 shader support for fused tile color work: sRGB/linear conversion, base unmix, Vlahos clamp/key-vector despill, decontaminate/luminance protect, nearest-inner color pull, transition reference repair, repair mask output, and transparent-RGB zero enforcement. CPU remains the correctness/fallback path; CUDA compatibility remains transition-only and reports explicit capability fallback for full-color tiles.
@@ -611,6 +634,10 @@ Progress notes:
 
 ---
 
+
+
+Current:
+- No
 ### Phase 7 - Vulkan backend behind the same ABI
 
 Category:
@@ -628,8 +655,6 @@ Isolation:
 Status:
 - Completed as deferred by Vulkan SDK/toolchain gate
 
-Current:
-- No
 
 #### P7.1 - Vulkan probe/context and SPIR-V shader path
 - Hard stop before this milestone: do not start Vulkan until D3D12 MVP has passed parity, performance, packaging dependency audit, and backend ABI review.
@@ -645,8 +670,7 @@ Acceptance:
 Status:
 - Completed as probe/deferred
 
-Current:
-- No
+
 
 #### P7.2 - Vulkan parity for tile color backend
 - Implement the same tile color operations supported by D3D12.
@@ -658,11 +682,13 @@ Acceptance:
 Status:
 - Deferred
 
-Current:
-- No
 
 ---
 
+
+
+Current:
+- No
 ### Phase 8 - Final release hardening
 
 Category:
@@ -678,10 +704,8 @@ Isolation:
 - Verification/build/docs only.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
 
 #### P8.1 - Verification matrix
 - Run:
@@ -704,16 +728,32 @@ Acceptance:
 - Docs explain backend priority, fallback behavior, and known limitations.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+Progress notes:
+- Activated the one-EXE release path: `ImgKey.spec` now bundles `native/imgkey_gpu/build/imgkey_gpu.dll` into primary `dist\ImgKey.exe`, explicitly excludes Torch/model/CUDA Python runtimes, includes backend probe helpers, rejects native imports for CUDA/Vulkan SDK/shader compiler payloads, and bundles MSVC runtimes only if the D3D12 DLL import table requires them. The legacy `ImgKey-GPU.spec` remains dev-only CUDA compatibility packaging.
+- Updated release docs/workflow/context (`README.md`, `RELEASE.md`, `CHANGELOG.md`, `AGENTS.md`, `.github/workflows/release.yml`, `docs/build-gpu.md`, `native/imgkey_gpu/README.md`) so `ImgKey.exe` is the primary CPU+D3D12 artifact with automatic CPU fallback; Vulkan is documented as runtime-probed/deferred until SDK headers/import lib are available; CUDA compatibility is documented as legacy/dev-only.
+- Native builds passed locally: `native/imgkey_gpu/build.ps1 -Clean` produced `imgkey_gpu.dll` (`332,288` bytes; imports only `d3d12.dll`, `dxgi.dll`, `KERNEL32.dll`), and `native/imgkey_cuda/build.ps1` produced the legacy compatibility DLL for parity/benchmark checks.
+- Verification matrix passed: smoke, geometric benchmark, geometric tuning, GPU parity, GPU benchmark, perf baseline, source/runtime GPU probe, expanded py_compile/import, no-heavy default startup guard, PyInstaller one-EXE build, temp-cwd EXE probe, sanitized-PATH EXE probe, GUI lifetime smoke, recursive archive dependency check, native dependency audit, and `git diff --check`.
+- Packaging evidence supports one-EXE unification: `dist\ImgKey.exe` is `100,363,242` bytes (`95.71 MB`, below the `150 MB` preferred gate and `250 MB` hard stop) with SHA256 `73951db25c193c1d31d94031606ba48047c1e1b904ddfec9325e6ea5c4736e2e`; recursive archive check found `imgkey_gpu.dll` and no Torch/model/CuPy/ONNX/PyOpenCL/CUDA toolkit/DXC/Vulkan SDK payloads.
+- Backend probe evidence: source and packaged probes selected `d3d12_compute` on local NVIDIA GeForce RTX 5060 Ti with `constant_screen`, `screen_tile`, `persistent_session`, `rgb_only`, and `full_color_tile`; CPU fallback reported available; packaged primary EXE correctly left `cuda_compat` unavailable because `imgkey_cuda.dll` is not bundled; Vulkan runtime loader/device were detected but backend status stayed `deferred` with reason `vulkan_toolchain_incomplete`.
+- Benchmark/perf evidence: GPU parity reported D3D12 `max_backend_rgb_diff=1`, direct CUDA diff `0`, and mask diff `0`; GPU benchmark/perf baseline reported D3D12 full-color tile CPU `6283.249 ms` vs D3D12 `51.935 ms` (`120.98x`) and compact CUDA transition CPU `911.642 ms` vs CUDA direct `10.109 ms` / dispatch `568.847 ms`. Large perf baseline completed 4096 flat-blue in `43.97s` and 8192 gradient-blue in `175.24s`, with transparent RGB zero preserved.
+
+
 
 ---
 
 ## 6) Immediate next step
 
-Phase 8 is current. Phase 7 executed the Vulkan hard gate: D3D12 remains primary; Vulkan native tile implementation is deferred until Vulkan SDK headers/import libraries are available without installing new dependencies.
+Plan completed. Phase 8 promoted the D3D12 CPU/GPU one-EXE package, completed final verification, and documented the release policy.
+
+Phase 8 final notes:
+- Primary release artifact: `dist\ImgKey.exe` (`100,363,242` bytes, `95.71 MB`, SHA256 `73951db25c193c1d31d94031606ba48047c1e1b904ddfec9325e6ea5c4736e2e`).
+- Packaging decision: one `ImgKey.exe` is now the intended CPU+D3D12 release artifact with CPU fallback; `ImgKey-GPU.exe` remains legacy/dev CUDA compatibility only.
+- Backend status: D3D12 available/selected on local RTX 5060 Ti; CPU fallback available; Vulkan runtime probe available but native backend deferred by missing SDK headers/import lib; packaged primary EXE does not bundle CUDA compatibility DLL.
+- Limitation carried forward: release-quality broad-GPU claims still need AMD/Intel D3D12/Vulkan validation hardware; Vulkan tile implementation remains deferred until toolchain gate is satisfied.
+
+Phase 7 historical notes:
 
 Phase 7 progress notes:
 - Vulkan hard gate failed for native implementation on this machine: MSVC, Windows SDK, DXC/FXC, dumpbin, and `vulkan-1.dll` were present, but `VULKAN_SDK`, Vulkan SDK roots, `vulkan/vulkan.h`, and `vulkan-1.lib` were missing. Per constraint, no dependencies were installed and no fake native Vulkan tile backend was built.
@@ -721,3 +761,8 @@ Phase 7 progress notes:
 - Added `gpu_backend.VulkanComputeBackend` as an explicit optional/deferred backend behind the same ABI/registry contract. It reports capabilities and clean fallback/deferred status but never claims availability or runs tile work without a real native Vulkan implementation. D3D12 remains selected before Vulkan; CPU fallback remains unchanged.
 - Updated native toolchain/runtime probe JSON, smoke coverage, GPU benchmark metadata, and build docs so missing Vulkan SDK/header/import-lib conditions produce clean skip/fallback telemetry and validation layers/shader compilers remain development/build-time only, never packaged.
 - Phase 7 verification passed locally for deferred path: native toolchain/Vulkan gate report, runtime Vulkan probe, smoke, GPU parity, runtime GPU probe JSON, py_compile/import/no-heavy/default startup guards, and `git diff --check`.
+
+
+
+Current:
+- No

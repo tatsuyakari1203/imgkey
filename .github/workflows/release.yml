@@ -42,7 +42,6 @@ jobs:
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "asset_name=ImgKey-$version-windows-x64.exe" >> $env:GITHUB_OUTPUT
-          "gpu_asset_name=ImgKey-GPU-$version-windows-x64.exe" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -61,10 +60,21 @@ jobs:
       - name: Verify source
         shell: pwsh
         run: |
+          .\native\imgkey_gpu\build.ps1 -Clean
+          if (-not (Test-Path -LiteralPath "native\imgkey_gpu\build\imgkey_gpu.dll")) {
+            throw "native\imgkey_gpu\build\imgkey_gpu.dll was not produced"
+          }
           python smoke_test.py
-          python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+          python -m gpu_runtime --probe --json --no-kernel-smoke
+          $compileFiles = @(
+            "app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py",
+            "gpu_accel.py", "gpu_backend.py", "native_toolchain.py",
+            "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py"
+          )
+          $compileFiles += Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py" | ForEach-Object { $_.FullName }
+          python -m py_compile @compileFiles
           python -c "import app, keyer; print('import ok')"
-          python -c "import sys, app, keyer, gpu_accel, gpu_runtime, screen_analysis; blocked={'torch','torchvision','trans'+'formers','timm','kornia','einops','accelerate','hugging'+'face_hub','safe'+'tensors','skimage','onnxruntime','onnxruntime_gpu','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
+          python -c "import sys, app, keyer, gpu_accel, gpu_backend, gpu_runtime, native_toolchain, screen_analysis; blocked={'torch','torchvision','trans'+'formers','timm','kornia','einops','accelerate','hugging'+'face_hub','safe'+'tensors','skimage','onnxruntime','onnxruntime_gpu','cupy','pyopencl','pymatting','scipy','numba'}; loaded=sorted(m for m in blocked if m in sys.modules); assert not loaded, f'blocked optional/heavy modules imported at default startup: {loaded}'; print('default dependency fence ok')"
 
       - name: Build ImgKey.exe
         shell: pwsh
@@ -73,45 +83,18 @@ jobs:
           if (-not (Test-Path -LiteralPath "dist\ImgKey.exe")) {
             throw "dist\ImgKey.exe was not produced"
           }
-          Copy-Item -LiteralPath "dist\ImgKey.exe" -Destination "dist\${{ steps.release.outputs.asset_name }}" -Force
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.34
-        with:
-          cuda: "12.6.0"
-          method: network
-          sub-packages: '["nvcc","cudart"]'
-
-      - name: Add CUDA Toolkit to PATH
-        shell: pwsh
-        run: |
-          if (-not $env:CUDA_PATH) {
-            throw "CUDA_PATH was not set by the CUDA Toolkit action"
-          }
-          "$env:CUDA_PATH\bin" >> $env:GITHUB_PATH
-          "CUDAToolkit_ROOT=$env:CUDA_PATH" >> $env:GITHUB_ENV
-
-      - name: Build ImgKey-GPU.exe
-        shell: pwsh
-        run: |
-          .\native\imgkey_cuda\build.ps1
-          python -m gpu_runtime --probe --json --no-kernel-smoke
-          python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
-          if (-not (Test-Path -LiteralPath "dist\ImgKey-GPU.exe")) {
-            throw "dist\ImgKey-GPU.exe was not produced"
-          }
-          $blockedPath = @("NVIDIA GPU Computing Toolkit", "Microsoft Visual Studio", "Windows Kits", "MSVC")
+          $blockedPath = @("NVIDIA GPU Computing Toolkit", "Microsoft Visual Studio", "Windows Kits", "MSVC", "VulkanSDK", "DXC", "FXC")
           $pathParts = @($env:PATH -split [IO.Path]::PathSeparator | Where-Object { $_ })
           $sanitizedPath = @($pathParts | Where-Object { $part = $_; -not ($blockedPath | Where-Object { $part -like "*$_*" }) }) -join [IO.Path]::PathSeparator
           $probeInfo = [System.Diagnostics.ProcessStartInfo]::new()
-          $probeInfo.FileName = (Resolve-Path -LiteralPath "dist\ImgKey-GPU.exe").Path
+          $probeInfo.FileName = (Resolve-Path -LiteralPath "dist\ImgKey.exe").Path
           $probeInfo.WorkingDirectory = (Resolve-Path -LiteralPath ".").Path
           $probeInfo.UseShellExecute = $false
           $probeInfo.RedirectStandardOutput = $true
           $probeInfo.RedirectStandardError = $true
           $probeInfo.Environment["PATH"] = $sanitizedPath
           foreach ($key in @($probeInfo.Environment.Keys)) {
-            if ($key -like "CUDA_PATH*" -or $key -in @("CUDA_HOME", "CUDAToolkit_ROOT", "VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsRedistDir")) {
+            if ($key -like "CUDA_PATH*" -or $key -in @("CUDA_HOME", "CUDAToolkit_ROOT", "VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsRedistDir", "VULKAN_SDK", "VK_SDK_PATH")) {
               $probeInfo.Environment.Remove($key) | Out-Null
             }
           }
@@ -125,13 +108,18 @@ jobs:
           $probeStdout
           if ($probeStderr) { $probeStderr }
           if ($probe.ExitCode -ne 0) {
-            throw "dist\ImgKey-GPU.exe probe failed with exit code $($probe.ExitCode)"
+            throw "dist\ImgKey.exe probe failed with exit code $($probe.ExitCode)"
           }
           $probeJson = $probeStdout | ConvertFrom-Json
-          if (-not $probeJson.cuda_dll.load_success) {
-            throw "dist\ImgKey-GPU.exe did not load the bundled compact CUDA DLL: $($probeJson.cuda_dll.message)"
+          $cpu = @($probeJson.backend_registry.backends | Where-Object { $_.id -eq "cpu_fallback" })[0]
+          if (-not $cpu.available) {
+            throw "dist\ImgKey.exe did not report CPU fallback availability"
           }
-          Copy-Item -LiteralPath "dist\ImgKey-GPU.exe" -Destination "dist\${{ steps.release.outputs.gpu_asset_name }}" -Force
+          $d3d12 = @($probeJson.backend_registry.backends | Where-Object { $_.id -eq "d3d12_compute" })[0]
+          if (-not $d3d12) {
+            throw "dist\ImgKey.exe probe did not report the bundled D3D12 backend"
+          }
+          Copy-Item -LiteralPath "dist\ImgKey.exe" -Destination "dist\${{ steps.release.outputs.asset_name }}" -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -139,7 +127,6 @@ jobs:
           name: ImgKey-${{ steps.release.outputs.version }}-windows-x64
           path: |
             dist/${{ steps.release.outputs.asset_name }}
-            dist/${{ steps.release.outputs.gpu_asset_name }}
           if-no-files-found: error
 
       - name: Create GitHub release
@@ -151,4 +138,3 @@ jobs:
           generate_release_notes: true
           files: |
             dist/${{ steps.release.outputs.asset_name }}
-            dist/${{ steps.release.outputs.gpu_asset_name }}

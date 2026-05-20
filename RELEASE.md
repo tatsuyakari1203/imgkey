@@ -6,9 +6,9 @@ This document describes how ImgKey releases are produced, verified, and publishe
 
 - Target platform: Windows x64
 - Release artifact: `ImgKey-<version>-windows-x64.exe`
-- Optional local artifact: `ImgKey-GPU.exe`
+- Optional local artifact: `ImgKey-GPU.exe` legacy/dev CUDA compatibility build only
 - Build type: one-file, windowed PyInstaller executable
-- Runtime profile: default classical build
+- Runtime profile: classical CPU path plus bundled native D3D12 backend with automatic CPU fallback
 
 ## What is included
 
@@ -18,6 +18,7 @@ This document describes how ImgKey releases are produced, verified, and publishe
 - Global connected-background matte decisions before tiled full-resolution export.
 - Edge-only trimap refinement and tile-safe PNG export.
 - Edge Color Reconstruction Pro: alpha/spill-gated fringe mask, alpha-aware foreground unmix, Vlahos-style key-channel clamp, nearest-inner foreground color pull, luminance protection, and zeroed transparent RGB.
+- Backend-neutral GPU registry with D3D12 as the primary native Windows backend, deferred Vulkan runtime probe telemetry, legacy CUDA compatibility for local comparisons, and CPU fallback.
 
 ## Release workflow
 
@@ -28,14 +29,17 @@ The workflow runs on `windows-latest` and performs:
 1. Check out the repository.
 2. Set up Python 3.10.
 3. Install dependencies from `requirements.txt` plus PyInstaller.
-4. Run verification:
+4. Build `native/imgkey_gpu/build/imgkey_gpu.dll` with `native/imgkey_gpu/build.ps1 -Clean`.
+5. Run verification:
    - `python smoke_test.py`
-   - `python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py`
+   - `python -m gpu_runtime --probe --json --no-kernel-smoke`
+   - PowerShell-expanded `python -m py_compile` over `app.py`, `keyer.py`, GPU/runtime modules, `imgkey_engine/*.py`, and `ui/*.py`
    - `python -c "import app, keyer; print('import ok')"`
-5. Build the executable with `python -m PyInstaller --noconfirm --clean ImgKey.spec`.
-6. Rename the release asset to `ImgKey-<version>-windows-x64.exe`.
-7. Upload the EXE as a workflow artifact.
-8. Create or update the GitHub Release and attach the EXE.
+6. Build the executable with `python -m PyInstaller --noconfirm --clean ImgKey.spec`.
+7. Probe `dist\ImgKey.exe --gpu-probe --json` with a sanitized PATH and verify CPU fallback plus any available D3D12 status.
+8. Rename the release asset to `ImgKey-<version>-windows-x64.exe`.
+9. Upload the EXE as a workflow artifact.
+10. Create or update the GitHub Release and attach the EXE.
 
 ## How to publish a release
 
@@ -71,10 +75,19 @@ Manual dispatch is useful for rebuilding an existing release asset, but normal r
 Run these commands before creating a release tag:
 
 ```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File native/imgkey_gpu/build.ps1 -Clean
 python smoke_test.py
-python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py
+python smoke_test.py --write-geometric-benchmark
+python smoke_test.py --tune-geometric-defaults
+python smoke_test.py --gpu-parity
+python smoke_test.py --gpu-benchmark
+python smoke_test.py --write-perf-baseline
+python -m gpu_runtime --probe --json
+$files = @("app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py", "gpu_accel.py", "gpu_backend.py", "native_toolchain.py", "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py") + (Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py").FullName
+python -m py_compile @files
 python -c "import app, keyer; print('import ok')"
 python -m PyInstaller --noconfirm --clean ImgKey.spec
+.\dist\ImgKey.exe --gpu-probe --json
 ```
 
 Optional diagnostics:
@@ -89,8 +102,9 @@ Diagnostics are generated under `.artifact/` and are intentionally not committed
 ## Dependency policy
 
 - Allowed default dependencies: `numpy`, `opencv-python`, `Pillow`, `PySide6`, and Python standard library modules.
-- Keep PyTorch/CUDA out of the default dependency file and default PyInstaller spec.
-- Publish `ImgKey-GPU.exe` as a separate optional asset when CUDA tensor-runtime support is needed.
+- Keep PyTorch/CUDA, CuPy, ONNX Runtime, PyOpenCL, model runtimes, Vulkan SDK files, and shader compilers out of the default dependency file and primary PyInstaller spec.
+- The primary `ImgKey.exe` may include only the compact native `imgkey_gpu.dll` plus imported MSVC runtime DLLs if the native DLL needs them.
+- Keep `ImgKey-GPU.exe` as a legacy/dev CUDA compatibility artifact only; do not publish it as the primary public release asset.
 
 ## Artifact policy
 

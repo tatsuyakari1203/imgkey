@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# GPU runtime packaging flavor: compact native CUDA DLL backend.
+# Legacy/dev GPU compatibility packaging flavor: compact native CUDA DLL backend.
+# The primary release artifact is ImgKey.exe from ImgKey.spec with imgkey_gpu.dll.
 
 import glob
 import os
