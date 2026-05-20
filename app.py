@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 import sys
 
-import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QProcess, QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCursor, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QWheelEvent
+from PySide6.QtCore import QEvent, QProcess, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QColor, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -16,12 +13,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QGraphicsPixmapItem,
-    QGraphicsScene,
-    QGraphicsView,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -47,71 +40,58 @@ from PySide6.QtWidgets import (
 from keyer import (
     KeyResult,
     KeySettings,
-    checkerboard_composite,
-    process_key_image,
     read_grayscale_mask,
     read_imported_matte_mask,
     read_image_rgb,
     resize_for_preview,
     write_grayscale_mask,
-    write_png_rgba,
 )
+from ui.canvas import (
+    BACKGROUND_MODES,
+    VIEW_MODES,
+    ImageCanvas,
+    blank_rgb_qimage,
+    checker_brush,
+    composite_rgba_for_mode,
+    debug_rgb_to_rgb,
+    mask_to_qimage,
+    mask_to_rgb,
+    rgb_to_qimage,
+    rgba_to_qimage,
+)
+from ui.export_controller import ExportController, ExportThread
+from ui.gpu_probe_controller import (
+    GPUProbeController,
+    format_gpu_probe_details,
+    format_gpu_probe_summary,
+    gpu_probe_subprocess_command,
+    json_object_from_text,
+    message_mentions_gpu_backend,
+    process_stderr,
+    process_stdout,
+)
+from ui.preview_controller import (
+    PreviewController,
+    PreviewJob,
+    PreviewThread,
+    resize_alpha_for_preview,
+    resize_alpha_hint_mask,
+    resize_mask,
+)
+from ui.settings_mapper import (
+    APP_DEFAULT_EDGE_RADIUS,
+    APP_DEFAULT_KEY_MODE,
+    APP_DEFAULT_SETTINGS,
+    app_default_settings,
+    current_settings_from_window,
+    preset_control_values,
+    processing_alpha_input,
+)
+from ui.widgets import SliderRow, label_row
 
 
-VIEW_MODES = (
-    "Result",
-    "Source",
-    "Alpha",
-    "Imported Matte",
-    "Background Mask",
-    "Edge Mask",
-    "Fringe Mask",
-    "Despill Mask",
-    "Foreground RGB",
-    "Split Compare",
-)
-BACKGROUND_MODES = ("Checkerboard", "Black", "White", "Gray", "Transparent")
 OUTPUT_MODES = ("Classical", "Imported Matte")
 GPU_ACCELERATION_MODES = ("Auto", "Off", "Force GPU")
-APP_DIR = Path(__file__).resolve().parent
-FROZEN_APP = bool(getattr(sys, "frozen", False))
-WRITABLE_APP_DIR = Path(sys.executable).resolve().parent if FROZEN_APP else APP_DIR
-APP_DEFAULT_KEY_MODE = "Blue"
-APP_DEFAULT_EDGE_RADIUS = 24
-APP_DEFAULT_SETTINGS = KeySettings(
-    key_color=(30, 80, 235),
-    tolerance=0.26,
-    softness=0.02,
-    edge_blur=(APP_DEFAULT_EDGE_RADIUS - 1) / 4.0,
-    cleanup=0,
-    despill=0.80,
-    sample_size=10,
-    auto_border_sample=True,
-    auto_detect_key_color=False,
-    clip_background=0.95,
-    clip_foreground=0.08,
-    matte_gamma=1.60,
-    core_strength=0.45,
-    edge_refine_radius=APP_DEFAULT_EDGE_RADIUS,
-    edge_softness=0.04,
-    erode_expand=-4,
-    despeckle_min_area=0,
-    aggressive_interior_removal=True,
-    decontaminate=0.70,
-    luminance_restore=0.85,
-    fringe_remove=0.85,
-    edge_color_repair=0.80,
-    inner_color_pull=0.60,
-    fringe_band_radius=5,
-    luminance_protect=0.85,
-    transition_unmix=True,
-    alpha_recover_strength=0.90,
-    key_vector_despill=0.85,
-    foreground_reference_pull=0.75,
-    screen_cleanup_strength=1.00,
-    screen_cleanup_similarity=8,
-    gpu_acceleration="Off",
-)
 
 
 def update_boot_splash(message: str) -> None:
@@ -163,17 +143,6 @@ def create_qt_startup_splash() -> QSplashScreen:
     splash.showMessage("Starting ImgKey…", Qt.AlignLeft | Qt.AlignBottom, QColor("#E7ECF3"))
     return splash
 
-
-def app_default_settings() -> KeySettings:
-    return replace(APP_DEFAULT_SETTINGS)
-
-
-def gpu_probe_subprocess_command() -> tuple[str, list[str]]:
-    if FROZEN_APP:
-        return sys.executable, ["--gpu-probe", "--json"]
-    return sys.executable, ["-m", "gpu_runtime", "--probe", "--json"]
-
-
 def dispatch_headless_cli(argv: list[str]) -> int | None:
     args = list(argv[1:])
     if not args:
@@ -188,554 +157,6 @@ def dispatch_headless_cli(argv: list[str]) -> int | None:
         return gpu_runtime_main(probe_args)
 
     return None
-
-
-@dataclass(slots=True)
-class PreviewJob:
-    input_rgb: np.ndarray
-    original_alpha: np.ndarray | None
-    keep_mask: np.ndarray | None
-    remove_mask: np.ndarray | None
-    alpha_hint: np.ndarray | None
-    settings: KeySettings
-    display_rgb: np.ndarray
-    display_alpha: np.ndarray | None
-    display_scale: float
-    crop_origin: tuple[int, int]
-    label: str
-
-
-class ImageCanvas(QGraphicsView):
-    sampled = Signal(int, int)
-    cursor_changed = Signal(int, int)
-    cursor_left = Signal()
-    view_changed = Signal()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setObjectName("ImageCanvas")
-        self.setMinimumSize(520, 360)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
-
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-        self._pixmap_item = QGraphicsPixmapItem()
-        self._scene.addItem(self._pixmap_item)
-
-        self.source_rgb: np.ndarray | None = None
-        self.result: KeyResult | None = None
-        self.display_scale = 1.0
-        self.crop_origin = (0, 0)
-        self.view_mode = "Result"
-        self.background_mode = "Checkerboard"
-        self.persistent_tool = "Pan"
-        self.picker_enabled = False
-        self.space_pan_active = False
-        self._fit_mode = True
-        self._has_pixmap = False
-        self._picker_cursor = self._build_picker_cursor()
-        self._apply_background()
-        self._apply_tool_state()
-
-    def set_images(
-        self,
-        source_rgb: np.ndarray | None,
-        result: KeyResult | None,
-        *,
-        display_scale: float,
-        crop_origin: tuple[int, int],
-        reset_view: bool = True,
-    ) -> None:
-        self.source_rgb = source_rgb
-        self.result = result
-        self.display_scale = max(float(display_scale), 1e-6)
-        self.crop_origin = crop_origin
-        self._refresh_pixmap(reset_view=reset_view)
-
-    def set_result(self, result: KeyResult | None) -> None:
-        self.result = result
-        self._refresh_pixmap(reset_view=False)
-
-    def set_view_mode(self, mode: str) -> None:
-        if mode not in VIEW_MODES:
-            return
-        self.view_mode = mode
-        self._refresh_pixmap(reset_view=False)
-
-    def set_background_mode(self, mode: str) -> None:
-        if mode not in BACKGROUND_MODES:
-            return
-        if mode == self.background_mode:
-            return
-        self.background_mode = mode
-        self._apply_background()
-        if self._display_depends_on_background():
-            self._refresh_pixmap(reset_view=False)
-        else:
-            self.viewport().update()
-
-    def _display_depends_on_background(self) -> bool:
-        return self.view_mode == "Split Compare"
-
-    def set_picker_enabled(self, enabled: bool) -> None:
-        self.persistent_tool = "Pick" if enabled else "Pan"
-        self.picker_enabled = enabled
-        self._apply_tool_state()
-
-    def set_space_pan_active(self, active: bool) -> None:
-        if self.space_pan_active == active:
-            return
-        self.space_pan_active = active
-        self._apply_tool_state()
-
-    def fit_to_view(self) -> None:
-        if not self._has_pixmap:
-            return
-        self._fit_mode = True
-        self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
-        self.view_changed.emit()
-
-    def set_100_percent(self) -> None:
-        if not self._has_pixmap:
-            return
-        self._fit_mode = False
-        self.resetTransform()
-        self.view_changed.emit()
-
-    def visible_image_rect(self) -> tuple[int, int, int, int] | None:
-        if not self._has_pixmap:
-            return None
-        polygon = self.mapToScene(self.viewport().rect())
-        rect = polygon.boundingRect().intersected(self._pixmap_item.sceneBoundingRect())
-        if rect.isEmpty():
-            return None
-        return self._clamped_rect(rect)
-
-    def _refresh_pixmap(self, *, reset_view: bool) -> None:
-        preserve_view = not reset_view and self._has_pixmap
-        old_transform = self.transform() if preserve_view else None
-        old_center = self.mapToScene(self.viewport().rect().center()) if preserve_view else None
-        old_size = self._pixmap_item.pixmap().size() if self._has_pixmap else QSize()
-        image = self._display_image()
-        if image is None:
-            self._pixmap_item.setPixmap(QPixmap())
-            self._scene.setSceneRect(QRectF())
-            self._has_pixmap = False
-            self.view_changed.emit()
-            return
-        pixmap = QPixmap.fromImage(image)
-        self._pixmap_item.setPixmap(pixmap)
-        self._pixmap_item.setOffset(0, 0)
-        self._scene.setSceneRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
-        self._has_pixmap = True
-        if reset_view or not preserve_view or (self._fit_mode and old_size != pixmap.size()):
-            QTimer.singleShot(0, self.fit_to_view)
-        elif old_transform is not None and old_center is not None:
-            self.setTransform(old_transform)
-            self.centerOn(old_center)
-            self.view_changed.emit()
-
-    def _apply_tool_state(self) -> None:
-        if self.space_pan_active or self.persistent_tool == "Pan":
-            self.setDragMode(QGraphicsView.ScrollHandDrag)
-            self.viewport().setCursor(Qt.OpenHandCursor)
-            return
-        self.setDragMode(QGraphicsView.NoDrag)
-        self.viewport().setCursor(self._picker_cursor)
-
-    def _build_picker_cursor(self) -> QCursor:
-        try:
-            size = 25
-            center = size // 2
-            pixmap = QPixmap(size, size)
-            pixmap.fill(QColor(0, 0, 0, 0))
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(QColor(8, 12, 18))
-            painter.drawEllipse(center - 5, center - 5, 10, 10)
-            painter.drawLine(center, 1, center, 8)
-            painter.drawLine(center, size - 9, center, size - 2)
-            painter.drawLine(1, center, 8, center)
-            painter.drawLine(size - 9, center, size - 2, center)
-            painter.setPen(QColor(245, 248, 255))
-            painter.drawEllipse(center - 4, center - 4, 8, 8)
-            painter.drawLine(center, 2, center, 8)
-            painter.drawLine(center, size - 9, center, size - 3)
-            painter.drawLine(2, center, 8, center)
-            painter.drawLine(size - 9, center, size - 3, center)
-            painter.end()
-            if not pixmap.isNull():
-                return QCursor(pixmap, center, center)
-        except Exception:
-            pass
-        return QCursor(Qt.CrossCursor)
-
-    def _display_image(self) -> QImage | None:
-        if self.source_rgb is None:
-            return None
-        mode = self.view_mode
-        result = self.result
-        if mode == "Source" or result is None:
-            return rgb_to_qimage(self.source_rgb)
-        if mode == "Result":
-            return rgba_to_qimage(result.rgba)
-        if mode == "Alpha":
-            return mask_to_qimage(result.alpha, self.source_rgb.shape[:2])
-        if mode == "Imported Matte":
-            return mask_to_qimage(result.alpha_hint, self.source_rgb.shape[:2])
-        if mode == "Background Mask":
-            return mask_to_qimage(result.background_mask, self.source_rgb.shape[:2])
-        if mode == "Edge Mask":
-            return mask_to_qimage(result.edge_mask, self.source_rgb.shape[:2])
-        if mode == "Fringe Mask":
-            return mask_to_qimage(result.fringe_mask, self.source_rgb.shape[:2])
-        if mode == "Despill Mask":
-            return mask_to_qimage(result.despill_mask, self.source_rgb.shape[:2])
-        if mode == "Foreground RGB":
-            foreground_rgb = result.foreground_rgb
-            if foreground_rgb is None:
-                foreground_rgb = result.foreground
-            if foreground_rgb is None:
-                foreground_rgb = result.rgba[:, :, :3]
-            return rgb_to_qimage(debug_rgb_to_rgb(foreground_rgb, self.source_rgb.shape[:2]))
-        if mode == "Split Compare":
-            return rgb_to_qimage(self._split_compare(result))
-        return rgb_to_qimage(self.source_rgb)
-
-    def _split_compare(self, result: KeyResult) -> np.ndarray:
-        source = self.source_rgb if self.source_rgb is not None else result.rgba[:, :, :3]
-        out = source.copy()
-        comp = composite_rgba_for_mode(result.rgba, self.background_mode)
-        split_x = out.shape[1] // 2
-        out[:, split_x:] = comp[:, split_x:]
-        out[:, max(0, split_x - 1) : min(out.shape[1], split_x + 1)] = np.array([79, 140, 255], dtype=np.uint8)
-        return out
-
-    def _apply_background(self) -> None:
-        if self.background_mode == "Checkerboard":
-            self._scene.setBackgroundBrush(checker_brush())
-        elif self.background_mode == "Black":
-            self._scene.setBackgroundBrush(QBrush(QColor("#000000")))
-        elif self.background_mode == "White":
-            self._scene.setBackgroundBrush(QBrush(QColor("#ffffff")))
-        elif self.background_mode == "Gray":
-            self._scene.setBackgroundBrush(QBrush(QColor("#777d86")))
-        else:
-            self._scene.setBackgroundBrush(QBrush(QColor("#101318")))
-
-    def _image_pos_from_event(self, event: QMouseEvent) -> tuple[int, int] | None:
-        if not self._has_pixmap:
-            return None
-        scene_pos = self.mapToScene(event.position().toPoint())
-        item_pos = self._pixmap_item.mapFromScene(scene_pos)
-        x = int(np.floor(item_pos.x()))
-        y = int(np.floor(item_pos.y()))
-        pixmap = self._pixmap_item.pixmap()
-        if x < 0 or y < 0 or x >= pixmap.width() or y >= pixmap.height():
-            return None
-        return x, y
-
-    def _clamped_rect(self, rect: QRectF) -> tuple[int, int, int, int]:
-        pixmap = self._pixmap_item.pixmap()
-        x0 = max(0, min(pixmap.width(), int(np.floor(rect.left()))))
-        y0 = max(0, min(pixmap.height(), int(np.floor(rect.top()))))
-        x1 = max(0, min(pixmap.width(), int(np.ceil(rect.right()))))
-        y1 = max(0, min(pixmap.height(), int(np.ceil(rect.bottom()))))
-        if x1 <= x0:
-            x1 = min(pixmap.width(), x0 + 1)
-        if y1 <= y0:
-            y1 = min(pixmap.height(), y0 + 1)
-        return x0, y0, x1, y1
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        pos = self._image_pos_from_event(event)
-        if pos is None:
-            self.cursor_left.emit()
-        else:
-            self.cursor_changed.emit(pos[0], pos[1])
-        super().mouseMoveEvent(event)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self.picker_enabled and not self.space_pan_active and event.button() == Qt.LeftButton:
-            pos = self._image_pos_from_event(event)
-            if pos is not None:
-                self.sampled.emit(pos[0], pos[1])
-                event.accept()
-                return
-        if event.button() == Qt.LeftButton and self.dragMode() == QGraphicsView.ScrollHandDrag:
-            self._fit_mode = False
-        super().mousePressEvent(event)
-
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        self.cursor_left.emit()
-        super().leaveEvent(event)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        if self._fit_mode and self._has_pixmap:
-            QTimer.singleShot(0, self.fit_to_view)
-
-    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
-        if not self._has_pixmap:
-            event.ignore()
-            return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        current_zoom = self.transform().m11()
-        factor = 1.22 if delta > 0 else 1 / 1.22
-        next_zoom = current_zoom * factor
-        if next_zoom < 0.04 or next_zoom > 32.0:
-            return
-        self._fit_mode = False
-        self.scale(factor, factor)
-        self.view_changed.emit()
-        event.accept()
-
-
-class SliderRow(QWidget):
-    value_changed = Signal()
-
-    def __init__(
-        self,
-        title: str,
-        minimum: float,
-        maximum: float,
-        default: float,
-        *,
-        step: float,
-        decimals: int = 2,
-        integer: bool = False,
-    ) -> None:
-        super().__init__()
-        self.minimum = float(minimum)
-        self.maximum = float(maximum)
-        self.default = int(default) if integer else float(default)
-        self.step = float(step)
-        self.decimals = decimals
-        self.integer = integer
-        self._steps = max(1, int(round((self.maximum - self.minimum) / self.step)))
-
-        root = QGridLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setHorizontalSpacing(8)
-        root.setVerticalSpacing(6)
-        self.label = QLabel(title)
-        self.label.setObjectName("ControlLabel")
-        root.addWidget(self.label, 0, 0, 1, 3)
-
-        self.value_label = QLabel()
-        self.value_label.setObjectName("SliderValueLabel")
-        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        root.addWidget(self.value_label, 0, 3, 1, 2)
-
-        nudge_tooltip = "Adjust by one step. Hold Ctrl or Shift while clicking for 10× step."
-        self.minus_btn = QPushButton("−")
-        self.minus_btn.setObjectName("StepButton")
-        self.minus_btn.setFixedWidth(26)
-        self.minus_btn.setToolTip(nudge_tooltip)
-        root.addWidget(self.minus_btn, 1, 0)
-
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(0, self._steps)
-        root.addWidget(self.slider, 1, 1)
-
-        self.plus_btn = QPushButton("+")
-        self.plus_btn.setObjectName("StepButton")
-        self.plus_btn.setFixedWidth(26)
-        self.plus_btn.setToolTip(nudge_tooltip)
-        root.addWidget(self.plus_btn, 1, 2)
-
-        if integer:
-            self.spin = QSpinBox()
-            self.spin.setRange(int(round(self.minimum)), int(round(self.maximum)))
-            self.spin.setSingleStep(max(1, int(round(self.step))))
-        else:
-            self.spin = QDoubleSpinBox()
-            self.spin.setRange(self.minimum, self.maximum)
-            self.spin.setSingleStep(self.step)
-            self.spin.setDecimals(decimals)
-        self.spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.spin.setKeyboardTracking(False)
-        self.spin.setFixedWidth(82)
-        root.addWidget(self.spin, 1, 3)
-
-        self.reset_btn = QPushButton("↺")
-        self.reset_btn.setObjectName("ResetButton")
-        self.reset_btn.setFixedWidth(28)
-        self.reset_btn.setToolTip("Reset to tuned default")
-        root.addWidget(self.reset_btn, 1, 4)
-        root.setColumnStretch(1, 1)
-
-        self.minus_btn.clicked.connect(lambda: self.nudge(-1))
-        self.plus_btn.clicked.connect(lambda: self.nudge(1))
-        self.slider.valueChanged.connect(self._from_slider_changed)
-        self.spin.valueChanged.connect(self._from_spin_changed)
-        self.reset_btn.clicked.connect(self.reset)
-        self.set_value(self.default, emit=False)
-
-    def value(self) -> int | float:
-        value = self.spin.value()
-        return int(round(value)) if self.integer else float(value)
-
-    def set_value(self, value: float, *, emit: bool = True) -> None:
-        slider_pos = self._value_to_pos(value)
-        value = self._pos_to_value(slider_pos)
-        self.slider.blockSignals(True)
-        self.spin.blockSignals(True)
-        self.slider.setValue(slider_pos)
-        self.spin.setValue(int(round(value)) if self.integer else float(value))
-        self._update_value_label(value)
-        self.slider.blockSignals(False)
-        self.spin.blockSignals(False)
-        if emit:
-            self.value_changed.emit()
-
-    def reset(self) -> None:
-        self.set_value(self.default)
-
-    def nudge(self, direction: int) -> None:
-        modifiers = QApplication.keyboardModifiers()
-        multiplier = 10 if modifiers & (Qt.ControlModifier | Qt.ShiftModifier) else 1
-        self.set_value(float(self.value()) + (self.step * multiplier * (1 if direction >= 0 else -1)))
-
-    def _from_slider_changed(self, position: int) -> None:
-        value = self._pos_to_value(position)
-        self.spin.blockSignals(True)
-        self.spin.setValue(int(round(value)) if self.integer else value)
-        self._update_value_label(value)
-        self.spin.blockSignals(False)
-        self.value_changed.emit()
-
-    def _from_spin_changed(self, value: float) -> None:
-        slider_pos = self._value_to_pos(float(value))
-        value = self._pos_to_value(slider_pos)
-        self.slider.blockSignals(True)
-        self.spin.blockSignals(True)
-        self.slider.setValue(slider_pos)
-        self.spin.setValue(int(round(value)) if self.integer else float(value))
-        self._update_value_label(value)
-        self.spin.blockSignals(False)
-        self.slider.blockSignals(False)
-        self.value_changed.emit()
-
-    def _clamp(self, value: float) -> float:
-        return max(self.minimum, min(self.maximum, float(value)))
-
-    def _value_to_pos(self, value: float) -> int:
-        return max(0, min(self._steps, int(round((self._clamp(value) - self.minimum) / self.step))))
-
-    def _pos_to_value(self, position: int) -> float:
-        value = self.minimum + max(0, min(self._steps, position)) * self.step
-        value = self._clamp(value)
-        if self.integer:
-            return float(int(round(value)))
-        return round(value, self.decimals)
-
-    def _format_value(self, value: float) -> str:
-        if self.integer:
-            return str(int(round(value)))
-        return f"{float(value):.{self.decimals}f}"
-
-    def _update_value_label(self, value: float) -> None:
-        self.value_label.setText(self._format_value(value))
-
-
-class PreviewThread(QThread):
-    done = Signal(int, object)
-    progress = Signal(int, float, str)
-    failed = Signal(int, str)
-
-    def __init__(self, generation: int, job: PreviewJob) -> None:
-        super().__init__()
-        self.generation = generation
-        self.job = job
-        self._cancel_requested = False
-
-    def request_cancel(self) -> None:
-        self._cancel_requested = True
-
-    def _is_cancelled(self) -> bool:
-        return self._cancel_requested
-
-    def run(self) -> None:
-        try:
-            result = process_key_image(
-                self.job.input_rgb,
-                self.job.settings,
-                self.job.original_alpha,
-                keep_mask=self.job.keep_mask,
-                remove_mask=self.job.remove_mask,
-                alpha_hint=self.job.alpha_hint,
-                progress_callback=lambda value, stage: None
-                if self._cancel_requested
-                else self.progress.emit(self.generation, value, stage),
-                cancel_callback=self._is_cancelled,
-            )
-            if self._cancel_requested:
-                return
-            self.done.emit(self.generation, result)
-        except Exception as exc:  # pragma: no cover - UI boundary
-            if self._cancel_requested and "cancel" in str(exc).lower():
-                return
-            self.failed.emit(self.generation, str(exc))
-
-
-class ExportThread(QThread):
-    progress = Signal(float, str)
-    done = Signal(str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        path: str,
-        rgb: np.ndarray,
-        original_alpha: np.ndarray | None,
-        settings: KeySettings,
-        keep_mask: np.ndarray | None,
-        remove_mask: np.ndarray | None,
-        alpha_hint: np.ndarray | None,
-    ) -> None:
-        super().__init__()
-        self.path = path
-        self.rgb = rgb
-        self.original_alpha = original_alpha
-        self.settings = settings
-        self.keep_mask = keep_mask
-        self.remove_mask = remove_mask
-        self.alpha_hint = alpha_hint
-        self._cancel_requested = False
-
-    def request_cancel(self) -> None:
-        self._cancel_requested = True
-
-    def run(self) -> None:
-        try:
-            result = process_key_image(
-                self.rgb,
-                self.settings,
-                self.original_alpha,
-                keep_mask=self.keep_mask,
-                remove_mask=self.remove_mask,
-                alpha_hint=self.alpha_hint,
-                progress_callback=lambda value, stage: self.progress.emit(value, stage),
-                cancel_callback=lambda: self._cancel_requested,
-                include_debug=False,
-            )
-            if self._cancel_requested:
-                raise RuntimeError("Processing cancelled")
-            write_png_rgba(self.path, result.rgba)
-            self.done.emit(self.path)
-        except Exception as exc:  # pragma: no cover - UI boundary
-            self.failed.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -765,16 +186,9 @@ class MainWindow(QMainWindow):
         self.last_cursor_rgb: tuple[int, int, int] | None = None
         self.settings = app_default_settings()
 
-        self._preview_generation = 0
-        self._preview_jobs: dict[int, PreviewJob] = {}
-        self._preview_threads: list[PreviewThread] = []
-        self._preview_pending = False
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.timeout.connect(self._start_preview)
-        self.export_thread: ExportThread | None = None
-        self.gpu_probe_process: QProcess | None = None
-        self.last_gpu_probe: dict | None = None
+        self.preview_controller = PreviewController(self)
+        self.export_controller = ExportController(self)
+        self.gpu_probe_controller = GPUProbeController(self)
         self._closing = False
 
         self._build_ui()
@@ -1390,74 +804,16 @@ class MainWindow(QMainWindow):
         self.schedule_preview()
 
     def current_settings(self) -> KeySettings:
-        key_mode = self.key_mode.currentText()
-        output_mode = self.output_mode.currentText() if hasattr(self, "output_mode") else "Classical"
-        engine_mode = {
-            "Imported Matte": "ImportedMatte",
-        }.get(output_mode, "GraphicExact")
-        radius = int(self.edge_radius.value())
-        return KeySettings(
-            key_color=self.settings.key_color,
-            tolerance=float(self.screen_tolerance.value()),
-            softness=float(self.screen_softness.value()),
-            edge_blur=max(0.0, (radius - 1) / 4.0),
-            cleanup=0,
-            mode=engine_mode,
-            sample_size=int(self.sample_size.value()),
-            auto_border_sample=key_mode != "Pick",
-            auto_detect_key_color=key_mode == "Auto",
-            clip_background=float(self.clip_background.value()),
-            clip_foreground=float(self.clip_foreground.value()),
-            matte_gamma=float(self.matte_gamma.value()),
-            core_strength=float(self.core_strength.value()),
-            edge_refine_radius=radius,
-            edge_softness=float(self.edge_softness.value()),
-            erode_expand=int(self.erode_expand.value()),
-            despeckle_min_area=int(self.despeckle.value()),
-            aggressive_interior_removal=self.policy.currentText() == "Aggressive Interior Removal",
-            despill=float(self.despill.value()),
-            decontaminate=float(self.decontaminate.value()),
-            luminance_restore=float(self.luminance_restore.value()),
-            fringe_remove=float(self.fringe_remove.value()),
-            edge_color_repair=float(self.edge_color_repair.value()),
-            inner_color_pull=float(self.inner_color_pull.value()),
-            fringe_band_radius=int(self.fringe_band.value()),
-            transition_unmix=bool(self.transition_unmix.isChecked()),
-            alpha_recover_strength=float(self.alpha_recover.value()),
-            key_vector_despill=float(self.key_vector_despill.value()),
-            foreground_reference_pull=float(self.foreground_reference_pull.value()),
-            screen_cleanup_strength=(
-                APP_DEFAULT_SETTINGS.screen_cleanup_strength
-                if self.policy.currentText() == "Aggressive Interior Removal"
-                else 0.0
-            ),
-            screen_cleanup_similarity=APP_DEFAULT_SETTINGS.screen_cleanup_similarity,
-            gpu_acceleration=self.gpu_acceleration.currentText() if hasattr(self, "gpu_acceleration") else "Off",
-            luminance_protect=float(self.luminance_restore.value()),
-            preview_scale=float(self.current_display_scale),
-            use_tiling=True,
-        )
+        return current_settings_from_window(self)
 
     def _processing_alpha_input(self, settings: KeySettings, shape: tuple[int, int]) -> np.ndarray | None:
-        if settings.mode == "ImportedMatte":
-            return resize_alpha_hint_mask(self.alpha_hint_mask, shape)
-        return None
+        return processing_alpha_input(settings, self.alpha_hint_mask, shape)
 
     def schedule_preview(self) -> None:
-        if self.full_rgb is None:
-            return
-        self.settings = self.current_settings()
-        self._sync_output_mode_status()
-        self._preview_generation += 1
-        self._preview_jobs.clear()
-        self._cancel_preview_threads()
-        self.statusBar().showMessage("Preview queued…")
-        self._preview_timer.start(150)
+        self.preview_controller.schedule_preview()
 
     def _cancel_preview_threads(self) -> None:
-        for thread in list(self._preview_threads):
-            if thread.isRunning():
-                thread.request_cancel()
+        self.preview_controller.cancel_preview_threads()
 
     def _on_preview_quality_changed(self, mode: str) -> None:
         self._full_crop_rect = self._current_full_crop() if mode == "Full Crop" and self.full_rgb is not None else None
@@ -1466,85 +822,10 @@ class MainWindow(QMainWindow):
         self.schedule_preview()
 
     def _start_preview(self) -> None:
-        if self.full_rgb is None:
-            return
-        if any(thread.isRunning() for thread in self._preview_threads):
-            self._preview_pending = True
-            return
-        try:
-            job = self._make_preview_job()
-        except Exception as exc:
-            self.on_failed(f"Preview setup failed: {exc}")
-            return
-        generation = self._preview_generation
-        self._preview_jobs[generation] = job
-        self._preview_pending = False
-
-        if (
-            self.current_source_rgb is None
-            or self.current_source_rgb.shape != job.display_rgb.shape
-            or self.current_crop_origin != job.crop_origin
-            or abs(self.current_display_scale - job.display_scale) > 1e-6
-        ):
-            self.current_result = None
-            self._set_current_source(job.display_rgb, job.display_alpha, job.display_scale, job.crop_origin, job.label)
-
-        thread = PreviewThread(generation, job)
-        self._preview_threads.append(thread)
-        thread.done.connect(self.on_preview_done)
-        thread.progress.connect(self.on_preview_progress)
-        thread.failed.connect(self.on_preview_failed)
-        thread.finished.connect(lambda t=thread: self._forget_preview_thread(t))
-        self.statusBar().showMessage(f"Processing {job.label.lower()} preview…")
-        thread.start()
+        self.preview_controller.start_preview()
 
     def _make_preview_job(self) -> PreviewJob:
-        assert self.full_rgb is not None
-        settings = self.current_settings()
-        if self.preview_quality.currentText() == "Full Crop":
-            if self._full_crop_rect is None:
-                self._full_crop_rect = self._current_full_crop()
-            crop = self._full_crop_rect
-            x0, y0, x1, y1 = crop
-            alpha_hint = self._processing_alpha_input(settings, self.full_rgb.shape[:2])
-            settings.full_res_crop = crop
-            settings.preview_scale = 1.0
-            settings.use_tiling = True
-            display_rgb = self.full_rgb[y0:y1, x0:x1].copy()
-            display_alpha = None if self.full_alpha is None else self.full_alpha[y0:y1, x0:x1].copy()
-            return PreviewJob(
-                input_rgb=self.full_rgb,
-                original_alpha=self.full_alpha,
-                keep_mask=self.keep_mask,
-                remove_mask=self.remove_mask,
-                alpha_hint=alpha_hint,
-                settings=settings,
-                display_rgb=display_rgb,
-                display_alpha=display_alpha,
-                display_scale=1.0,
-                crop_origin=(x0, y0),
-                label=f"Full crop {x1 - x0}×{y1 - y0}",
-            )
-
-        assert self.proxy_rgb is not None
-        settings.full_res_crop = None
-        self._full_crop_rect = None
-        settings.preview_scale = self.proxy_scale
-        shape = self.proxy_rgb.shape[:2]
-        alpha_hint = self._processing_alpha_input(settings, shape)
-        return PreviewJob(
-            input_rgb=self.proxy_rgb,
-            original_alpha=self.proxy_alpha,
-            keep_mask=resize_mask(self.keep_mask, shape),
-            remove_mask=resize_mask(self.remove_mask, shape),
-            alpha_hint=alpha_hint,
-            settings=settings,
-            display_rgb=self.proxy_rgb,
-            display_alpha=self.proxy_alpha,
-            display_scale=self.proxy_scale,
-            crop_origin=(0, 0),
-            label="Proxy",
-        )
+        return self.preview_controller.make_preview_job()
 
     def _current_full_crop(self) -> tuple[int, int, int, int]:
         assert self.full_rgb is not None
@@ -1620,79 +901,25 @@ class MainWindow(QMainWindow):
             self.on_failed(message)
 
     def _forget_preview_thread(self, thread: PreviewThread) -> None:
-        if thread in self._preview_threads:
-            self._preview_threads.remove(thread)
-        if self._preview_pending and self.full_rgb is not None:
-            self._preview_pending = False
-            self._preview_timer.start(0)
+        self.preview_controller.forget_preview_thread(thread)
 
     def export_png(self) -> None:
-        if self.full_rgb is None:
-            return
-        default = "output_keyed.png"
-        if self.image_path:
-            default = str(self.image_path.with_name(f"{self.image_path.stem}_keyed.png"))
-        path, _ = QFileDialog.getSaveFileName(self, "Export PNG", default, "PNG image (*.png)")
-        if not path:
-            return
-        settings = self.current_settings()
-        settings.full_res_crop = None
-        settings.preview_scale = 1.0
-        settings.use_tiling = True
-        try:
-            alpha_hint = self._processing_alpha_input(settings, self.full_rgb.shape[:2])
-        except Exception as exc:
-            self.on_failed(str(exc), title="Export setup failed")
-            return
-        self.export_thread = ExportThread(
-            path,
-            self.full_rgb,
-            self.full_alpha,
-            settings,
-            self.keep_mask,
-            self.remove_mask,
-            alpha_hint,
-        )
-        self.export_thread.progress.connect(self.on_export_progress)
-        self.export_thread.done.connect(self.on_export_done)
-        self.export_thread.failed.connect(self.on_export_failed)
-        self.export_thread.finished.connect(self._export_finished)
-        self.progress_bar.setValue(0)
-        self.progress_bar.show()
-        self.cancel_export_btn.show()
-        self.open_action.setEnabled(False)
-        self._update_enabled_state()
-        self.statusBar().showMessage("Export started…")
-        self.export_thread.start()
+        self.export_controller.export_png()
 
     def cancel_export(self) -> None:
-        if self.export_thread is not None and self.export_thread.isRunning():
-            self.export_thread.request_cancel()
-            self.statusBar().showMessage("Cancelling export…")
+        self.export_controller.cancel_export()
 
     def on_export_progress(self, value: float, stage: str) -> None:
-        self.progress_bar.setValue(int(np.clip(value, 0.0, 1.0) * 100))
-        self.statusBar().showMessage(f"Export {self.progress_bar.value()}% · {stage}")
+        self.export_controller.on_export_progress(value, stage)
 
     def on_export_done(self, path: str) -> None:
-        self.progress_bar.setValue(100)
-        self.statusBar().showMessage(f"Saved {Path(path).name}")
-        QMessageBox.information(self, "Export complete", f"Saved transparent PNG:\n{path}")
+        self.export_controller.on_export_done(path)
 
     def on_export_failed(self, message: str) -> None:
-        if "cancel" in message.lower():
-            self.statusBar().showMessage("Export cancelled")
-        else:
-            if hasattr(self, "gpu_probe_status") and self._message_mentions_gpu_backend(message):
-                self.gpu_probe_status.setText(f"GPU Status: error. {message}")
-            self.on_failed(message, title="Export failed")
+        self.export_controller.on_export_failed(message)
 
     def _export_finished(self) -> None:
-        self.progress_bar.hide()
-        self.cancel_export_btn.hide()
-        self.export_thread = None
-        self.open_action.setEnabled(True)
-        self._update_enabled_state()
+        self.export_controller.export_finished()
 
     def export_current_matte(self) -> None:
         if self.current_result is None:
@@ -1829,116 +1056,34 @@ class MainWindow(QMainWindow):
             self.gpu_probe_status.setText(f"GPU Status: {mode} · {prefix}; waiting for next preview/export.")
 
     def _message_mentions_gpu_backend(self, message: str) -> bool:
-        lowered = str(message).lower()
-        return any(token in lowered for token in ("gpu", "cuda", "dll"))
+        return message_mentions_gpu_backend(message)
 
     def show_gpu_status(self, checked: bool = False) -> None:
-        del checked
-        if self._gpu_probe_running():
-            self.statusBar().showMessage("GPU status probe already running…")
-            return
-        process = QProcess(self)
-        process.setObjectName("GPUStatusProcess")
-        process.setWorkingDirectory(str(WRITABLE_APP_DIR))
-        process.setProcessChannelMode(QProcess.SeparateChannels)
-        process.finished.connect(lambda exit_code, exit_status, proc=process: self._on_gpu_probe_finished(proc, exit_code, exit_status))
-        process.errorOccurred.connect(lambda error, proc=process: self._on_gpu_probe_error(proc, error))
-        self.gpu_probe_process = process
-        if hasattr(self, "gpu_probe_status"):
-            self.gpu_probe_status.setText("GPU Status: running probe in subprocess…")
-        self.statusBar().showMessage("GPU status probe running…")
-        self._update_enabled_state()
-        command, arguments = gpu_probe_subprocess_command()
-        process.start(command, arguments)
+        self.gpu_probe_controller.show_gpu_status(checked)
 
     def _on_gpu_probe_error(self, process: QProcess, error) -> None:
-        if process is not self.gpu_probe_process:
-            return
-        if process.state() != QProcess.NotRunning:
-            return
-        message = process.errorString() or str(error)
-        self.gpu_probe_process = None
-        if hasattr(self, "gpu_probe_status"):
-            self.gpu_probe_status.setText(f"GPU Status: failed to start probe subprocess: {message}")
-        self.statusBar().showMessage("GPU status probe failed to start")
-        self._update_enabled_state()
-        process.deleteLater()
+        self.gpu_probe_controller.on_gpu_probe_error(process, error)
 
     def _on_gpu_probe_finished(self, process: QProcess, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
-        stdout = self._process_stdout(process)
-        stderr = self._process_stderr(process)
-        if process is not self.gpu_probe_process:
-            process.deleteLater()
-            return
-        self.gpu_probe_process = None
-        result = self._json_object_from_text(stdout)
-        if isinstance(result, dict):
-            self.last_gpu_probe = result
-            summary = self._format_gpu_probe_summary(result)
-            if hasattr(self, "gpu_probe_status"):
-                self.gpu_probe_status.setText(f"GPU Status: {summary}")
-            self.statusBar().showMessage(f"GPU status: {result.get('status', 'unknown')}")
-            if not self._closing:
-                QMessageBox.information(self, "GPU Status", self._format_gpu_probe_details(result))
-        else:
-            detail = stderr.strip() or f"process exited {exit_code} status {exit_status}"
-            if hasattr(self, "gpu_probe_status"):
-                self.gpu_probe_status.setText(f"GPU Status: failed - {detail}")
-            self.statusBar().showMessage("GPU status probe failed")
-        self._update_enabled_state()
-        process.deleteLater()
+        self.gpu_probe_controller.on_gpu_probe_finished(process, exit_code, exit_status)
 
     def _gpu_probe_running(self) -> bool:
-        return self.gpu_probe_process is not None and self.gpu_probe_process.state() != QProcess.NotRunning
+        return self.gpu_probe_controller.gpu_probe_running()
 
     def _process_stdout(self, process: QProcess) -> str:
-        return bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        return process_stdout(process)
 
     def _process_stderr(self, process: QProcess) -> str:
-        return bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        return process_stderr(process)
 
     def _json_object_from_text(self, text: str) -> dict | None:
-        stripped = text.strip()
-        if not stripped:
-            return None
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            start = stripped.find("{")
-            end = stripped.rfind("}")
-            if start < 0 or end <= start:
-                return None
-            try:
-                parsed = json.loads(stripped[start : end + 1])
-            except json.JSONDecodeError:
-                return None
-        return parsed if isinstance(parsed, dict) else None
+        return json_object_from_text(text)
 
     def _format_gpu_probe_summary(self, result: dict) -> str:
-        status = result.get("status", "unknown")
-        message = str(result.get("message") or "")
-        cuda_dll = result.get("cuda_dll") or {}
-        device = (result.get("cuda") or {}).get("device_name") or cuda_dll.get("device")
-        if device:
-            return f"{status} · {device}. {message}"
-        return f"{status}. {message}"
+        return format_gpu_probe_summary(result)
 
     def _format_gpu_probe_details(self, result: dict) -> str:
-        backend = result.get("backend") or {}
-        cuda_dll = result.get("cuda_dll") or {}
-        cuda = result.get("cuda") or {}
-        smi = result.get("nvidia_smi") or {}
-        smoke = result.get("transition_repair_smoke") or {}
-        return "\n".join(
-            (
-                f"GPU runtime: {result.get('status', 'unknown')} - {result.get('message', '')}",
-                f"Backend: {backend.get('name', 'compact CUDA DLL')} ({backend.get('id', 'compact_cuda_dll')})",
-                f"CUDA DLL: available={cuda_dll.get('available')} version={cuda_dll.get('version')} devices={cuda_dll.get('device_count')} path={cuda_dll.get('dll_path')}",
-                f"CUDA device: available={cuda.get('is_available')} device_count={cuda.get('device_count')} device={cuda.get('device_name')} capability={cuda.get('device_capability')}",
-                f"nvidia-smi: available={smi.get('available')} driver={smi.get('driver_version')} cuda={smi.get('cuda_version')}",
-                f"transition repair smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} max_rgb_diff={smoke.get('max_rgb_diff')} error={smoke.get('error')}",
-            )
-        )
+        return format_gpu_probe_details(result)
 
     def set_key_color(self, color: tuple[int, int, int], *, refresh: bool = True) -> None:
         self.settings.key_color = tuple(int(np.clip(c, 0, 255)) for c in color)
@@ -2032,67 +1177,8 @@ class MainWindow(QMainWindow):
         return full_x, full_y
 
     def apply_preset(self, name: str) -> None:
-        presets = {
-            "Fast": {
-                self.screen_tolerance: 0.20,
-                self.screen_softness: 0.07,
-                self.clip_background: 0.80,
-                self.clip_foreground: 0.16,
-                self.edge_radius: 3,
-                self.edge_softness: 0.35,
-                self.despeckle: 24,
-                self.decontaminate: 0.35,
-                self.fringe_remove: 0.55,
-                self.edge_color_repair: 0.40,
-                self.inner_color_pull: 0.20,
-                self.fringe_band: 2,
-                self.luminance_restore: 0.20,
-                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
-                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
-                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
-            },
-            "Clean": {
-                self.screen_tolerance: 0.18,
-                self.screen_softness: 0.08,
-                self.clip_background: 0.78,
-                self.clip_foreground: 0.14,
-                self.edge_radius: 6,
-                self.edge_softness: 0.55,
-                self.despeckle: 48,
-                self.decontaminate: 0.50,
-                self.fringe_remove: 0.70,
-                self.edge_color_repair: 0.55,
-                self.inner_color_pull: 0.35,
-                self.fringe_band: 3,
-                self.luminance_restore: 0.35,
-                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
-                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
-                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
-            },
-            "High Accuracy": {
-                self.screen_tolerance: APP_DEFAULT_SETTINGS.tolerance,
-                self.screen_softness: APP_DEFAULT_SETTINGS.softness,
-                self.clip_background: APP_DEFAULT_SETTINGS.clip_background,
-                self.clip_foreground: APP_DEFAULT_SETTINGS.clip_foreground,
-                self.matte_gamma: APP_DEFAULT_SETTINGS.matte_gamma,
-                self.core_strength: APP_DEFAULT_SETTINGS.core_strength,
-                self.despeckle: APP_DEFAULT_SETTINGS.despeckle_min_area,
-                self.edge_radius: APP_DEFAULT_SETTINGS.edge_refine_radius,
-                self.edge_softness: APP_DEFAULT_SETTINGS.edge_softness,
-                self.erode_expand: APP_DEFAULT_SETTINGS.erode_expand,
-                self.despill: APP_DEFAULT_SETTINGS.despill,
-                self.decontaminate: APP_DEFAULT_SETTINGS.decontaminate,
-                self.fringe_remove: APP_DEFAULT_SETTINGS.fringe_remove,
-                self.edge_color_repair: APP_DEFAULT_SETTINGS.edge_color_repair,
-                self.inner_color_pull: APP_DEFAULT_SETTINGS.inner_color_pull,
-                self.fringe_band: APP_DEFAULT_SETTINGS.fringe_band_radius,
-                self.luminance_restore: APP_DEFAULT_SETTINGS.luminance_restore,
-                self.alpha_recover: APP_DEFAULT_SETTINGS.alpha_recover_strength,
-                self.key_vector_despill: APP_DEFAULT_SETTINGS.key_vector_despill,
-                self.foreground_reference_pull: APP_DEFAULT_SETTINGS.foreground_reference_pull,
-            },
-        }
-        for row, value in presets[name].items():
+        presets = preset_control_values(name, self)
+        for row, value in presets.items():
             row.set_value(value, emit=False)
         self.transition_unmix.blockSignals(True)
         self.transition_unmix.setChecked(bool(APP_DEFAULT_SETTINGS.transition_unmix))
@@ -2161,128 +1247,6 @@ class MainWindow(QMainWindow):
             self.gpu_probe_process = None
             process.deleteLater()
         super().closeEvent(event)
-
-
-def label_row(label: str, widget: QWidget) -> QHBoxLayout:
-    row = QHBoxLayout()
-    row.setSpacing(8)
-    text = QLabel(label)
-    text.setObjectName("ControlLabel")
-    row.addWidget(text)
-    row.addWidget(widget, 1)
-    return row
-
-
-def resize_alpha_for_preview(alpha: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-    if alpha is None:
-        return None
-    if alpha.shape == shape:
-        return alpha.copy()
-    return cv2.resize(alpha, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
-
-
-def resize_mask(mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-    if mask is None:
-        return None
-    if mask.shape == shape:
-        return mask.copy()
-    return cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
-
-
-def resize_alpha_hint_mask(mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
-    if mask is None:
-        return None
-    if mask.shape == shape:
-        return mask.copy()
-    return cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
-
-
-def mask_to_rgb(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> np.ndarray:
-    if mask is None:
-        h, w = shape or (1, 1)
-        return np.zeros((h, w, 3), dtype=np.uint8)
-    arr = np.asarray(mask)
-    if arr.ndim == 3:
-        arr = arr[:, :, 0]
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    if shape is not None and arr.shape != shape:
-        arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
-    return np.repeat(arr[:, :, None], 3, axis=2)
-
-
-def blank_rgb_qimage(shape: tuple[int, int] | None = None) -> QImage:
-    h, w = shape or (1, 1)
-    image = QImage(max(1, int(w)), max(1, int(h)), QImage.Format_RGB888)
-    image.fill(QColor(0, 0, 0))
-    return image
-
-
-def mask_to_qimage(mask: np.ndarray | None, shape: tuple[int, int] | None = None) -> QImage:
-    if mask is None:
-        return blank_rgb_qimage(shape)
-    arr = np.asarray(mask)
-    if arr.ndim == 3:
-        arr = arr[:, :, 0]
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    if shape is not None and arr.shape != shape:
-        arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
-    arr = np.ascontiguousarray(arr)
-    h, w = arr.shape[:2]
-    return QImage(arr.data, w, h, w, QImage.Format_Grayscale8).copy()
-
-
-def debug_rgb_to_rgb(image: np.ndarray | None, shape: tuple[int, int] | None = None) -> np.ndarray:
-    if image is None:
-        h, w = shape or (1, 1)
-        return np.zeros((h, w, 3), dtype=np.uint8)
-    arr = np.asarray(image)
-    if arr.ndim == 2:
-        return mask_to_rgb(arr, shape)
-    if arr.ndim != 3 or arr.shape[2] < 3:
-        h, w = shape or (1, 1)
-        return np.zeros((h, w, 3), dtype=np.uint8)
-    arr = np.clip(arr[:, :, :3], 0, 255).astype(np.uint8)
-    if shape is not None and arr.shape[:2] != shape:
-        arr = cv2.resize(arr, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
-    return arr
-
-
-def rgb_to_qimage(rgb: np.ndarray) -> QImage:
-    arr = np.ascontiguousarray(rgb[:, :, :3], dtype=np.uint8)
-    h, w = arr.shape[:2]
-    return QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-
-
-def rgba_to_qimage(rgba: np.ndarray) -> QImage:
-    arr = np.ascontiguousarray(rgba[:, :, :4], dtype=np.uint8)
-    h, w = arr.shape[:2]
-    return QImage(arr.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
-
-
-def checker_brush() -> QBrush:
-    size = 32
-    pixmap = QPixmap(size, size)
-    pixmap.fill(QColor("#161B22"))
-    painter = QPainter(pixmap)
-    painter.fillRect(0, 0, size // 2, size // 2, QColor("#202633"))
-    painter.fillRect(size // 2, size // 2, size // 2, size // 2, QColor("#202633"))
-    painter.end()
-    return QBrush(pixmap)
-
-
-def composite_rgba_for_mode(rgba: np.ndarray, mode: str) -> np.ndarray:
-    if mode == "Checkerboard":
-        return checkerboard_composite(rgba, cell=18)
-    if mode == "White":
-        bg = np.array([255, 255, 255], dtype=np.float32)
-    elif mode == "Gray":
-        bg = np.array([119, 125, 134], dtype=np.float32)
-    else:
-        bg = np.array([0, 0, 0], dtype=np.float32)
-    rgb = rgba[:, :, :3].astype(np.float32)
-    alpha = rgba[:, :, 3:4].astype(np.float32) / 255.0
-    out = rgb * alpha + bg.reshape(1, 1, 3) * (1.0 - alpha)
-    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
 def main(argv: list[str] | None = None) -> int:

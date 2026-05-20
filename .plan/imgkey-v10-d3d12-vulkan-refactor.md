@@ -298,10 +298,10 @@ Isolation:
 - Own `app.py` split and UI modules. Do not alter user-facing behavior except bug fixes required by extraction.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P3.1 - Split UI primitives and controllers
 - Extract:
@@ -324,10 +324,16 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Extracted viewer/display primitives into `ui/canvas.py`, reusable controls into `ui/widgets.py`, settings/default/preset mapping into `ui/settings_mapper.py`, preview worker orchestration into `ui/preview_controller.py`, export worker orchestration into `ui/export_controller.py`, and lazy GPU probe subprocess handling into `ui/gpu_probe_controller.py`.
+- Kept `app.py` as the startup/`MainWindow` composition layer with compatibility re-exports for existing smoke/UI probes (`ImageCanvas`, `SliderRow`, preview/export threads, view constants, debug image helpers, and default settings).
+- Preserved viewer-first controls and behavior: spring-loaded Space pan remains in `MainWindow` event filtering, Pick/Pan toolbar coordination and sampled-color flow remain unchanged, High Accuracy/default reset values still map through `APP_DEFAULT_SETTINGS`, preview/export worker lifetimes are controller-owned but UI callbacks/status remain compatible, and GPU status probing remains subprocess-only/lazy.
+- Required Phase 3 verification passed locally, including smoke, GPU parity, py_compile/import checks with new UI modules, explicit offscreen UI lifetime probe, dependency/no-AI/default startup no-torch guards through smoke/source guards, and `git diff --check`.
 
 ---
 
@@ -349,7 +355,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P4.1 - Add backend protocol and session lifecycle
 - Replace direct `gpu_accel.process_color_tile_gpu()` calls with a backend registry/session API:

@@ -5578,6 +5578,9 @@ def run_import_compile_tests() -> None:
     engine_dir = Path("imgkey_engine")
     if engine_dir.exists():
         sources.extend(sorted(engine_dir.glob("*.py")))
+    ui_dir = Path("ui")
+    if ui_dir.exists():
+        sources.extend(sorted(ui_dir.glob("*.py")))
     for source in sources:
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
@@ -5699,6 +5702,9 @@ def run_source_surface_guard() -> None:
     engine_dir = Path("imgkey_engine")
     if engine_dir.exists():
         roots.extend(path for path in engine_dir.glob("**/*.py") if path.is_file())
+    ui_dir = Path("ui")
+    if ui_dir.exists():
+        roots.extend(path for path in ui_dir.glob("**/*.py") if path.is_file())
     forbidden = [
         "Bi" + "RefNet",
         "bi" + "ref",
