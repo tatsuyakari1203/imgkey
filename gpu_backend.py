@@ -25,6 +25,7 @@ class BackendCapability(IntFlag):
     TILE_BATCH = 1 << 3
     ALPHA_WRITE = 1 << 4
     RGB_ONLY = 1 << 5
+    FULL_COLOR_TILE = 1 << 6
 
 
 CAPABILITY_NAMES: dict[BackendCapability, str] = {
@@ -34,6 +35,7 @@ CAPABILITY_NAMES: dict[BackendCapability, str] = {
     BackendCapability.TILE_BATCH: "tile_batch",
     BackendCapability.ALPHA_WRITE: "alpha_write",
     BackendCapability.RGB_ONLY: "rgb_only",
+    BackendCapability.FULL_COLOR_TILE: "full_color_tile",
 }
 CAPABILITY_BY_NAME = {name: capability for capability, name in CAPABILITY_NAMES.items()}
 
@@ -137,9 +139,49 @@ class ImgKeyNativeColorTileParamsV1(ctypes.Structure):
     ]
 
 
+class ImgKeyNativeColorTileParamsV2(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("required_capabilities", ctypes.c_uint64),
+        ("status", ctypes.c_int32),
+        ("fallback_reason", ctypes.c_int32),
+        ("screen_r", ctypes.c_uint8),
+        ("screen_g", ctypes.c_uint8),
+        ("screen_b", ctypes.c_uint8),
+        ("reserved0", ctypes.c_uint8),
+        ("foreground_reference_pull", ctypes.c_float),
+        ("key_vector_despill", ctypes.c_float),
+        ("preserve_foreground_luma", ctypes.c_float),
+        ("transition_spill_threshold", ctypes.c_float),
+        ("transition_reconstruction_error", ctypes.c_float),
+        ("clip_foreground", ctypes.c_float),
+        ("transition_alpha_min", ctypes.c_uint32),
+        ("transition_alpha_max", ctypes.c_uint32),
+        ("despill", ctypes.c_float),
+        ("decontaminate", ctypes.c_float),
+        ("unmix_amount", ctypes.c_float),
+        ("edge_color_repair", ctypes.c_float),
+        ("inner_color_pull", ctypes.c_float),
+        ("fringe_remove", ctypes.c_float),
+        ("luminance_protect", ctypes.c_float),
+        ("clamp_key_r", ctypes.c_float),
+        ("clamp_key_g", ctypes.c_float),
+        ("clamp_key_b", ctypes.c_float),
+        ("transition_enabled", ctypes.c_uint32),
+        ("transition_reference_enabled", ctypes.c_uint32),
+    ]
+
+
 @dataclass(slots=True)
 class NativeColorTileCallV1:
     params: ImgKeyNativeColorTileParamsV1
+    buffers: dict[str, ImgKeyNativeTileBufferV1]
+
+
+@dataclass(slots=True)
+class NativeColorTileCallV2:
+    params: ImgKeyNativeColorTileParamsV2
     buffers: dict[str, ImgKeyNativeTileBufferV1]
 
 
@@ -232,6 +274,24 @@ class GpuBackendSession(Protocol):
         settings: Any,
     ) -> dict[str, Any]: ...
 
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]: ...
+
     def end_render(self) -> None: ...
 
 
@@ -296,6 +356,31 @@ class NoOpGpuSession:
         settings: Any,
     ) -> dict[str, Any]:
         del rgb_tile, alpha_tile, background_mask, edge_mask, probability, fringe_mask, screen_tile, nearest_fg_rgb, nearest_fg_valid, screen_color, settings
+        return _fallback_result(
+            self.selection.reason or "backend_unavailable",
+            self.selection.message,
+            backend=self.backend_id,
+            backend_name=self.backend_name,
+        )
+
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        del rgb_tile, alpha_tile, background_mask, edge_mask, probability, fringe_mask, screen_tile, nearest_inner_rgb, nearest_inner_valid, screen_color, settings, transition_nearest_rgb, transition_nearest_valid
         return _fallback_result(
             self.selection.reason or "backend_unavailable",
             self.selection.message,
@@ -416,12 +501,39 @@ class CudaCompatSession:
         result.setdefault("capabilities", capability_names(self.backend.capabilities))
         return result
 
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        del rgb_tile, alpha_tile, background_mask, edge_mask, probability, fringe_mask, screen_tile, nearest_inner_rgb, nearest_inner_valid, screen_color, settings, transition_nearest_rgb, transition_nearest_valid
+        return _fallback_result(
+            "unsupported_capability",
+            "CUDA compatibility backend exposes transition repair only; full color tile graph falls back to CPU or D3D12.",
+            backend=self.backend_id,
+            backend_name=self.backend_name,
+        )
+
     def end_render(self) -> None:
         self.ended = True
 
 
 NATIVE_GPU_DLL_NAME = "imgkey_gpu.dll"
-D3D12_MVP_MAX_TILE_PIXELS = 640 * 640
+D3D12_MVP_MAX_TILE_PIXELS = 3072 * 3072
+D3D12_MAX_DISPATCH_PIXELS = 512 * 512
+D3D12_NATIVE_CALL_MAX_TILE_PIXELS = 512 * 512
 _NATIVE_GPU_DLL_CACHE: "_NativeGpuDll" | None = None
 _NATIVE_GPU_DLL_CACHE_KEY: str | None = None
 
@@ -467,6 +579,25 @@ class _NativeGpuDll:
             ctypes.POINTER(ImgKeyNativeTileBufferV1),
         ]
         self.library.imgkey_gpu_process_color_tile_v1.restype = ctypes.c_int
+        if hasattr(self.library, "imgkey_gpu_process_color_tile_v2"):
+            self.library.imgkey_gpu_process_color_tile_v2.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ImgKeyNativeColorTileParamsV2),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ]
+            self.library.imgkey_gpu_process_color_tile_v2.restype = ctypes.c_int
         if hasattr(self.library, "imgkey_gpu_identity_rgba_v1"):
             self.library.imgkey_gpu_identity_rgba_v1.argtypes = [
                 ctypes.c_void_p,
@@ -520,6 +651,33 @@ class _NativeGpuDll:
                 _ptr(call.buffers.get("screen_tile")),
                 ctypes.byref(call.buffers["foreground_ref_rgb"]),
                 ctypes.byref(call.buffers["foreground_ref_valid"]),
+                ctypes.byref(out_rgb),
+                ctypes.byref(out_repair),
+            )
+        )
+
+    def process_color_tile_v2(self, context: ctypes.c_void_p, call: NativeColorTileCallV2, out_rgb: ImgKeyNativeTileBufferV1, out_repair: ImgKeyNativeTileBufferV1) -> int:
+        if not hasattr(self.library, "imgkey_gpu_process_color_tile_v2"):
+            raise NativeGpuDllError(IMGKEY_GPU_UNSUPPORTED_CAPABILITY, "imgkey_gpu_process_color_tile_v2 export is missing")
+
+        def _ptr(buffer: ImgKeyNativeTileBufferV1 | None):
+            return ctypes.byref(buffer) if buffer is not None else None
+
+        return int(
+            self.library.imgkey_gpu_process_color_tile_v2(
+                context,
+                ctypes.byref(call.params),
+                ctypes.byref(call.buffers["rgb"]),
+                ctypes.byref(call.buffers["alpha"]),
+                ctypes.byref(call.buffers["background_mask"]),
+                ctypes.byref(call.buffers["edge_mask"]),
+                ctypes.byref(call.buffers["probability"]),
+                ctypes.byref(call.buffers["fringe_mask"]),
+                _ptr(call.buffers.get("screen_tile")),
+                ctypes.byref(call.buffers["nearest_inner_rgb"]),
+                ctypes.byref(call.buffers["nearest_inner_valid"]),
+                ctypes.byref(call.buffers["transition_ref_rgb"]),
+                ctypes.byref(call.buffers["transition_ref_valid"]),
                 ctypes.byref(out_rgb),
                 ctypes.byref(out_repair),
             )
@@ -604,6 +762,8 @@ def _status_native_unavailable(reason: str, message: str, *, extra: dict[str, An
         "version": None,
         "dll_path": None,
         "max_tile_pixels": D3D12_MVP_MAX_TILE_PIXELS,
+        "max_dispatch_pixels": D3D12_MAX_DISPATCH_PIXELS,
+        "max_native_call_pixels": D3D12_NATIVE_CALL_MAX_TILE_PIXELS,
     }
     if extra:
         result.update(extra)
@@ -633,10 +793,43 @@ def _as_u8_mask(mask: np.ndarray, shape: tuple[int, int], name: str) -> np.ndarr
     return np.ascontiguousarray(arr)
 
 
+_SRGB_U8_TO_LINEAR_LUT = np.where(
+    (np.arange(256, dtype=np.float32) / 255.0) <= 0.04045,
+    (np.arange(256, dtype=np.float32) / 255.0) / 12.92,
+    np.power(((np.arange(256, dtype=np.float32) / 255.0) + 0.055) / 1.055, 2.4),
+).astype(np.float32)
+
+
+def _screen_clamp_key_linear(screen_tile: np.ndarray | None, screen_color: tuple[int, int, int]) -> tuple[float, float, float]:
+    if screen_tile is None:
+        values = _SRGB_U8_TO_LINEAR_LUT[np.asarray(screen_color, dtype=np.uint8)]
+        return (float(values[0]), float(values[1]), float(values[2]))
+    screen = np.asarray(screen_tile, dtype=np.uint8)
+    if screen.ndim != 3 or screen.shape[2] < 3 or screen.size == 0:
+        values = _SRGB_U8_TO_LINEAR_LUT[np.asarray(screen_color, dtype=np.uint8)]
+        return (float(values[0]), float(values[1]), float(values[2]))
+    return (
+        float(np.mean(_SRGB_U8_TO_LINEAR_LUT[screen[:, :, 0]])),
+        float(np.mean(_SRGB_U8_TO_LINEAR_LUT[screen[:, :, 1]])),
+        float(np.mean(_SRGB_U8_TO_LINEAR_LUT[screen[:, :, 2]])),
+    )
+
+
+def _foreground_reference_radius(settings: Any) -> int:
+    return int(np.clip(int(_setting(settings, "foreground_reference_radius", 96)), 0, np.iinfo(np.uint16).max - 1))
+
+
+def _effective_luminance_protect(settings: Any) -> float:
+    value = _setting(settings, "luminance_protect", None)
+    if value is None:
+        value = _setting(settings, "luminance_restore", 0.35)
+    return _clip01(value)
+
+
 class D3D12ComputeBackend:
     backend_id = "d3d12_compute"
     backend_name = "D3D12 compute backend"
-    capabilities = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.PERSISTENT_SESSION | BackendCapability.RGB_ONLY
+    capabilities = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.PERSISTENT_SESSION | BackendCapability.RGB_ONLY | BackendCapability.FULL_COLOR_TILE
 
     def __init__(self, dll_path: str | os.PathLike[str] | None = None):
         self.dll_path = dll_path
@@ -675,6 +868,8 @@ class D3D12ComputeBackend:
         info["dll_path"] = str(dll.path)
         info["version"] = info.get("version") or dll.version()
         info["max_tile_pixels"] = int(info.get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
+        info["max_dispatch_pixels"] = int(info.get("max_dispatch_pixels") or D3D12_MAX_DISPATCH_PIXELS)
+        info["max_native_call_pixels"] = int(info.get("max_native_call_pixels") or D3D12_NATIVE_CALL_MAX_TILE_PIXELS)
         self._last_availability = dict(info)
         return info
 
@@ -761,6 +956,15 @@ class D3D12ComputeSession:
         try:
             rgb = _as_rgb_u8(rgb_tile, "rgb_tile")
             shape = rgb.shape[:2]
+            if int(shape[0]) * int(shape[1]) > D3D12_NATIVE_CALL_MAX_TILE_PIXELS:
+                return _fallback_result(
+                    "tile_too_large",
+                    f"D3D12 transition-only native call {shape[1]}x{shape[0]} exceeds safe native_call_pixels={D3D12_NATIVE_CALL_MAX_TILE_PIXELS}; full color tile processing uses TDR-bounded subtiles and CPU remains fallback for this legacy entry point.",
+                    backend=self.backend_id,
+                    backend_name=self.backend_name,
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                    availability=self.backend._last_availability,
+                )
             max_tile_pixels = int((self.backend._last_availability or {}).get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
             if int(shape[0]) * int(shape[1]) > max_tile_pixels:
                 return _fallback_result(
@@ -826,6 +1030,224 @@ class D3D12ComputeSession:
             "elapsed_ms": (time.perf_counter() - start) * 1000.0,
             "availability": self.backend._last_availability,
             "capabilities": capability_names(self.backend.capabilities),
+        }
+
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        start = time.perf_counter()
+        if self.dll is None or self.context is None or not self.context.value:
+            return _fallback_result("d3d12_context_failed", f"D3D12 context is unavailable: {self.context_error or 'context not created'}", backend=self.backend_id, backend_name=self.backend_name)
+        try:
+            rgb = _as_rgb_u8(rgb_tile, "rgb_tile")
+            shape = rgb.shape[:2]
+            if int(shape[0]) * int(shape[1]) > D3D12_NATIVE_CALL_MAX_TILE_PIXELS:
+                return self._process_full_color_tile_split(
+                    rgb,
+                    alpha_tile,
+                    background_mask,
+                    edge_mask,
+                    probability,
+                    fringe_mask,
+                    screen_tile,
+                    nearest_inner_rgb,
+                    nearest_inner_valid,
+                    screen_color,
+                    settings,
+                    transition_nearest_rgb=transition_nearest_rgb,
+                    transition_nearest_valid=transition_nearest_valid,
+                    start_time=start,
+                )
+            max_tile_pixels = int((self.backend._last_availability or {}).get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
+            if int(shape[0]) * int(shape[1]) > max_tile_pixels:
+                return _fallback_result(
+                    "tile_too_large",
+                    f"D3D12 full color tile {shape[1]}x{shape[0]} exceeds max_tile_pixels={max_tile_pixels}; CPU color path is used to avoid TDR.",
+                    backend=self.backend_id,
+                    backend_name=self.backend_name,
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                    availability=self.backend._last_availability,
+                )
+            alpha = _as_u8_mask(alpha_tile, shape, "alpha_tile")
+            background = _as_u8_mask(background_mask, shape, "background_mask")
+            edge = _as_u8_mask(edge_mask, shape, "edge_mask")
+            probability_u8 = _as_u8_mask(probability, shape, "probability")
+            fringe_u8 = _as_u8_mask(fringe_mask, shape, "fringe_mask")
+            screen_u8 = _as_rgb_u8(screen_tile, "screen_tile") if screen_tile is not None else None
+            zero_rgb = np.zeros_like(rgb)
+            zero_valid = np.zeros(shape, dtype=np.uint8)
+            nearest_rgb = _as_rgb_u8(nearest_inner_rgb, "nearest_inner_rgb") if nearest_inner_rgb is not None else zero_rgb
+            nearest_valid = _as_u8_mask(nearest_inner_valid, shape, "nearest_inner_valid") if nearest_inner_valid is not None else zero_valid
+            transition_rgb = _as_rgb_u8(transition_nearest_rgb, "transition_nearest_rgb") if transition_nearest_rgb is not None else nearest_rgb
+            transition_valid = _as_u8_mask(transition_nearest_valid, shape, "transition_nearest_valid") if transition_nearest_valid is not None else nearest_valid
+            out_rgb = np.empty_like(rgb)
+            out_repair = np.empty(shape, dtype=np.uint8)
+            required = {"rgb_only", "full_color_tile", "screen_tile"} if screen_u8 is not None else {"rgb_only", "full_color_tile", "constant_screen"}
+            call = validate_native_full_color_tile_inputs(
+                rgb,
+                alpha,
+                background,
+                edge,
+                probability_u8,
+                fringe_u8,
+                screen_u8,
+                nearest_rgb,
+                nearest_valid,
+                transition_rgb,
+                transition_valid,
+                tuple(int(np.clip(c, 0, 255)) for c in screen_color),
+                settings,
+                clamp_key_linear=_screen_clamp_key_linear(screen_u8, tuple(int(np.clip(c, 0, 255)) for c in screen_color)),
+                required_capabilities=required,
+            )
+            out_rgb_buffer = native_buffer_from_array("out_rgb", out_rgb, expected_channels=3)
+            out_repair_buffer = native_buffer_from_array("out_repair_mask", out_repair, expected_channels=1)
+        except Exception as exc:
+            return _fallback_result("invalid_inputs", f"D3D12 full color tile input validation failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name)
+        if int(np.max(alpha)) <= 0:
+            out_rgb = np.zeros_like(rgb)
+            out_repair = np.zeros(shape, dtype=np.uint8)
+            return {
+                "ok": True,
+                "used": True,
+                "backend": self.backend_id,
+                "backend_name": self.backend_name,
+                "reason": None,
+                "message": "D3D12 full color tile skipped transparent tile on CPU-side invariant.",
+                "rgb": out_rgb,
+                "repair_mask": out_repair,
+                "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+                "availability": self.backend._last_availability,
+                "capabilities": capability_names(self.backend.capabilities),
+                "full_color_tile": True,
+            }
+        try:
+            status = self.dll.process_color_tile_v2(self.context, call, out_rgb_buffer, out_repair_buffer)
+            if status != IMGKEY_GPU_OK:
+                reason = "d3d12_execution_failed"
+                if int(call.params.fallback_reason) == int(NativeFallbackReason.UNSUPPORTED_CAPABILITY):
+                    reason = "unsupported_capability"
+                elif int(call.params.fallback_reason) == int(NativeFallbackReason.BAD_SHAPE):
+                    reason = "tile_too_large" if "exceed" in self.dll.last_error().lower() else "invalid_inputs"
+                return _fallback_result(reason, f"D3D12 full color tile failed: status={status} {self.dll.last_error()}", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0, availability=self.backend._last_availability)
+        except Exception as exc:
+            return _fallback_result("d3d12_execution_failed", f"D3D12 full color tile failed; CPU fallback is required: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0, availability=self.backend._last_availability)
+        mode = "forced" if self.force_gpu else "auto"
+        return {
+            "ok": True,
+            "used": True,
+            "backend": self.backend_id,
+            "backend_name": self.backend_name,
+            "reason": None,
+            "message": f"D3D12 full color tile pipeline completed ({mode}).",
+            "rgb": out_rgb,
+            "repair_mask": out_repair,
+            "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+            "availability": self.backend._last_availability,
+            "capabilities": capability_names(self.backend.capabilities),
+            "full_color_tile": True,
+        }
+
+    def _process_full_color_tile_split(
+        self,
+        rgb: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+        start_time: float | None = None,
+    ) -> dict[str, Any]:
+        start = time.perf_counter() if start_time is None else start_time
+        shape = rgb.shape[:2]
+        try:
+            alpha = _as_u8_mask(alpha_tile, shape, "alpha_tile")
+            background = _as_u8_mask(background_mask, shape, "background_mask")
+            edge = _as_u8_mask(edge_mask, shape, "edge_mask")
+            probability_u8 = _as_u8_mask(probability, shape, "probability")
+            fringe_u8 = _as_u8_mask(fringe_mask, shape, "fringe_mask")
+            screen_u8 = _as_rgb_u8(screen_tile, "screen_tile") if screen_tile is not None else None
+            zero_rgb = np.zeros_like(rgb)
+            zero_valid = np.zeros(shape, dtype=np.uint8)
+            nearest_rgb = _as_rgb_u8(nearest_inner_rgb, "nearest_inner_rgb") if nearest_inner_rgb is not None else zero_rgb
+            nearest_valid = _as_u8_mask(nearest_inner_valid, shape, "nearest_inner_valid") if nearest_inner_valid is not None else zero_valid
+            transition_rgb = _as_rgb_u8(transition_nearest_rgb, "transition_nearest_rgb") if transition_nearest_rgb is not None else nearest_rgb
+            transition_valid = _as_u8_mask(transition_nearest_valid, shape, "transition_nearest_valid") if transition_nearest_valid is not None else nearest_valid
+        except Exception as exc:
+            return _fallback_result("invalid_inputs", f"D3D12 split full color tile input validation failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name)
+
+        out_rgb = np.empty_like(rgb)
+        out_repair = np.empty(shape, dtype=np.uint8)
+        chunk = int(np.sqrt(D3D12_NATIVE_CALL_MAX_TILE_PIXELS))
+        chunk = max(1, min(512, chunk))
+        used_chunks = 0
+        elapsed_reported = 0.0
+        for y0 in range(0, shape[0], chunk):
+            y1 = min(shape[0], y0 + chunk)
+            ys = slice(y0, y1)
+            for x0 in range(0, shape[1], chunk):
+                x1 = min(shape[1], x0 + chunk)
+                xs = slice(x0, x1)
+                result = self.process_full_color_tile(
+                    rgb[ys, xs],
+                    alpha[ys, xs],
+                    background[ys, xs],
+                    edge[ys, xs],
+                    probability_u8[ys, xs],
+                    fringe_u8[ys, xs],
+                    None if screen_u8 is None else screen_u8[ys, xs],
+                    nearest_rgb[ys, xs],
+                    nearest_valid[ys, xs],
+                    screen_color,
+                    settings,
+                    transition_nearest_rgb=transition_rgb[ys, xs],
+                    transition_nearest_valid=transition_valid[ys, xs],
+                )
+                if not result.get("used") or not isinstance(result.get("rgb"), np.ndarray) or not isinstance(result.get("repair_mask"), np.ndarray):
+                    result.setdefault("elapsed_ms", (time.perf_counter() - start) * 1000.0)
+                    return result
+                out_rgb[ys, xs] = result["rgb"]
+                out_repair[ys, xs] = result["repair_mask"]
+                used_chunks += 1
+                elapsed_reported += float(result.get("elapsed_ms") or 0.0)
+        return {
+            "ok": True,
+            "used": True,
+            "backend": self.backend_id,
+            "backend_name": self.backend_name,
+            "reason": None,
+            "message": f"D3D12 full color tile pipeline completed via {used_chunks} TDR-bounded native subtile dispatch(es).",
+            "rgb": out_rgb,
+            "repair_mask": out_repair,
+            "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+            "native_elapsed_ms_total": elapsed_reported,
+            "availability": self.backend._last_availability,
+            "capabilities": capability_names(self.backend.capabilities),
+            "full_color_tile": True,
+            "subtile_dispatches": used_chunks,
+            "subtile_max_pixels": D3D12_NATIVE_CALL_MAX_TILE_PIXELS,
         }
 
     def end_render(self) -> None:
@@ -935,6 +1357,66 @@ class FakeNativeSession:
             "capabilities": capability_names(self.backend.capabilities),
         }
 
+    def process_full_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_inner_rgb: np.ndarray | None,
+        nearest_inner_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+        *,
+        transition_nearest_rgb: np.ndarray | None = None,
+        transition_nearest_valid: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        start = time.perf_counter()
+        if not self.backend.available:
+            return _fallback_result(self.backend.fallback_reason, "Fake native backend unavailable.", backend=self.backend_id, backend_name=self.backend_name)
+        if not (self.backend.capabilities & BackendCapability.FULL_COLOR_TILE):
+            return _fallback_result("unsupported_capability", "Fake native backend does not support full_color_tile.", backend=self.backend_id, backend_name=self.backend_name)
+        try:
+            validate_native_full_color_tile_inputs(
+                rgb_tile,
+                alpha_tile,
+                background_mask,
+                edge_mask,
+                probability,
+                fringe_mask,
+                screen_tile,
+                nearest_inner_rgb,
+                nearest_inner_valid,
+                transition_nearest_rgb,
+                transition_nearest_valid,
+                screen_color,
+                settings,
+                clamp_key_linear=(0.0, 0.0, 0.0),
+                required_capabilities=self.backend.capabilities,
+            )
+        except Exception as exc:
+            return _fallback_result("invalid_inputs", f"Fake native full ABI validation failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name)
+        rgb = np.asarray(rgb_tile)[:, :, :3].copy()
+        alpha = np.asarray(alpha_tile)
+        repair_mask = np.zeros(alpha.shape[:2], dtype=np.uint8)
+        rgb[alpha <= 0] = 0
+        return {
+            "ok": True,
+            "used": True,
+            "backend": self.backend_id,
+            "backend_name": self.backend_name,
+            "reason": None,
+            "message": "Fake native backend validated full color ABI inputs and returned RGB unchanged.",
+            "rgb": rgb,
+            "repair_mask": repair_mask,
+            "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+            "capabilities": capability_names(self.backend.capabilities),
+            "full_color_tile": True,
+        }
+
     def end_render(self) -> None:
         self.ended = True
 
@@ -994,7 +1476,7 @@ def probe_backends(
                 }
             )
     if include_cpu:
-        cpu_caps = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.ALPHA_WRITE | BackendCapability.RGB_ONLY
+        cpu_caps = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.ALPHA_WRITE | BackendCapability.RGB_ONLY | BackendCapability.FULL_COLOR_TILE
         results.append(
             {
                 "id": "cpu_fallback",
@@ -1168,6 +1650,58 @@ def process_color_tile(
             session.end_render()
 
 
+def process_full_color_tile(
+    rgb_tile: np.ndarray,
+    alpha_tile: np.ndarray,
+    background_mask: np.ndarray,
+    edge_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    screen_tile: np.ndarray | None,
+    nearest_inner_rgb: np.ndarray | None,
+    nearest_inner_valid: np.ndarray | None,
+    screen_color: tuple[int, int, int],
+    settings: Any,
+    *,
+    transition_nearest_rgb: np.ndarray | None = None,
+    transition_nearest_valid: np.ndarray | None = None,
+    session: GpuBackendSession | None = None,
+    required_capabilities: BackendCapability | int | set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    owned = session is None
+    if session is None:
+        required = capabilities_to_mask(required_capabilities) | BackendCapability.FULL_COLOR_TILE | BackendCapability.RGB_ONLY
+        required |= BackendCapability.SCREEN_TILE if screen_tile is not None else BackendCapability.CONSTANT_SCREEN
+        session = begin_render(settings, rgb_tile.shape[:2], required_capabilities=required)
+    try:
+        process_full = getattr(session, "process_full_color_tile", None)
+        if process_full is None:
+            return _fallback_result(
+                "unsupported_capability",
+                "Selected GPU backend does not expose full color tile processing; CPU color path remains active.",
+                backend=getattr(session, "backend_id", None),
+                backend_name=getattr(session, "backend_name", None),
+            )
+        return process_full(
+            rgb_tile,
+            alpha_tile,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe_mask,
+            screen_tile,
+            nearest_inner_rgb,
+            nearest_inner_valid,
+            screen_color,
+            settings,
+            transition_nearest_rgb=transition_nearest_rgb,
+            transition_nearest_valid=transition_nearest_valid,
+        )
+    finally:
+        if owned:
+            session.end_render()
+
+
 def native_buffer_from_array(
     name: str,
     array: np.ndarray,
@@ -1322,10 +1856,101 @@ def validate_native_color_tile_inputs(
     return NativeColorTileCallV1(params=params, buffers=buffers)
 
 
-def _validate_params_struct(params: ImgKeyNativeColorTileParamsV1 | None) -> None:
+def validate_native_full_color_tile_inputs(
+    rgb_tile: np.ndarray,
+    alpha_tile: np.ndarray,
+    background_mask: np.ndarray,
+    edge_mask: np.ndarray,
+    probability: np.ndarray,
+    fringe_mask: np.ndarray,
+    screen_tile: np.ndarray | None,
+    nearest_inner_rgb: np.ndarray | None,
+    nearest_inner_valid: np.ndarray | None,
+    transition_ref_rgb: np.ndarray | None,
+    transition_ref_valid: np.ndarray | None,
+    screen_color: tuple[int, int, int],
+    settings: Any,
+    *,
+    clamp_key_linear: tuple[float, float, float],
+    required_capabilities: BackendCapability | int | set[str] | list[str] | tuple[str, ...] | None = None,
+) -> NativeColorTileCallV2:
+    required = capabilities_to_mask(required_capabilities)
+    screen = tuple(int(v) for v in screen_color)
+    if len(screen) != 3 or any(v < 0 or v > 255 for v in screen):
+        raise NativeAbiError(NativeFallbackReason.BAD_SHAPE, "screen_color must contain three 0..255 values")
+    rgb = np.asarray(rgb_tile)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise NativeAbiError(NativeFallbackReason.BAD_SHAPE, "rgb_tile must have shape HxWx3")
+    shape = rgb.shape[:2]
+    if nearest_inner_rgb is None or nearest_inner_valid is None or transition_ref_rgb is None or transition_ref_valid is None:
+        raise NativeAbiError(NativeFallbackReason.NULL_POINTER, "nearest and transition reference inputs are required for native full color tile dispatch")
+    buffers: dict[str, ImgKeyNativeTileBufferV1] = {
+        "rgb": native_buffer_from_array("rgb", rgb, expected_channels=3),
+        "alpha": native_buffer_from_array("alpha", np.asarray(alpha_tile), expected_channels=1),
+        "background_mask": native_buffer_from_array("background_mask", np.asarray(background_mask), expected_channels=1, allowed_dtypes=(NativeDType.UINT8, NativeDType.BOOL8)),
+        "edge_mask": native_buffer_from_array("edge_mask", np.asarray(edge_mask), expected_channels=1, allowed_dtypes=(NativeDType.UINT8, NativeDType.BOOL8)),
+        "probability": native_buffer_from_array("probability", np.asarray(probability), expected_channels=1),
+        "fringe_mask": native_buffer_from_array("fringe_mask", np.asarray(fringe_mask), expected_channels=1),
+        "nearest_inner_rgb": native_buffer_from_array("nearest_inner_rgb", np.asarray(nearest_inner_rgb), expected_channels=3),
+        "nearest_inner_valid": native_buffer_from_array("nearest_inner_valid", np.asarray(nearest_inner_valid), expected_channels=1, allowed_dtypes=(NativeDType.UINT8, NativeDType.BOOL8)),
+        "transition_ref_rgb": native_buffer_from_array("transition_ref_rgb", np.asarray(transition_ref_rgb), expected_channels=3),
+        "transition_ref_valid": native_buffer_from_array("transition_ref_valid", np.asarray(transition_ref_valid), expected_channels=1, allowed_dtypes=(NativeDType.UINT8, NativeDType.BOOL8)),
+    }
+    for name, buffer in buffers.items():
+        if (int(buffer.height), int(buffer.width)) != tuple(shape):
+            raise NativeAbiError(NativeFallbackReason.BAD_SHAPE, f"{name} must match rgb tile dimensions")
+    if screen_tile is not None:
+        buffers["screen_tile"] = native_buffer_from_array("screen_tile", np.asarray(screen_tile), expected_channels=3)
+        if (int(buffers["screen_tile"].height), int(buffers["screen_tile"].width)) != tuple(shape):
+            raise NativeAbiError(NativeFallbackReason.BAD_SHAPE, "screen_tile must match rgb tile dimensions")
+        required |= BackendCapability.SCREEN_TILE
+    else:
+        required |= BackendCapability.CONSTANT_SCREEN
+    required |= BackendCapability.RGB_ONLY | BackendCapability.FULL_COLOR_TILE
+    clamp_key = tuple(float(np.clip(v, 0.0, 1.0)) for v in clamp_key_linear)
+    if len(clamp_key) != 3:
+        raise NativeAbiError(NativeFallbackReason.BAD_SHAPE, "clamp_key_linear must contain three values")
+    transition_enabled = bool(_setting(settings, "transition_unmix", True))
+    params = ImgKeyNativeColorTileParamsV2(
+        struct_size=ctypes.sizeof(ImgKeyNativeColorTileParamsV2),
+        version=IMGKEY_GPU_ABI_VERSION,
+        required_capabilities=int(required),
+        status=IMGKEY_GPU_OK,
+        fallback_reason=int(NativeFallbackReason.NONE),
+        screen_r=int(screen[0]),
+        screen_g=int(screen[1]),
+        screen_b=int(screen[2]),
+        reserved0=0,
+        foreground_reference_pull=float(_clip01(_setting(settings, "foreground_reference_pull", 0.65))),
+        key_vector_despill=float(_clip01(_setting(settings, "key_vector_despill", 0.75))),
+        preserve_foreground_luma=float(_clip01(_setting(settings, "preserve_foreground_luma", 0.85))),
+        transition_spill_threshold=float(_setting(settings, "transition_spill_threshold", 0.08)),
+        transition_reconstruction_error=float(_setting(settings, "transition_reconstruction_error", 0.08)),
+        clip_foreground=float(_clip01(_setting(settings, "clip_foreground", 0.14))),
+        transition_alpha_min=int(np.clip(int(_setting(settings, "transition_alpha_min", 2)), 0, 255)),
+        transition_alpha_max=int(np.clip(int(_setting(settings, "transition_alpha_max", 253)), 0, 255)),
+        despill=float(_clip01(_setting(settings, "despill", 0.70))),
+        decontaminate=float(_clip01(_setting(settings, "decontaminate", 0.50))),
+        unmix_amount=float(_clip01(_setting(settings, "unmix_amount", 0.75))),
+        edge_color_repair=float(_clip01(_setting(settings, "edge_color_repair", 0.65))),
+        inner_color_pull=float(_clip01(_setting(settings, "inner_color_pull", 0.45))),
+        fringe_remove=float(_clip01(_setting(settings, "fringe_remove", 0.75))),
+        luminance_protect=float(_effective_luminance_protect(settings)),
+        clamp_key_r=clamp_key[0],
+        clamp_key_g=clamp_key[1],
+        clamp_key_b=clamp_key[2],
+        transition_enabled=1 if transition_enabled else 0,
+        transition_reference_enabled=1 if (transition_enabled and _foreground_reference_radius(settings) > 0) else 0,
+    )
+    _validate_params_struct(params)
+    return NativeColorTileCallV2(params=params, buffers=buffers)
+
+
+def _validate_params_struct(params: ImgKeyNativeColorTileParamsV1 | ImgKeyNativeColorTileParamsV2 | None) -> None:
     if params is None:
         raise NativeAbiError(NativeFallbackReason.NULL_POINTER, "params pointer is null")
-    if int(params.struct_size) != ctypes.sizeof(ImgKeyNativeColorTileParamsV1):
+    expected_size = ctypes.sizeof(type(params))
+    if int(params.struct_size) != expected_size:
         raise NativeAbiError(NativeFallbackReason.BAD_VERSION, "params struct_size is unsupported")
     if int(params.version) != IMGKEY_GPU_ABI_VERSION:
         raise NativeAbiError(NativeFallbackReason.BAD_VERSION, f"params version {params.version} is unsupported")

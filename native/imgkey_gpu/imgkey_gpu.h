@@ -44,7 +44,8 @@ typedef enum ImgKeyGpuCapabilityFlags {
     IMGKEY_GPU_CAP_PERSISTENT_SESSION = 1u << 2,
     IMGKEY_GPU_CAP_TILE_BATCH = 1u << 3,
     IMGKEY_GPU_CAP_ALPHA_WRITE = 1u << 4,
-    IMGKEY_GPU_CAP_RGB_ONLY = 1u << 5
+    IMGKEY_GPU_CAP_RGB_ONLY = 1u << 5,
+    IMGKEY_GPU_CAP_FULL_COLOR_TILE = 1u << 6
 } ImgKeyGpuCapabilityFlags;
 
 typedef enum ImgKeyGpuDType {
@@ -85,6 +86,38 @@ typedef struct ImgKeyGpuColorTileParamsV1 {
     uint32_t transition_alpha_max;
 } ImgKeyGpuColorTileParamsV1;
 
+typedef struct ImgKeyGpuColorTileParamsV2 {
+    uint32_t struct_size;
+    uint32_t version;
+    uint64_t required_capabilities;
+    int32_t status;
+    int32_t fallback_reason;
+    uint8_t screen_r;
+    uint8_t screen_g;
+    uint8_t screen_b;
+    uint8_t reserved0;
+    float foreground_reference_pull;
+    float key_vector_despill;
+    float preserve_foreground_luma;
+    float transition_spill_threshold;
+    float transition_reconstruction_error;
+    float clip_foreground;
+    uint32_t transition_alpha_min;
+    uint32_t transition_alpha_max;
+    float despill;
+    float decontaminate;
+    float unmix_amount;
+    float edge_color_repair;
+    float inner_color_pull;
+    float fringe_remove;
+    float luminance_protect;
+    float clamp_key_r;
+    float clamp_key_g;
+    float clamp_key_b;
+    uint32_t transition_enabled;
+    uint32_t transition_reference_enabled;
+} ImgKeyGpuColorTileParamsV2;
+
 IMGKEY_GPU_API uint32_t IMGKEY_GPU_CALL imgkey_gpu_version(void);
 IMGKEY_GPU_API const char* IMGKEY_GPU_CALL imgkey_gpu_last_error(void);
 IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_probe_v1(void* out_probe_json, uint32_t out_probe_json_bytes);
@@ -107,6 +140,23 @@ IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_process_color_tile_v1(
     const ImgKeyGpuTileBufferV1* screen_tile,
     const ImgKeyGpuTileBufferV1* foreground_ref_rgb,
     const ImgKeyGpuTileBufferV1* foreground_ref_valid,
+    ImgKeyGpuTileBufferV1* out_rgb,
+    ImgKeyGpuTileBufferV1* out_repair_mask
+);
+IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_process_color_tile_v2(
+    void* context,
+    ImgKeyGpuColorTileParamsV2* params,
+    const ImgKeyGpuTileBufferV1* rgb,
+    const ImgKeyGpuTileBufferV1* alpha,
+    const ImgKeyGpuTileBufferV1* background_mask,
+    const ImgKeyGpuTileBufferV1* edge_mask,
+    const ImgKeyGpuTileBufferV1* probability,
+    const ImgKeyGpuTileBufferV1* fringe_mask,
+    const ImgKeyGpuTileBufferV1* screen_tile,
+    const ImgKeyGpuTileBufferV1* nearest_inner_rgb,
+    const ImgKeyGpuTileBufferV1* nearest_inner_valid,
+    const ImgKeyGpuTileBufferV1* transition_ref_rgb,
+    const ImgKeyGpuTileBufferV1* transition_ref_valid,
     ImgKeyGpuTileBufferV1* out_rgb,
     ImgKeyGpuTileBufferV1* out_repair_mask
 );

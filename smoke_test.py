@@ -3280,6 +3280,7 @@ def run_gpu_backend_registry_tests() -> None:
     d3d12_info = d3d12.probe(refresh=True)
     if d3d12_info.get("available"):
         assert "screen_tile" in d3d12_info.get("capabilities", [])
+        assert "full_color_tile" in d3d12_info.get("capabilities", [])
         identity_rgba = np.arange(17 * 19 * 4, dtype=np.uint8).reshape(17, 19, 4)
         identity = d3d12.identity_rgba(identity_rgba)
         assert identity["used"] is True, f"D3D12 identity expected use, got {identity.get('reason')}: {identity.get('message')}"
@@ -3314,6 +3315,29 @@ def run_gpu_backend_registry_tests() -> None:
         screen_mask_delta = np.abs(cpu_screen_mask.astype(np.int16) - d3d12_screen["repair_mask"].astype(np.int16))
         assert int(screen_rgb_delta.max()) <= 2 and float(np.percentile(screen_rgb_delta, 99)) <= 1.0, "D3D12 screen_tile RGB parity exceeded tolerance"
         assert int(screen_mask_delta.max()) == 0, "D3D12 screen_tile repair mask must match CPU exactly"
+
+        cpu_full_rgb, cpu_full_mask = _process_color_tile(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, screen_tile, odd_foreground, odd_valid, odd_key_color, replace(odd_settings, gpu_acceleration="Off"))
+        d3d12_full_session = gpu_backend.begin_render(d3d12_settings, odd_rgb.shape, required_capabilities={"screen_tile", "rgb_only", "full_color_tile"}, backends=[d3d12])
+        d3d12_full = d3d12_full_session.process_full_color_tile(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, screen_tile, odd_foreground, odd_valid, odd_key_color, d3d12_settings)
+        d3d12_full_session.end_render()
+        assert d3d12_full["used"] is True, f"D3D12 full color tile expected use, got {d3d12_full.get('reason')}: {d3d12_full.get('message')}"
+        full_rgb_delta = np.abs(cpu_full_rgb.astype(np.int16) - d3d12_full["rgb"].astype(np.int16))
+        full_mask_delta = np.abs(cpu_full_mask.astype(np.int16) - d3d12_full["repair_mask"].astype(np.int16))
+        assert int(full_rgb_delta.max()) <= 2 and float(np.percentile(full_rgb_delta, 99)) <= 1.0, "D3D12 full color tile RGB parity exceeded tolerance"
+        assert int(full_mask_delta.max()) <= 1, "D3D12 full color tile spill/repair mask parity exceeded tolerance"
+        assert int(d3d12_full["rgb"][odd_alpha == 0].max(initial=0)) == 0, "D3D12 full color tile transparent RGB must remain zero"
+
+        split_rgb, split_alpha, split_background, split_edge, split_probability, split_fringe, split_foreground, split_valid, split_key, split_settings = _gpu_transition_tile((513, 513))
+        split_cpu_rgb, split_cpu_mask = _process_color_tile(split_rgb, split_alpha, split_background, split_edge, split_probability, split_fringe, None, split_foreground, split_valid, split_key, replace(split_settings, gpu_acceleration="Off"))
+        split_gpu_settings = replace(split_settings, gpu_acceleration="Force GPU")
+        split_session = gpu_backend.begin_render(split_gpu_settings, split_rgb.shape, required_capabilities={"constant_screen", "rgb_only", "full_color_tile"}, backends=[d3d12])
+        split_gpu = split_session.process_full_color_tile(split_rgb, split_alpha, split_background, split_edge, split_probability, split_fringe, None, split_foreground, split_valid, split_key, split_gpu_settings)
+        split_session.end_render()
+        assert split_gpu["used"] is True and int(split_gpu.get("subtile_dispatches") or 0) > 1, "D3D12 full color tile must split larger tiles into persistent TDR-bounded subdispatches"
+        split_rgb_delta = np.abs(split_cpu_rgb.astype(np.int16) - split_gpu["rgb"].astype(np.int16))
+        split_mask_delta = np.abs(split_cpu_mask.astype(np.int16) - split_gpu["repair_mask"].astype(np.int16))
+        assert int(split_rgb_delta.max()) <= 2 and float(np.percentile(split_rgb_delta, 99)) <= 1.0, "D3D12 split full color tile RGB parity exceeded tolerance"
+        assert int(split_mask_delta.max()) <= 1, "D3D12 split full color tile mask parity exceeded tolerance"
     else:
         print(f"D3D12 native backend tests skipped: {d3d12_info.get('reason')} - {d3d12_info.get('message')}")
 
@@ -3551,7 +3575,7 @@ def write_gpu_benchmarks() -> None:
         "notes": [
             "CPU remains the correctness reference.",
             "CUDA DLL timings include host/device copies performed inside imgkey_cuda_transition_repair_v1.",
-            "D3D12 timings use the persistent D3D12 context and include per-dispatch upload/readback for the MVP backend.",
+            "D3D12 timings use the persistent D3D12 context. Full-color tiles larger than the native-call safety budget are split into TDR-bounded persistent-buffer subdispatches.",
         ],
         "benchmarks": {},
     }
@@ -3672,6 +3696,42 @@ def write_gpu_benchmarks() -> None:
             "max_mask_diff_vs_cpu": int(d3d12_mask_delta.max()),
             "faster_than_cpu": d3d12_dispatch_ms < d3d12_cpu_ms,
             "auto_fallback_policy": "Backend registry selects D3D12 for constant-screen and screen_tile tiles when available; CPU remains fallback.",
+        }
+
+        full_rgb, full_alpha, full_bg, full_edge, full_probability, full_fringe, full_foreground, full_valid, full_key, full_settings = _gpu_transition_tile((2048, 2048))
+        full_settings_gpu = replace(full_settings, gpu_acceleration="Force GPU")
+
+        def d3d12_cpu_full_color_dispatch() -> None:
+            _process_color_tile(full_rgb, full_alpha, full_bg, full_edge, full_probability, full_fringe, None, full_foreground, full_valid, full_key, replace(full_settings, gpu_acceleration="Off"))
+
+        d3d12_full_cpu_ms = _median_time_ms(d3d12_cpu_full_color_dispatch, repeat=3, warmup=1)
+        d3d12_full_cpu_rgb, d3d12_full_cpu_mask = _process_color_tile(full_rgb, full_alpha, full_bg, full_edge, full_probability, full_fringe, None, full_foreground, full_valid, full_key, replace(full_settings, gpu_acceleration="Off"))
+        d3d12_full_session = gpu_backend.begin_render(full_settings_gpu, full_rgb.shape, required_capabilities={"constant_screen", "rgb_only", "full_color_tile"}, backends=[d3d12])
+
+        def d3d12_full_color_dispatch() -> None:
+            result = d3d12_full_session.process_full_color_tile(full_rgb, full_alpha, full_bg, full_edge, full_probability, full_fringe, None, full_foreground, full_valid, full_key, full_settings_gpu)
+            assert result["used"], result.get("message")
+
+        try:
+            d3d12_full_dispatch_ms = _median_time_ms(d3d12_full_color_dispatch, repeat=5, warmup=2)
+            d3d12_full_result = d3d12_full_session.process_full_color_tile(full_rgb, full_alpha, full_bg, full_edge, full_probability, full_fringe, None, full_foreground, full_valid, full_key, full_settings_gpu)
+        finally:
+            d3d12_full_session.end_render()
+        full_rgb_delta = np.abs(d3d12_full_cpu_rgb.astype(np.int16) - d3d12_full_result["rgb"].astype(np.int16))
+        full_mask_delta = np.abs(d3d12_full_cpu_mask.astype(np.int16) - d3d12_full_result["repair_mask"].astype(np.int16))
+        summary["benchmarks"]["d3d12_full_color_tile_2048_dispatch"] = {
+            "tile_shape": list(full_rgb.shape[:2]),
+            "cpu_full_color_ms": d3d12_full_cpu_ms,
+            "d3d12_dispatch_ms_including_transfer": d3d12_full_dispatch_ms,
+            "speedup": d3d12_full_cpu_ms / d3d12_full_dispatch_ms if d3d12_full_dispatch_ms > 0 else None,
+            "transfer_included": True,
+            "subtile_dispatches": int(d3d12_full_result.get("subtile_dispatches") or 1),
+            "subtile_max_pixels": int(d3d12_full_result.get("subtile_max_pixels") or 0),
+            "max_rgb_diff_vs_cpu": int(full_rgb_delta.max()),
+            "p99_rgb_diff_vs_cpu": float(np.percentile(full_rgb_delta, 99)),
+            "max_mask_diff_vs_cpu": int(full_mask_delta.max()),
+            "faster_than_cpu": d3d12_full_dispatch_ms < d3d12_full_cpu_ms,
+            "auto_fallback_policy": "Full color D3D12 path is optional and falls back by capability/error; CPU remains correctness reference.",
         }
 
     (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -3998,6 +4058,73 @@ def _profile_compact_cuda_transfer_dispatch() -> dict[str, Any]:
     return report
 
 
+def _profile_d3d12_full_color_tile_dispatch() -> dict[str, Any]:
+    gpu_backend = importlib.import_module("gpu_backend")
+    d3d12 = gpu_backend.D3D12ComputeBackend()
+    availability = d3d12.probe(refresh=True)
+    report: dict[str, Any] = {
+        "backend": {"id": "d3d12_compute", "name": "D3D12 compute backend"},
+        "availability": availability,
+        "status": "skipped",
+        "reason": availability.get("reason"),
+        "message": availability.get("message"),
+        "notes": [
+            "D3D12 Phase 6 path fuses linear conversion, unmix/clamp/despill/luma protect, nearest-inner pull, transition reference repair, transparent-RGB enforcement, and screen-tile support in the native full-color tile kernel.",
+            "Tiles above max_native_call_pixels are split into TDR-bounded native calls while reusing the render-session D3D12 context and persistent buffers.",
+        ],
+    }
+    if not availability.get("available"):
+        return report
+
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((2048, 2048))
+    cpu_settings = replace(settings, gpu_acceleration="Off")
+    gpu_settings = replace(settings, gpu_acceleration="Force GPU")
+
+    def cpu_full_color() -> None:
+        _process_color_tile(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, cpu_settings)
+
+    session = gpu_backend.begin_render(gpu_settings, rgb.shape, required_capabilities={"constant_screen", "rgb_only", "full_color_tile"}, backends=[d3d12])
+
+    def d3d12_full_color() -> None:
+        result = session.process_full_color_tile(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, gpu_settings)
+        if not result.get("used"):
+            raise RuntimeError(str(result.get("message") or result.get("reason") or "D3D12 dispatch skipped"))
+
+    try:
+        cpu_ms = _median_time_ms(cpu_full_color, repeat=3, warmup=1)
+        d3d12_ms = _median_time_ms(d3d12_full_color, repeat=5, warmup=2)
+        cpu_rgb, cpu_mask = _process_color_tile(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, cpu_settings)
+        result = session.process_full_color_tile(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, gpu_settings)
+    except Exception as exc:
+        report.update({"status": "error", "reason": "d3d12_profile_failed", "message": f"{type(exc).__name__}: {exc}"})
+        return report
+    finally:
+        session.end_render()
+
+    rgb_delta = np.abs(cpu_rgb.astype(np.int16) - result["rgb"].astype(np.int16))
+    mask_delta = np.abs(cpu_mask.astype(np.int16) - result["repair_mask"].astype(np.int16))
+    report.update(
+        {
+            "status": "measured",
+            "reason": None,
+            "message": "D3D12 full color tile transfer/dispatch/readback profile completed.",
+            "tile_shape": list(rgb.shape[:2]),
+            "cpu_full_color_ms": _perf_ms(cpu_ms),
+            "d3d12_ms_including_transfer": _perf_ms(d3d12_ms),
+            "d3d12_reported_elapsed_ms": _perf_ms(float(result.get("elapsed_ms") or 0.0)),
+            "subtile_dispatches": int(result.get("subtile_dispatches") or 1),
+            "subtile_max_pixels": int(result.get("subtile_max_pixels") or 0),
+            "speedup_vs_cpu": float(cpu_ms / d3d12_ms) if d3d12_ms > 0 else None,
+            "faster_than_cpu": bool(d3d12_ms < cpu_ms),
+            "max_rgb_diff_vs_cpu": int(rgb_delta.max()),
+            "p99_rgb_diff_vs_cpu": float(np.percentile(rgb_delta, 99)),
+            "max_mask_diff_vs_cpu": int(mask_delta.max()),
+            "dispatch_result": {k: v for k, v in result.items() if k not in {"rgb", "repair_mask"}},
+        }
+    )
+    return report
+
+
 def _perf_case_stage(case: dict[str, Any], stage: str) -> dict[str, Any]:
     return case.get("timings", {}).get(stage, {"total_ms": 0.0, "calls": 0, "median_ms": 0.0, "max_ms": 0.0})
 
@@ -4066,6 +4193,17 @@ def _perf_report_text(summary: dict[str, Any]) -> str:
             f"cuda_dispatch={gpu.get('cuda_process_color_tile_ms_including_transfer'):.3f} ms "
             f"speedup_direct={gpu.get('speedup_direct_vs_cpu'):.2f}x max_rgb_diff={gpu.get('max_rgb_diff_vs_cpu')}"
         )
+    d3d12 = summary.get("d3d12_full_color_tile_dispatch", {})
+    lines.extend(["", "D3D12 full color tile transfer/dispatch/readback:"])
+    lines.append(
+        f"- status={d3d12.get('status')} reason={d3d12.get('reason')} message={d3d12.get('message')}"
+    )
+    if d3d12.get("status") == "measured":
+        lines.append(
+            f"  tile={d3d12.get('tile_shape')} subtiles={d3d12.get('subtile_dispatches')} "
+            f"cpu={d3d12.get('cpu_full_color_ms'):.3f} ms d3d12={d3d12.get('d3d12_ms_including_transfer'):.3f} ms "
+            f"speedup={d3d12.get('speedup_vs_cpu'):.2f}x max_rgb_diff={d3d12.get('max_rgb_diff_vs_cpu')}"
+        )
     lines.extend(
         [
             "",
@@ -4073,6 +4211,7 @@ def _perf_report_text(summary: dict[str, Any]) -> str:
             "- This command only profiles current behavior; it does not change keyer settings or output logic.",
             "- Large cases use resized geometric benchmark sources: 4096 flat blue screen and 8192 uneven-gradient blue screen.",
             "- Current compact CUDA timing is reported as one combined host call because the CUDA v1 ABI does not expose separate transfer, dispatch, and readback timers.",
+            "- D3D12 full-color timing reports the Phase 6 fused tile graph independently from the CPU-reference large export cases so fallback correctness and acceleration evidence are both visible.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -4092,6 +4231,7 @@ def write_perf_baseline() -> None:
         print(f"profiling {name} ({size}x{size})")
         summary["cases"].append(_profile_large_pipeline_case(name, template_case, size))
     summary["compact_cuda_transfer_dispatch"] = _profile_compact_cuda_transfer_dispatch()
+    summary["d3d12_full_color_tile_dispatch"] = _profile_d3d12_full_color_tile_dispatch()
     report_text = _perf_report_text(summary)
     summary_path = PERF_BASELINE_DIR / "pipeline_baseline.json"
     report_path = PERF_BASELINE_DIR / "pipeline_baseline.txt"

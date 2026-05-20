@@ -10,6 +10,7 @@ $Shader = Join-Path $Root "imgkey_gpu_color.hlsl"
 $GeneratedHeader = Join-Path $BuildDir "imgkey_gpu_shaders.h"
 $IdentityBlob = Join-Path $BuildDir "imgkey_identity.cso"
 $ColorBlob = Join-Path $BuildDir "imgkey_color_tile.cso"
+$FullColorBlob = Join-Path $BuildDir "imgkey_full_color_tile.cso"
 $ResponseFile = Join-Path $BuildDir "cl.rsp"
 $DllOut = Join-Path $BuildDir "imgkey_gpu.dll"
 
@@ -127,8 +128,10 @@ function Write-CArray([string]$Path, [string]$Name, [byte[]]$Bytes, [bool]$Appen
 
 Invoke-ShaderCompile "ImgKeyIdentityCS" $IdentityBlob
 Invoke-ShaderCompile "ImgKeyColorTileCS" $ColorBlob
+Invoke-ShaderCompile "ImgKeyFullColorTileCS" $FullColorBlob
 Write-CArray $GeneratedHeader "g_imgkey_identity_cs" ([IO.File]::ReadAllBytes($IdentityBlob)) $false
 Write-CArray $GeneratedHeader "g_imgkey_color_tile_cs" ([IO.File]::ReadAllBytes($ColorBlob)) $true
+Write-CArray $GeneratedHeader "g_imgkey_full_color_tile_cs" ([IO.File]::ReadAllBytes($FullColorBlob)) $true
 
 $vsRoot = Find-VsRoot
 $vcvars = if ($vsRoot) { Join-Path $vsRoot "VC\Auxiliary\Build\vcvars64.bat" } else { $null }

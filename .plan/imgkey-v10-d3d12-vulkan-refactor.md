@@ -523,10 +523,10 @@ Isolation:
 - Own tile color render graph and backend capabilities. Do not move global connected components/distance transform until color path is stable.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P6.1 - GPU linear conversion / unmix foundation
 - Move the linear/sRGB conversion and base unmix math into backend-supported tile kernels.
@@ -536,7 +536,7 @@ Acceptance:
 - RGB parity thresholds pass on geometric and transition diagnostics.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -555,7 +555,7 @@ Acceptance:
 - Unsupported operations fall back by capability, not crash.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -568,7 +568,7 @@ Acceptance:
 - Inner color pull and transition references match CPU within tolerance.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -582,7 +582,7 @@ Acceptance:
 - Large synthetic export shows less transfer overhead than current one-kernel CUDA path.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -596,10 +596,18 @@ Acceptance:
 - Benchmarks show reduced transfer/dispatch overhead vs current compact CUDA path.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Added native ABI/color-tile v2 capability `full_color_tile` plus D3D12 shader support for fused tile color work: sRGB/linear conversion, base unmix, Vlahos clamp/key-vector despill, decontaminate/luminance protect, nearest-inner color pull, transition reference repair, repair mask output, and transparent-RGB zero enforcement. CPU remains the correctness/fallback path; CUDA compatibility remains transition-only and reports explicit capability fallback for full-color tiles.
+- Preserved default local screen model GPU support through D3D12 `screen_tile` inputs. Local screen plate estimation and nearest-inner label/reference generation remain CPU/tile-local as planned; the GPU consumes those tile/reference inputs and does not port distance transforms yet.
+- Added render-session persistent D3D12 upload/default/readback buffers reused across native calls. Native calls are capped at `512x512`/`262144` pixels to avoid observed long-command/TDR risk, while the Python D3D12 session splits larger full-color tiles into persistent-buffer subdispatches and reports `max_tile_pixels=9437184`, `max_native_call_pixels=262144`, and `persistent_buffers=true`.
+- Routed `_process_color_tile()` through the fused full-color backend first; unsupported backends fall back by capability, and legacy transition-only D3D12 calls above the safe native-call size now return a clean `tile_too_large` fallback instead of launching unsafe work.
+- Parity/perf evidence on local RTX 5060 Ti: D3D12 full-color 2048 tile benchmark CPU `8575.37ms` vs D3D12 `68.27ms` including transfer/readback, `16` subdispatches, max RGB diff `0`, p99 diff `0`, mask diff `0`, speedup `125.61x`. Perf baseline report separately measured CPU full color `8922.08ms` vs D3D12 `69.86ms`, speedup `127.72x`. Geometry GPU parity passed with max backend RGB diff `1`; transparent RGB stayed zero.
+- Required Phase 6 verification passed locally: native clean build, smoke, GPU parity, GPU benchmark, geometric benchmark generation, perf baseline generation, runtime probe, py_compile/import, no-heavy/default startup no-torch guard, and `git diff --check` after plan cleanup.
 
 ---
 
@@ -618,10 +626,10 @@ Isolation:
 - Own Vulkan backend only; no algorithm changes unless parity requires shared shader fixes.
 
 Status:
-- Deferred until D3D12 gate passes
+- Deferred pending Vulkan start gate
 
 Current:
-- No
+- Yes
 
 #### P7.1 - Vulkan probe/context and SPIR-V shader path
 - Hard stop before this milestone: do not start Vulkan until D3D12 MVP has passed parity, performance, packaging dependency audit, and backend ABI review.
@@ -705,4 +713,4 @@ Current:
 
 ## 6) Immediate next step
 
-Proceed to Phase 6 with `deep-worker`: expand the D3D12 backend from the transition-repair MVP into the full GPU tile color pipeline with persistent buffers/batching, while keeping CPU as the correctness reference. Do not begin Vulkan until the D3D12 full tile pipeline gate passes.
+Phase 7 is the current deferred gate. Planner should decide whether to open Vulkan implementation now that the D3D12 full tile pipeline has parity/perf evidence, or keep Vulkan deferred and move to Phase 8 release hardening.

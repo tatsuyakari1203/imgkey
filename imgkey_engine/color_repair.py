@@ -88,7 +88,7 @@ def _finalize_gpu_stats(settings: KeySettings, gpu_stats: dict | None) -> dict:
     if used > 0:
         backend = stats.get("backend") or "GPU"
         stats["status"] = "used"
-        stats["message"] = f"{backend} transition repair used on {used} tile(s); CPU remained the reference/fallback for {fallback} tile(s)."
+        stats["message"] = f"{backend} color pipeline used on {used} tile(s); CPU remained the reference/fallback for {fallback} tile(s)."
     elif attempted > 0:
         stats["status"] = "fallback"
         stats["message"] = stats.get("last_message") or "GPU acceleration fell back to CPU for all attempted tiles."
@@ -273,6 +273,45 @@ def _process_color_tile(
     gpu_stats: dict | None = None,
     gpu_session=None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    gpu_mode = _gpu_acceleration_mode(settings)
+    if gpu_mode != "Off":
+        full_result: dict | None = None
+        try:
+            required = {"rgb_only", "full_color_tile", "screen_tile"} if screen_tile is not None else {"rgb_only", "full_color_tile", "constant_screen"}
+            full_result = gpu_backend.process_full_color_tile(
+                rgb_tile,
+                alpha_u8,
+                background_mask,
+                edge_mask,
+                probability,
+                fringe_mask,
+                screen_tile,
+                nearest_inner_rgb,
+                nearest_inner_valid,
+                screen_color,
+                settings,
+                transition_nearest_rgb=transition_nearest_rgb,
+                transition_nearest_valid=transition_nearest_valid,
+                session=gpu_session,
+                required_capabilities=required,
+            )
+        except Exception as exc:  # pragma: no cover - defensive backend boundary
+            full_result = {
+                "ok": False,
+                "used": False,
+                "backend": "gpu_backend",
+                "backend_name": "GPU backend registry",
+                "reason": "gpu_exception",
+                "message": f"GPU full color tile failed before launch; CPU fallback is required: {type(exc).__name__}: {exc}",
+                "elapsed_ms": None,
+            }
+        if full_result.get("used") and isinstance(full_result.get("rgb"), np.ndarray) and isinstance(full_result.get("repair_mask"), np.ndarray):
+            _record_gpu_tile_result(gpu_stats, full_result)
+            return full_result["rgb"], full_result["repair_mask"]
+        if gpu_mode == "Force GPU" and full_result.get("reason") in gpu_backend.GPU_BACKEND_ERROR_REASONS:
+            _record_gpu_tile_result(gpu_stats, full_result)
+            raise RuntimeError(str(full_result.get("message") or "Force GPU requested, but full color GPU processing failed."))
+
     rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
     alpha = alpha_u8.astype(np.float32) / 255.0
     if screen_tile is None:
@@ -331,7 +370,6 @@ def _process_color_tile(
         repair_nearest_rgb = nearest_inner_rgb if transition_nearest_rgb is None else transition_nearest_rgb
         repair_nearest_valid = nearest_inner_valid if transition_nearest_valid is None else transition_nearest_valid
         transition_rgb = transition_mask = None
-        gpu_mode = _gpu_acceleration_mode(settings)
         if gpu_mode != "Off" and _transition_reference_enabled(settings):
             gpu_result: dict
             try:
