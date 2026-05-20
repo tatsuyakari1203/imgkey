@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+import gc
 import hashlib
 import importlib
 import json
@@ -50,6 +51,7 @@ ALGORITHM_BASELINE_DIR = Path(".artifact") / "algorithm-upgrade-baseline"
 TRANSITION_UNMIX_DIAGNOSTIC_DIR = Path(".artifact") / "transition-unmix-diagnostics"
 GPU_BENCHMARK_DIR = Path(".artifact") / "gpu-benchmarks"
 GEOMETRIC_BENCHMARK_DIR = Path(".artifact") / "geometric-benchmark"
+PERF_BASELINE_DIR = Path(".artifact") / "perf"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -3448,6 +3450,430 @@ def write_gpu_benchmarks() -> None:
     print(f"gpu benchmark summary written to {GPU_BENCHMARK_DIR / 'summary.json'}")
 
 
+def _perf_ms(value: float) -> float:
+    return float(round(float(value), 3))
+
+
+def _record_perf_timing(report: dict[str, Any], stage: str, elapsed_ms: float) -> None:
+    timings = report.setdefault("timings", {})
+    record = timings.setdefault(stage, {"calls": 0, "total_ms": 0.0, "samples_ms": []})
+    record["calls"] = int(record["calls"]) + 1
+    record["total_ms"] = float(record["total_ms"]) + float(elapsed_ms)
+    samples = record.setdefault("samples_ms", [])
+    if isinstance(samples, list):
+        samples.append(float(elapsed_ms))
+
+
+def _finalize_perf_timings(report: dict[str, Any]) -> None:
+    for record in report.get("timings", {}).values():
+        samples = np.asarray(record.get("samples_ms", []), dtype=np.float64)
+        if samples.size:
+            record["total_ms"] = _perf_ms(float(np.sum(samples)))
+            record["median_ms"] = _perf_ms(float(np.median(samples)))
+            record["max_ms"] = _perf_ms(float(np.max(samples)))
+            record["min_ms"] = _perf_ms(float(np.min(samples)))
+            record["mean_ms"] = _perf_ms(float(np.mean(samples)))
+            record["samples_ms"] = [_perf_ms(float(sample)) for sample in samples]
+        else:
+            record["total_ms"] = _perf_ms(float(record.get("total_ms", 0.0)))
+            record["median_ms"] = 0.0
+            record["max_ms"] = 0.0
+            record["min_ms"] = 0.0
+            record["mean_ms"] = 0.0
+
+
+def _record_perf_tile(report: dict[str, Any], args: tuple[Any, ...]) -> None:
+    if not args:
+        return
+    rgb_tile = np.asarray(args[0])
+    if rgb_tile.ndim < 2:
+        return
+    h, w = rgb_tile.shape[:2]
+    tiles = report.setdefault("tiles", {"count": 0, "read_shapes": {}})
+    tiles["count"] = int(tiles.get("count", 0)) + 1
+    shape_key = f"{int(w)}x{int(h)}"
+    read_shapes = tiles.setdefault("read_shapes", {})
+    read_shapes[shape_key] = int(read_shapes.get(shape_key, 0)) + 1
+
+
+def _record_perf_gpu_result(report: dict[str, Any], result: Any, wall_ms: float) -> None:
+    gpu = report.setdefault(
+        "gpu_tile_dispatch",
+        {
+            "calls": 0,
+            "used_tiles": 0,
+            "fallback_tiles": 0,
+            "reported_elapsed_ms_total": 0.0,
+            "wall_ms_total": 0.0,
+            "reasons": {},
+        },
+    )
+    gpu["calls"] = int(gpu.get("calls", 0)) + 1
+    gpu["wall_ms_total"] = float(gpu.get("wall_ms_total", 0.0)) + float(wall_ms)
+    if not isinstance(result, dict):
+        reasons = gpu.setdefault("reasons", {})
+        reasons["non_dict_result"] = int(reasons.get("non_dict_result", 0)) + 1
+        return
+    elapsed = result.get("elapsed_ms")
+    if elapsed is not None:
+        gpu["reported_elapsed_ms_total"] = float(gpu.get("reported_elapsed_ms_total", 0.0)) + float(elapsed)
+    used = bool(result.get("used"))
+    if used:
+        gpu["used_tiles"] = int(gpu.get("used_tiles", 0)) + 1
+    else:
+        gpu["fallback_tiles"] = int(gpu.get("fallback_tiles", 0)) + 1
+    reason = str(result.get("reason") or ("used" if used else "unknown"))
+    reasons = gpu.setdefault("reasons", {})
+    reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+
+@contextmanager
+def _pipeline_perf_instrumentation(report: dict[str, Any]):
+    originals: list[tuple[Any, str, Any]] = []
+
+    def patch(target: Any, name: str, stage: str, after: Any | None = None) -> None:
+        if not hasattr(target, name):
+            return
+        original = getattr(target, name)
+
+        def wrapped(*args: Any, **kwargs: Any):
+            start = time.perf_counter()
+            ok = False
+            result: Any = None
+            try:
+                result = original(*args, **kwargs)
+                ok = True
+                return result
+            finally:
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                _record_perf_timing(report, stage, elapsed_ms)
+                if ok and after is not None:
+                    after(report, result, elapsed_ms, args, kwargs)
+
+        setattr(target, name, wrapped)
+        originals.append((target, name, original))
+
+    def after_tile(case_report: dict[str, Any], _result: Any, _elapsed_ms: float, args: tuple[Any, ...], _kwargs: dict[str, Any]) -> None:
+        _record_perf_tile(case_report, args)
+
+    def after_gpu(case_report: dict[str, Any], result: Any, elapsed_ms: float, _args: tuple[Any, ...], _kwargs: dict[str, Any]) -> None:
+        _record_perf_gpu_result(case_report, result, elapsed_ms)
+
+    patch(keyer_module, "_build_global_matte", "global_matte_total")
+    patch(keyer_module, "_estimate_screen_map", "screen_model_full_image")
+    patch(keyer_module, "_estimate_screen_tile", "screen_model_local_plate_tile")
+    patch(keyer_module, "_build_nearest_inner_reference_map", "nearest_inner_reference_global")
+    patch(keyer_module, "_build_tile_local_nearest_inner_rgb", "nearest_inner_reference_tile_local")
+    patch(keyer_module, "_recover_transition_alpha_global", "transition_alpha_recovery")
+    patch(keyer_module, "_render_tiled_rgba", "tiled_rgba_render_total")
+    patch(keyer_module, "_process_color_tile", "per_tile_color_render", after_tile)
+    try:
+        gpu_accel = importlib.import_module("gpu_accel")
+        patch(gpu_accel, "process_color_tile_gpu", "gpu_transfer_dispatch_readback", after_gpu)
+    except Exception as exc:  # pragma: no cover - diagnostic-only guard
+        report["gpu_instrumentation_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        yield
+    finally:
+        for target, name, original in reversed(originals):
+            setattr(target, name, original)
+
+
+def _resampling_bilinear() -> Any:
+    resampling = getattr(Image, "Resampling", Image)
+    return getattr(resampling, "BILINEAR", Image.BILINEAR)
+
+
+def _large_perf_source_from_case(case: GeometricBenchmarkCase, size: int) -> np.ndarray:
+    image = Image.fromarray(case.source_rgb, mode="RGB")
+    resized = image.resize((int(size), int(size)), resample=_resampling_bilinear())
+    return np.asarray(resized, dtype=np.uint8).copy()
+
+
+def _large_perf_case_specs() -> list[tuple[str, GeometricBenchmarkCase, int]]:
+    cases = {case.background_name: case for case in geometric_benchmark_cases()}
+    return [
+        ("large_geometric_4096_blue_flat", cases["blue_flat"], 4096),
+        ("large_geometric_8192_blue_gradient", cases["blue_uneven_gradient"], 8192),
+    ]
+
+
+def _profile_large_pipeline_case(name: str, template_case: GeometricBenchmarkCase, size: int) -> dict[str, Any]:
+    source_dir = PERF_BASELINE_DIR / "sources"
+    export_dir = PERF_BASELINE_DIR / "exports"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / f"{name}_source.png"
+    export_path = export_dir / f"{name}_result.png"
+    settings = replace(template_case.settings, use_tiling=True, tile_size=2048, tile_overlap=128, gpu_acceleration="Off")
+    report: dict[str, Any] = {
+        "name": name,
+        "shape": [int(size), int(size), 3],
+        "background_name": template_case.background_name,
+        "key_color": list(template_case.key_color),
+        "notes": "Source is the current geometric benchmark case resized to the target square dimension; keyer settings keep tiled export enabled and GPU off for CPU-reference baseline.",
+        "settings": asdict(settings),
+        "source_path": str(source_path),
+        "export_path": str(export_path),
+        "timings": {},
+    }
+
+    start = time.perf_counter()
+    source_rgb = _large_perf_source_from_case(template_case, size)
+    _record_perf_timing(report, "fixture_generation", (time.perf_counter() - start) * 1000.0)
+    report["source_mean_rgb"] = [float(v) for v in np.mean(source_rgb.reshape(-1, 3), axis=0)]
+
+    start = time.perf_counter()
+    _save_rgb(source_path, source_rgb)
+    _record_perf_timing(report, "source_png_write", (time.perf_counter() - start) * 1000.0)
+    report["source_png_bytes"] = int(source_path.stat().st_size)
+    del source_rgb
+    gc.collect()
+
+    start = time.perf_counter()
+    rgb, original_alpha = keyer_module.read_image_rgb(source_path)
+    _record_perf_timing(report, "image_load", (time.perf_counter() - start) * 1000.0)
+    report["original_alpha_present"] = original_alpha is not None
+
+    start = time.perf_counter()
+    preview_rgb, preview_scale = keyer_module.resize_for_preview(rgb)
+    _record_perf_timing(report, "preview_resize", (time.perf_counter() - start) * 1000.0)
+    report["preview"] = {"shape": list(preview_rgb.shape), "scale": float(preview_scale)}
+    del preview_rgb
+    gc.collect()
+
+    with _pipeline_perf_instrumentation(report):
+        start = time.perf_counter()
+        result = process_key_image(rgb, settings, original_alpha=original_alpha, include_debug=False)
+        _record_perf_timing(report, "process_key_image_total", (time.perf_counter() - start) * 1000.0)
+
+    report["result"] = {
+        "rgba_shape": list(result.rgba.shape),
+        "alpha_nonzero_pixels": int(np.count_nonzero(result.alpha)),
+        "alpha_mean": float(np.mean(result.alpha)),
+        "transparent_rgb_zero": transparent_rgb_zero(result.rgba),
+        "gpu_acceleration": result.gpu_acceleration,
+    }
+    start = time.perf_counter()
+    _save_rgba(export_path, result.rgba)
+    _record_perf_timing(report, "png_encode_export", (time.perf_counter() - start) * 1000.0)
+    report["export_png_bytes"] = int(export_path.stat().st_size)
+    del result
+    del rgb
+    gc.collect()
+    _finalize_perf_timings(report)
+    if "gpu_tile_dispatch" in report:
+        gpu = report["gpu_tile_dispatch"]
+        gpu["reported_elapsed_ms_total"] = _perf_ms(float(gpu.get("reported_elapsed_ms_total", 0.0)))
+        gpu["wall_ms_total"] = _perf_ms(float(gpu.get("wall_ms_total", 0.0)))
+    return report
+
+
+def _profile_compact_cuda_transfer_dispatch() -> dict[str, Any]:
+    gpu_accel = importlib.import_module("gpu_accel")
+    availability = gpu_accel.is_available(refresh=True)
+    report: dict[str, Any] = {
+        "backend": {"id": "compact_cuda_dll", "name": "compact CUDA DLL"},
+        "availability": availability,
+        "status": "skipped",
+        "reason": availability.get("reason"),
+        "message": availability.get("message"),
+        "notes": [
+            "CUDA DLL v1 exposes one combined host call; timings include Python validation plus host/device transfer, kernel dispatch, synchronization, and readback.",
+            "Direct transfer/dispatch/readback sub-timers are not exposed by the current compact ABI.",
+        ],
+    }
+    if not availability.get("available"):
+        return report
+
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((1024, 1024))
+    transition_strength = gpu_accel.transition_repair_strength_mask_v1(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+    )
+    foreground_valid_u8 = np.ascontiguousarray(nearest_valid.astype(np.uint8) * 255)
+
+    def cpu_direct() -> None:
+        gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+
+    def cuda_direct() -> None:
+        gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+
+    def cuda_dispatch() -> None:
+        result = gpu_accel.process_color_tile_gpu(
+            rgb,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe,
+            None,
+            foreground,
+            nearest_valid,
+            key_color,
+            replace(settings, gpu_acceleration="Force GPU"),
+            force_gpu=True,
+        )
+        if not result.get("used"):
+            raise RuntimeError(str(result.get("message") or result.get("reason") or "GPU dispatch skipped"))
+
+    try:
+        cpu_ms = _median_time_ms(cpu_direct, repeat=3, warmup=1)
+        cuda_direct_ms = _median_time_ms(cuda_direct, repeat=3, warmup=1)
+        cuda_dispatch_ms = _median_time_ms(cuda_dispatch, repeat=3, warmup=1)
+        cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        dispatch_result = gpu_accel.process_color_tile_gpu(
+            rgb,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe,
+            None,
+            foreground,
+            nearest_valid,
+            key_color,
+            replace(settings, gpu_acceleration="Force GPU"),
+            force_gpu=True,
+        )
+    except Exception as exc:
+        report.update({"status": "error", "reason": "cuda_profile_failed", "message": f"{type(exc).__name__}: {exc}"})
+        return report
+
+    report.update(
+        {
+            "status": "measured",
+            "reason": None,
+            "message": "Compact CUDA transfer/dispatch/readback profile completed.",
+            "tile_shape": list(rgb.shape[:2]),
+            "active_repair_pixels": int(np.count_nonzero(transition_strength)),
+            "cpu_reference_ms": _perf_ms(cpu_ms),
+            "cuda_dll_ms_including_transfer": _perf_ms(cuda_direct_ms),
+            "cuda_process_color_tile_ms_including_transfer": _perf_ms(cuda_dispatch_ms),
+            "cuda_reported_elapsed_ms": _perf_ms(float(dispatch_result.get("elapsed_ms") or 0.0)),
+            "speedup_direct_vs_cpu": float(cpu_ms / cuda_direct_ms) if cuda_direct_ms > 0 else None,
+            "speedup_dispatch_vs_cpu": float(cpu_ms / cuda_dispatch_ms) if cuda_dispatch_ms > 0 else None,
+            "max_rgb_diff_vs_cpu": int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16)))),
+            "max_mask_diff_vs_cpu": int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16)))),
+            "dispatch_result": {k: v for k, v in dispatch_result.items() if k not in {"rgb", "repair_mask"}},
+        }
+    )
+    return report
+
+
+def _perf_case_stage(case: dict[str, Any], stage: str) -> dict[str, Any]:
+    return case.get("timings", {}).get(stage, {"total_ms": 0.0, "calls": 0, "median_ms": 0.0, "max_ms": 0.0})
+
+
+def _perf_report_text(summary: dict[str, Any]) -> str:
+    lines = [
+        "ImgKey pipeline performance baseline",
+        "====================================",
+        f"Generated by: {summary['generated_by']}",
+        f"Artifact dir: {summary['artifact_dir']}",
+        "",
+        "Large tiled CPU-reference pipeline cases:",
+    ]
+    tracked = [
+        "image_load",
+        "preview_resize",
+        "global_matte_total",
+        "screen_model_full_image",
+        "screen_model_local_plate_tile",
+        "nearest_inner_reference_global",
+        "nearest_inner_reference_tile_local",
+        "transition_alpha_recovery",
+        "tiled_rgba_render_total",
+        "per_tile_color_render",
+        "png_encode_export",
+        "process_key_image_total",
+    ]
+    for case in summary.get("cases", []):
+        lines.append("")
+        lines.append(f"- {case['name']} ({case['shape'][0]}x{case['shape'][1]}, {case['background_name']}):")
+        tiles = case.get("tiles", {})
+        lines.append(f"  tiles={tiles.get('count', 0)} read_shapes={tiles.get('read_shapes', {})}")
+        for stage in tracked:
+            record = _perf_case_stage(case, stage)
+            if float(record.get("total_ms", 0.0)) <= 0.0:
+                continue
+            lines.append(
+                f"  {stage}: total={record['total_ms']:.3f} ms calls={record['calls']} "
+                f"median={record.get('median_ms', 0.0):.3f} ms max={record.get('max_ms', 0.0):.3f} ms"
+            )
+        top = sorted(
+            (
+                (stage, float(case.get("timings", {}).get(stage, {}).get("total_ms", 0.0)))
+                for stage in tracked
+                if stage not in {"process_key_image_total"}
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:5]
+        lines.append("  top stages: " + ", ".join(f"{stage}={elapsed:.1f} ms" for stage, elapsed in top if elapsed > 0.0))
+        result = case.get("result", {})
+        lines.append(
+            f"  alpha_nonzero={result.get('alpha_nonzero_pixels')} alpha_mean={float(result.get('alpha_mean', 0.0)):.2f} "
+            f"transparent_rgb_zero={result.get('transparent_rgb_zero', {}).get('ok')} export_bytes={case.get('export_png_bytes')}"
+        )
+
+    gpu = summary.get("compact_cuda_transfer_dispatch", {})
+    lines.extend(["", "Compact CUDA transfer/dispatch/readback:"])
+    lines.append(
+        f"- status={gpu.get('status')} reason={gpu.get('reason')} message={gpu.get('message')}"
+    )
+    if gpu.get("status") == "measured":
+        lines.append(
+            f"  tile={gpu.get('tile_shape')} active_pixels={gpu.get('active_repair_pixels')} "
+            f"cpu={gpu.get('cpu_reference_ms'):.3f} ms cuda_direct={gpu.get('cuda_dll_ms_including_transfer'):.3f} ms "
+            f"cuda_dispatch={gpu.get('cuda_process_color_tile_ms_including_transfer'):.3f} ms "
+            f"speedup_direct={gpu.get('speedup_direct_vs_cpu'):.2f}x max_rgb_diff={gpu.get('max_rgb_diff_vs_cpu')}"
+        )
+    lines.extend(
+        [
+            "",
+            "Baseline interpretation:",
+            "- This command only profiles current behavior; it does not change keyer settings or output logic.",
+            "- Large cases use resized geometric benchmark sources: 4096 flat blue screen and 8192 uneven-gradient blue screen.",
+            "- Current compact CUDA timing is reported as one combined host call because the CUDA v1 ABI does not expose separate transfer, dispatch, and readback timers.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_perf_baseline() -> None:
+    PERF_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"writing pipeline performance baseline to {PERF_BASELINE_DIR}")
+    summary: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": "python smoke_test.py --write-perf-baseline",
+        "artifact_dir": str(PERF_BASELINE_DIR),
+        "python": sys.version,
+        "cases": [],
+    }
+    for name, template_case, size in _large_perf_case_specs():
+        print(f"profiling {name} ({size}x{size})")
+        summary["cases"].append(_profile_large_pipeline_case(name, template_case, size))
+    summary["compact_cuda_transfer_dispatch"] = _profile_compact_cuda_transfer_dispatch()
+    report_text = _perf_report_text(summary)
+    summary_path = PERF_BASELINE_DIR / "pipeline_baseline.json"
+    report_path = PERF_BASELINE_DIR / "pipeline_baseline.txt"
+    summary_path.write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(report_text, encoding="utf-8")
+    print(report_text.rstrip())
+    print(f"wrote pipeline performance baseline JSON to {summary_path}")
+    print(f"wrote pipeline performance baseline report to {report_path}")
+
+
 GEOMETRIC_PRIMARY_FEATURES = (
     "transparency_bands",
     "dots_speckles",
@@ -5303,13 +5729,14 @@ def main(argv: list[str] | None = None) -> None:
         "--tune-geometric-defaults",
         "--gpu-parity",
         "--gpu-benchmark",
+        "--write-perf-baseline",
     }
     unknown = [arg for arg in args if arg not in allowed]
     if unknown:
         raise SystemExit(
             "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
             "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--write-geometric-benchmark] "
-            "[--tune-geometric-defaults] [--gpu-parity] [--gpu-benchmark]; "
+            "[--tune-geometric-defaults] [--gpu-parity] [--gpu-benchmark] [--write-perf-baseline]; "
             f"unknown: {', '.join(unknown)}"
         )
 
@@ -5351,6 +5778,8 @@ def main(argv: list[str] | None = None) -> None:
         run_gpu_parity_tests()
     if "--gpu-benchmark" in args:
         write_gpu_benchmarks()
+    if "--write-perf-baseline" in args:
+        write_perf_baseline()
     print("smoke ok", rgba.shape)
 
 

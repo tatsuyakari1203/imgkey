@@ -1,7 +1,7 @@
 # 10 - ImgKey D3D12/Vulkan Backend Refactor
 
 Date: 2026-05-20
-Status: Planned
+Status: In progress
 Owner: ImgKey Native GPU + App Architecture
 Scope: Refactor ImgKey away from god components and CUDA-specific GPU seams toward a backend-neutral, one-EXE CPU/GPU app with D3D12 as the primary Windows-native GPU backend and Vulkan as an optional portable backend.
 
@@ -146,10 +146,10 @@ Isolation:
 - Own benchmark/profiling instrumentation and documentation only. No behavior-changing refactor yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P1.1 - Add pipeline timing report
 - Add timing instrumentation for:
@@ -176,10 +176,10 @@ Verification:
 - `python -c "import app, keyer; print('import ok')"`
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P1.2 - Freeze visual and parity baselines
 - Generate current geometric benchmark, tuning summary, GPU benchmark, transition diagnostics.
@@ -194,10 +194,17 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Added `python smoke_test.py --write-perf-baseline`, writing `.artifact/perf/pipeline_baseline.{json,txt}` plus generated source/export PNGs under `.artifact/perf/` only. The profiler wraps current keyer functions at CLI time and records image load, preview resize, global matte, full/local screen model, global/tile-local nearest-inner reference, transition alpha recovery, per-tile color render, PNG export, and compact CUDA combined transfer/dispatch/readback timing without changing keyer behavior.
+- Perf baseline on this machine: 4096 flat-blue geometric fixture processed in `65.77s` (tiled render `45.75s`, per-tile color `42.49s`, global matte `20.01s`, transition alpha `11.11s`, local screen plate `4.20s`, PNG export `0.57s`); 8192 uneven-blue fixture processed in `258.05s` (tiled render `184.17s`, per-tile color `170.40s`, global matte `73.86s`, transition alpha `37.18s`, local screen plate `15.33s`, PNG export `2.69s`). Transparent RGB remained zero for both large exports.
+- Compact CUDA baseline is available on the local RTX 5060 Ti: direct 1024 transition repair measured CPU `1268.97ms` vs CUDA DLL `5.72ms` in the perf report, while the existing GPU benchmark measured CPU `1211.98ms` vs CUDA direct `9.62ms` and dispatch `838.55ms`; both paths reported max RGB/mask diff within tolerance.
+- Visual/parity freeze generated geometric, tuning, GPU, and transition diagnostics under `.artifact/`. Geometric summary: six cases, alpha MAE mean `0.0488`/max `0.0542` (worst `geometric_cyan_flat`), min thin-line recall `0.777`, min dot recall `0.793`, zero background leaks, transparent RGB max `0`, geometry GPU parity max RGBA diff `1` and alpha diff `0`.
+- Tuning summary says current app defaults already match `green_cyan_safe` (score `82.19`). Inspected baseline failure modes to carry forward: cyan flat/gradient are the weakest detail-preservation cases, strict profiles introduce large background leaks, and transition diagnostics still show residual color on blue slash/manual-keep/source-alpha-cap cases even though cleanup improves all baseline transition fixtures.
 
 ---
 
@@ -219,7 +226,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P2.1 - Extract pure leaf modules
 - Extract low-risk helpers first:
@@ -668,4 +675,4 @@ Current:
 
 ## 6) Immediate next step
 
-Start Phase 1 with `deep-worker`: add profiling/timing reports and freeze current visual/performance baselines before refactoring. Do not begin D3D12/Vulkan implementation until god-component extraction and backend abstraction are in place.
+Proceed to Phase 2 with `deep-worker`: extract engine modules without behavior change, using the Phase 1 performance/visual baselines as the regression reference. Do not begin D3D12/Vulkan implementation until god-component extraction and backend abstraction are in place.
