@@ -5567,14 +5567,18 @@ def run_v6_screen_analysis_tests() -> None:
 
 
 def run_import_compile_tests() -> None:
-    for source in (
-        "app.py",
-        "keyer.py",
-        "smoke_test.py",
-        "gpu_accel.py",
-        "gpu_runtime.py",
-        "screen_analysis.py",
-    ):
+    sources = [
+        Path("app.py"),
+        Path("keyer.py"),
+        Path("smoke_test.py"),
+        Path("gpu_accel.py"),
+        Path("gpu_runtime.py"),
+        Path("screen_analysis.py"),
+    ]
+    engine_dir = Path("imgkey_engine")
+    if engine_dir.exists():
+        sources.extend(sorted(engine_dir.glob("*.py")))
+    for source in sources:
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
@@ -5692,6 +5696,9 @@ def run_source_surface_guard() -> None:
     docs = Path("docs")
     if docs.exists():
         roots.extend(path for path in docs.glob("**/*") if path.is_file())
+    engine_dir = Path("imgkey_engine")
+    if engine_dir.exists():
+        roots.extend(path for path in engine_dir.glob("**/*.py") if path.is_file())
     forbidden = [
         "Bi" + "RefNet",
         "bi" + "ref",

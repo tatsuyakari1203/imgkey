@@ -223,10 +223,10 @@ Isolation:
 - Own `keyer.py` extraction and new engine modules. Keep public `keyer.py` facade and private compatibility aliases until tests are migrated.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P2.1 - Extract pure leaf modules
 - Extract low-risk helpers first:
@@ -240,7 +240,7 @@ Acceptance:
 - No behavior change in smoke/geometric/GPU parity.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -263,16 +263,23 @@ Verification:
 - `python smoke_test.py`
 - `python smoke_test.py --write-geometric-benchmark`
 - `python smoke_test.py --gpu-parity`
+- `python smoke_test.py --write-perf-baseline`
 - `python -m py_compile app.py keyer.py smoke_test.py gpu_runtime.py screen_analysis.py gpu_accel.py packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py`
 - `python -c "import app, keyer; print('import ok')"`
 - dependency/no-AI guards
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Extracted engine-owned dataclasses/types, color math, image I/O, tiling utilities, matte helpers, screen model/screen plate logic, foreground references, transition-alpha recovery, and color-repair/tile color functions into `imgkey_engine/` modules without changing the `keyer.py` import surface.
+- Kept `keyer.py` as the compatibility facade/orchestrator for `process_chroma_key()`, `process_key_image()`, `_build_global_matte()`, `_render_tiled_rgba()`, and `_tile_extra_overlap()`, with private helper aliases retained for existing smoke tests and instrumentation monkeypatches.
+- Routed `screen_analysis.build_screen_plate_rgb()` and `ScreenPlateRGB` through `imgkey_engine.screen_model` so benchmark screen plate generation and engine screen-model ownership do not diverge.
+- Required Phase 2 verification passed locally, including smoke, geometric benchmark generation, GPU parity, perf baseline generation, py_compile/import, dependency/no-AI/default startup no-torch guards, and `git diff --check`.
 
 ---
 
@@ -294,7 +301,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P3.1 - Split UI primitives and controllers
 - Extract:
@@ -675,4 +682,4 @@ Current:
 
 ## 6) Immediate next step
 
-Proceed to Phase 2 with `deep-worker`: extract engine modules without behavior change, using the Phase 1 performance/visual baselines as the regression reference. Do not begin D3D12/Vulkan implementation until god-component extraction and backend abstraction are in place.
+Proceed to Phase 3 with `deep-worker`: split `app.py` UI/controller responsibilities without UX change. Do not begin backend abstraction or D3D12/Vulkan implementation until the UI/controller refactor is complete and verified.

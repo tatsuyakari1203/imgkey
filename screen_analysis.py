@@ -6,73 +6,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from imgkey_engine.screen_model import ScreenPlateRGB, build_screen_plate_rgb
+
 
 DEFAULT_SCREEN_COLOR_RGB = (0, 220, 50)
 DEFAULT_MAX_FULL_RES_SCREEN_PLATE_PIXELS = 4_000_000
 DEFAULT_LOW_RES_MAX_SIDE = 512
 _MAX_SCREEN_PICK_PIXELS = 200_000
-
-
-@dataclass(slots=True)
-class ScreenPlateRGB:
-    """Low-frequency screen plate with capped full-resolution storage.
-
-    ``full_res_rgb`` is populated only when the caller's cap allows it. Large
-    images retain a low-resolution uint8 plate and resolve requested tiles on
-    demand without storing a full HxWx3 plate.
-    """
-
-    source_shape: tuple[int, int]
-    fallback_rgb: tuple[int, int, int]
-    low_res_rgb: np.ndarray | None = None
-    full_res_rgb: np.ndarray | None = None
-    low_res_valid: np.ndarray | None = None
-
-    @property
-    def is_full_res_retained(self) -> bool:
-        return self.full_res_rgb is not None
-
-    def debug_image(self) -> np.ndarray:
-        if self.full_res_rgb is not None:
-            return self.full_res_rgb.copy()
-        if self.low_res_rgb is not None:
-            return self.low_res_rgb.copy()
-        return np.broadcast_to(np.asarray(self.fallback_rgb, dtype=np.uint8).reshape(1, 1, 3), (32, 32, 3)).copy()
-
-    def resolve(self, region: tuple[int, int, int, int] | None = None) -> np.ndarray:
-        """Resolve a full plate or ``(x0, y0, x1, y1)`` tile as uint8 RGB."""
-
-        h, w = self.source_shape
-        if region is None:
-            return self.resolve_tile(slice(0, h), slice(0, w))
-        x0, y0, x1, y1 = region
-        return self.resolve_tile(slice(y0, y1), slice(x0, x1))
-
-    def resolve_tile(self, y_slice: slice, x_slice: slice) -> np.ndarray:
-        h, w = self.source_shape
-        y0, y1 = _slice_bounds(y_slice, h)
-        x0, x1 = _slice_bounds(x_slice, w)
-        out_h = max(0, y1 - y0)
-        out_w = max(0, x1 - x0)
-        if out_h == 0 or out_w == 0:
-            return np.zeros((out_h, out_w, 3), dtype=np.uint8)
-        if self.full_res_rgb is not None:
-            return self.full_res_rgb[y0:y1, x0:x1].copy()
-        fallback = np.asarray(self.fallback_rgb, dtype=np.uint8).reshape(1, 1, 3)
-        if self.low_res_rgb is None:
-            return np.broadcast_to(fallback, (out_h, out_w, 3)).copy()
-
-        low = np.asarray(self.low_res_rgb, dtype=np.uint8)
-        low_h, low_w = low.shape[:2]
-        if low_h <= 1 and low_w <= 1:
-            return np.broadcast_to(low.reshape(1, 1, 3), (out_h, out_w, 3)).copy()
-
-        xs = (np.arange(x0, x1, dtype=np.float32) + 0.5) * (low_w / max(float(w), 1.0)) - 0.5
-        ys = (np.arange(y0, y1, dtype=np.float32) + 0.5) * (low_h / max(float(h), 1.0)) - 0.5
-        map_x = np.broadcast_to(xs.reshape(1, out_w), (out_h, out_w)).astype(np.float32, copy=False)
-        map_y = np.broadcast_to(ys.reshape(out_h, 1), (out_h, out_w)).astype(np.float32, copy=False)
-        return cv2.remap(low, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
 
 @dataclass(slots=True)
 class ScreenAnalysisResult:
@@ -160,53 +100,6 @@ def analyze_screen(
     )
 
 
-def build_screen_plate_rgb(
-    rgb_u8: np.ndarray,
-    background_candidates: np.ndarray | None,
-    fallback_color: tuple[int, int, int] | np.ndarray,
-    *,
-    max_full_res_pixels: int = DEFAULT_MAX_FULL_RES_SCREEN_PLATE_PIXELS,
-    low_res_max_side: int = DEFAULT_LOW_RES_MAX_SIDE,
-) -> ScreenPlateRGB:
-    rgb = _ensure_rgb_u8(rgb_u8)
-    h, w = rgb.shape[:2]
-    fallback = _sanitize_rgb_tuple(fallback_color)
-    candidates = _mask_to_bool(background_candidates, (h, w), "background_candidates")
-    if candidates is None:
-        candidates = np.ones((h, w), dtype=bool)
-
-    low_h, low_w = _low_res_shape(h, w, low_res_max_side)
-    fallback_arr = np.asarray(fallback, dtype=np.float32).reshape(1, 1, 3)
-    if h == 0 or w == 0 or low_h == 0 or low_w == 0:
-        return ScreenPlateRGB(source_shape=(h, w), fallback_rgb=fallback)
-
-    sums, counts = _accumulate_low_res_plate(rgb, candidates, (low_h, low_w))
-    expected_per_cell = max(1.0, (h * w) / float(max(1, low_h * low_w)))
-    valid = counts >= max(1.0, expected_per_cell * 0.025)
-    low = np.broadcast_to(fallback_arr, (low_h, low_w, 3)).copy()
-    if np.any(valid):
-        for channel in range(3):
-            value = np.divide(
-                sums[:, :, channel],
-                np.maximum(counts, 1.0),
-                out=np.full((low_h, low_w), fallback[channel], dtype=np.float32),
-                where=valid,
-            )
-            low[:, :, channel] = np.where(valid, value, low[:, :, channel])
-        low = _fill_low_res_plate(low, valid, fallback)
-
-    low = cv2.GaussianBlur(low, (0, 0), sigmaX=max(0.65, min(low_h, low_w) / 90.0), sigmaY=0.0, borderType=cv2.BORDER_REPLICATE)
-    low_u8 = np.clip(np.rint(low), 0, 255).astype(np.uint8)
-    full_res = None
-    if h * w <= max(0, int(max_full_res_pixels)):
-        full_res = cv2.resize(low_u8, (w, h), interpolation=cv2.INTER_LINEAR)
-    return ScreenPlateRGB(
-        source_shape=(h, w),
-        fallback_rgb=fallback,
-        low_res_rgb=low_u8,
-        full_res_rgb=full_res,
-        low_res_valid=valid.astype(np.uint8) * 255,
-    )
 
 
 def _estimate_screen_color(
