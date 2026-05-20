@@ -3,6 +3,10 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
+import json
+import os
+from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any, Callable, Protocol
@@ -78,8 +82,14 @@ _ERROR_REASONS = {
     "backend_unavailable",
     "backend_probe_failed",
     "backend_execution_failed",
+    "d3d12_dll_unavailable",
+    "d3d12_unavailable",
+    "d3d12_context_failed",
+    "d3d12_execution_failed",
+    "tile_too_large",
     "gpu_exception",
 }
+GPU_BACKEND_ERROR_REASONS = frozenset(_ERROR_REASONS)
 
 _THREAD_STATE = threading.local()
 
@@ -120,6 +130,10 @@ class ImgKeyNativeColorTileParamsV1(ctypes.Structure):
         ("key_vector_despill", ctypes.c_float),
         ("preserve_foreground_luma", ctypes.c_float),
         ("transition_spill_threshold", ctypes.c_float),
+        ("transition_reconstruction_error", ctypes.c_float),
+        ("clip_foreground", ctypes.c_float),
+        ("transition_alpha_min", ctypes.c_uint32),
+        ("transition_alpha_max", ctypes.c_uint32),
     ]
 
 
@@ -406,6 +420,421 @@ class CudaCompatSession:
         self.ended = True
 
 
+NATIVE_GPU_DLL_NAME = "imgkey_gpu.dll"
+D3D12_MVP_MAX_TILE_PIXELS = 640 * 640
+_NATIVE_GPU_DLL_CACHE: "_NativeGpuDll" | None = None
+_NATIVE_GPU_DLL_CACHE_KEY: str | None = None
+
+
+class NativeGpuDllUnavailable(RuntimeError):
+    pass
+
+
+class NativeGpuDllError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"imgkey_gpu status {status}: {message}")
+        self.status = int(status)
+        self.message = message
+
+
+class _NativeGpuDll:
+    def __init__(self, path: Path, library: ctypes.CDLL):
+        self.path = path
+        self.library = library
+        self.library.imgkey_gpu_version.argtypes = []
+        self.library.imgkey_gpu_version.restype = ctypes.c_uint32
+        self.library.imgkey_gpu_last_error.argtypes = []
+        self.library.imgkey_gpu_last_error.restype = ctypes.c_char_p
+        self.library.imgkey_gpu_probe_v1.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.library.imgkey_gpu_probe_v1.restype = ctypes.c_int
+        self.library.imgkey_gpu_create_context_v1.argtypes = [ctypes.POINTER(ImgKeyNativeColorTileParamsV1), ctypes.POINTER(ctypes.c_void_p)]
+        self.library.imgkey_gpu_create_context_v1.restype = ctypes.c_int
+        self.library.imgkey_gpu_destroy_context_v1.argtypes = [ctypes.c_void_p]
+        self.library.imgkey_gpu_destroy_context_v1.restype = None
+        self.library.imgkey_gpu_process_color_tile_v1.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ImgKeyNativeColorTileParamsV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ctypes.POINTER(ImgKeyNativeTileBufferV1),
+        ]
+        self.library.imgkey_gpu_process_color_tile_v1.restype = ctypes.c_int
+        if hasattr(self.library, "imgkey_gpu_identity_rgba_v1"):
+            self.library.imgkey_gpu_identity_rgba_v1.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+                ctypes.POINTER(ImgKeyNativeTileBufferV1),
+            ]
+            self.library.imgkey_gpu_identity_rgba_v1.restype = ctypes.c_int
+
+    def last_error(self) -> str:
+        raw = self.library.imgkey_gpu_last_error()
+        if not raw:
+            return ""
+        return raw.decode("utf-8", errors="replace")
+
+    def version(self) -> int:
+        return int(self.library.imgkey_gpu_version())
+
+    def probe(self) -> dict[str, Any]:
+        buffer = ctypes.create_string_buffer(16384)
+        status = int(self.library.imgkey_gpu_probe_v1(buffer, ctypes.sizeof(buffer)))
+        if status != IMGKEY_GPU_OK:
+            raise NativeGpuDllError(status, self.last_error())
+        raw = buffer.value.decode("utf-8", errors="replace")
+        return json.loads(raw)
+
+    def create_context(self) -> ctypes.c_void_p:
+        context = ctypes.c_void_p()
+        status = int(self.library.imgkey_gpu_create_context_v1(None, ctypes.byref(context)))
+        if status != IMGKEY_GPU_OK or not context.value:
+            raise NativeGpuDllError(status, self.last_error() or "D3D12 context creation returned null")
+        return context
+
+    def destroy_context(self, context: ctypes.c_void_p | None) -> None:
+        if context is not None and context.value:
+            self.library.imgkey_gpu_destroy_context_v1(context)
+
+    def process_color_tile(self, context: ctypes.c_void_p, call: NativeColorTileCallV1, out_rgb: ImgKeyNativeTileBufferV1, out_repair: ImgKeyNativeTileBufferV1) -> int:
+        def _ptr(buffer: ImgKeyNativeTileBufferV1 | None):
+            return ctypes.byref(buffer) if buffer is not None else None
+
+        return int(
+            self.library.imgkey_gpu_process_color_tile_v1(
+                context,
+                ctypes.byref(call.params),
+                ctypes.byref(call.buffers["rgb"]),
+                ctypes.byref(call.buffers["alpha"]),
+                ctypes.byref(call.buffers["background_mask"]),
+                ctypes.byref(call.buffers["edge_mask"]),
+                ctypes.byref(call.buffers["probability"]),
+                ctypes.byref(call.buffers["fringe_mask"]),
+                _ptr(call.buffers.get("screen_tile")),
+                ctypes.byref(call.buffers["foreground_ref_rgb"]),
+                ctypes.byref(call.buffers["foreground_ref_valid"]),
+                ctypes.byref(out_rgb),
+                ctypes.byref(out_repair),
+            )
+        )
+
+    def identity_rgba(self, context: ctypes.c_void_p, rgba: ImgKeyNativeTileBufferV1, out_rgba: ImgKeyNativeTileBufferV1) -> int:
+        if not hasattr(self.library, "imgkey_gpu_identity_rgba_v1"):
+            raise NativeGpuDllError(IMGKEY_GPU_UNSUPPORTED_CAPABILITY, "imgkey_gpu_identity_rgba_v1 export is missing")
+        return int(self.library.imgkey_gpu_identity_rgba_v1(context, ctypes.byref(rgba), ctypes.byref(out_rgba)))
+
+
+def _candidate_native_gpu_dll_paths(dll_path: str | os.PathLike[str] | None = None) -> list[Path]:
+    if dll_path is not None:
+        return [Path(dll_path).expanduser()]
+    paths: list[Path] = []
+    env_path = os.environ.get("IMGKEY_GPU_DLL")
+    if env_path:
+        paths.append(Path(env_path))
+    module_dir = Path(__file__).resolve().parent
+    paths.extend(
+        [
+            module_dir / NATIVE_GPU_DLL_NAME,
+            module_dir / "native" / "imgkey_gpu" / "build" / NATIVE_GPU_DLL_NAME,
+            Path.cwd() / "native" / "imgkey_gpu" / "build" / NATIVE_GPU_DLL_NAME,
+        ]
+    )
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(str(meipass)) / NATIVE_GPU_DLL_NAME)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.expanduser()).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path.expanduser())
+    return unique
+
+
+def _load_native_gpu_dll(dll_path: str | os.PathLike[str] | None = None, *, refresh: bool = False) -> _NativeGpuDll:
+    global _NATIVE_GPU_DLL_CACHE, _NATIVE_GPU_DLL_CACHE_KEY
+    candidates = _candidate_native_gpu_dll_paths(dll_path)
+    cache_key = str(candidates[0]) if dll_path is not None else "<default>"
+    if not refresh and _NATIVE_GPU_DLL_CACHE is not None and _NATIVE_GPU_DLL_CACHE_KEY == cache_key:
+        return _NATIVE_GPU_DLL_CACHE
+    checked: list[str] = []
+    load_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            checked.append(str(candidate))
+            continue
+        try:
+            library = ctypes.CDLL(str(resolved))
+        except OSError as exc:
+            load_errors.append(f"{resolved}: {exc}")
+            continue
+        dll = _NativeGpuDll(resolved, library)
+        if dll_path is None:
+            _NATIVE_GPU_DLL_CACHE = dll
+            _NATIVE_GPU_DLL_CACHE_KEY = cache_key
+        return dll
+    detail = "; ".join(load_errors) if load_errors else "checked " + ", ".join(checked)
+    raise NativeGpuDllUnavailable(f"{NATIVE_GPU_DLL_NAME} was not found or could not be loaded ({detail})")
+
+
+def _status_native_unavailable(reason: str, message: str, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": "d3d12_compute",
+        "name": "D3D12 compute backend",
+        "api_version": IMGKEY_GPU_BACKEND_API_VERSION,
+        "status": "unavailable",
+        "available": False,
+        "reason": reason,
+        "message": message,
+        "capability_mask": int(D3D12ComputeBackend.capabilities),
+        "capabilities": capability_names(D3D12ComputeBackend.capabilities),
+        "device": None,
+        "device_index": None,
+        "device_count": 0,
+        "version": None,
+        "dll_path": None,
+        "max_tile_pixels": D3D12_MVP_MAX_TILE_PIXELS,
+    }
+    if extra:
+        result.update(extra)
+    return result
+
+
+def _as_rgb_u8(tile: np.ndarray, name: str) -> np.ndarray:
+    arr = np.asarray(tile)
+    if arr.ndim != 3 or arr.shape[2] < 3:
+        raise ValueError(f"{name} must have shape HxWx3")
+    arr = arr[:, :, :3]
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _as_u8_mask(mask: np.ndarray, shape: tuple[int, int], name: str) -> np.ndarray:
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[:, :, -1] if arr.shape[2] == 4 else arr[:, :, 0]
+    if tuple(arr.shape) != tuple(shape):
+        raise ValueError(f"{name} must match tile shape")
+    if arr.dtype == np.bool_:
+        return np.ascontiguousarray(arr)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+class D3D12ComputeBackend:
+    backend_id = "d3d12_compute"
+    backend_name = "D3D12 compute backend"
+    capabilities = BackendCapability.CONSTANT_SCREEN | BackendCapability.SCREEN_TILE | BackendCapability.PERSISTENT_SESSION | BackendCapability.RGB_ONLY
+
+    def __init__(self, dll_path: str | os.PathLike[str] | None = None):
+        self.dll_path = dll_path
+        self._last_availability: dict[str, Any] | None = None
+
+    def probe(self, *, refresh: bool = False) -> dict[str, Any]:
+        try:
+            dll = _load_native_gpu_dll(self.dll_path, refresh=refresh)
+        except Exception as exc:
+            result = _status_native_unavailable(
+                "d3d12_dll_unavailable",
+                f"D3D12 native backend is unavailable: {type(exc).__name__}: {exc}. CPU fallback will be used.",
+                extra={"load_error": f"{type(exc).__name__}: {exc}"},
+            )
+            self._last_availability = dict(result)
+            return result
+        try:
+            info = dll.probe()
+        except Exception as exc:
+            result = _status_native_unavailable(
+                "d3d12_unavailable",
+                f"D3D12 native backend probe failed: {type(exc).__name__}: {exc}. CPU fallback will be used.",
+                extra={"dll_path": str(dll.path), "probe_error": f"{type(exc).__name__}: {exc}", "last_error": dll.last_error()},
+            )
+            self._last_availability = dict(result)
+            return result
+        info.setdefault("id", self.backend_id)
+        info.setdefault("name", self.backend_name)
+        info.setdefault("api_version", IMGKEY_GPU_BACKEND_API_VERSION)
+        info.setdefault("capability_mask", int(self.capabilities))
+        info.setdefault("capabilities", capability_names(self.capabilities))
+        info.setdefault("available", bool(info.get("status") == "available"))
+        info.setdefault("status", "available" if info.get("available") else "unavailable")
+        info.setdefault("reason", None if info.get("available") else "d3d12_unavailable")
+        info.setdefault("message", "D3D12 compute backend available." if info.get("available") else "D3D12 compute backend unavailable.")
+        info["dll_path"] = str(dll.path)
+        info["version"] = info.get("version") or dll.version()
+        info["max_tile_pixels"] = int(info.get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
+        self._last_availability = dict(info)
+        return info
+
+    def begin_render(self, settings: Any, image_shape: tuple[int, int] | tuple[int, int, int], *, force_gpu: bool = False) -> "D3D12ComputeSession":
+        return D3D12ComputeSession(self, settings, image_shape, force_gpu=force_gpu)
+
+    def identity_rgba(self, rgba: np.ndarray) -> dict[str, Any]:
+        start = time.perf_counter()
+        try:
+            dll = _load_native_gpu_dll(self.dll_path)
+            context = dll.create_context()
+        except Exception as exc:
+            return _fallback_result("d3d12_context_failed", f"D3D12 identity context creation failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name)
+        try:
+            arr = np.asarray(rgba)
+            if arr.ndim != 3 or arr.shape[2] != 4 or arr.dtype != np.uint8:
+                raise ValueError("rgba must be a uint8 HxWx4 array")
+            arr = np.ascontiguousarray(arr)
+            out = np.empty_like(arr)
+            in_buffer = native_buffer_from_array("rgba", arr, expected_channels=4)
+            out_buffer = native_buffer_from_array("out_rgba", out, expected_channels=4)
+            status = dll.identity_rgba(context, in_buffer, out_buffer)
+            if status != IMGKEY_GPU_OK:
+                raise NativeGpuDllError(status, dll.last_error())
+            return {
+                "ok": True,
+                "used": True,
+                "backend": self.backend_id,
+                "backend_name": self.backend_name,
+                "reason": None,
+                "message": "D3D12 identity RGBA kernel completed.",
+                "rgba": out,
+                "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+                "capabilities": capability_names(self.capabilities),
+            }
+        except Exception as exc:
+            return _fallback_result("d3d12_execution_failed", f"D3D12 identity kernel failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0)
+        finally:
+            dll.destroy_context(context)
+
+
+class D3D12ComputeSession:
+    def __init__(self, backend: D3D12ComputeBackend, settings: Any, image_shape: tuple[int, int] | tuple[int, int, int], *, force_gpu: bool = False):
+        self.backend = backend
+        self.backend_id = backend.backend_id
+        self.backend_name = backend.backend_name
+        self.settings = settings
+        self.image_shape = tuple(int(v) for v in image_shape[:2])
+        self.force_gpu = bool(force_gpu)
+        self.started_at = time.perf_counter()
+        self.ended = False
+        self.dll: _NativeGpuDll | None = None
+        self.context: ctypes.c_void_p | None = None
+        self.context_error: str | None = None
+        try:
+            self.dll = _load_native_gpu_dll(backend.dll_path)
+            self.context = self.dll.create_context()
+        except Exception as exc:
+            self.context_error = f"{type(exc).__name__}: {exc}"
+
+    def process_color_tile(
+        self,
+        rgb_tile: np.ndarray,
+        alpha_tile: np.ndarray,
+        background_mask: np.ndarray,
+        edge_mask: np.ndarray,
+        probability: np.ndarray,
+        fringe_mask: np.ndarray,
+        screen_tile: np.ndarray | None,
+        nearest_fg_rgb: np.ndarray | None,
+        nearest_fg_valid: np.ndarray | None,
+        screen_color: tuple[int, int, int],
+        settings: Any,
+    ) -> dict[str, Any]:
+        start = time.perf_counter()
+        if self.dll is None or self.context is None or not self.context.value:
+            return _fallback_result("d3d12_context_failed", f"D3D12 context is unavailable: {self.context_error or 'context not created'}", backend=self.backend_id, backend_name=self.backend_name)
+        if not bool(_setting(settings, "transition_unmix", True)):
+            return _fallback_result("transition_disabled", "Transition unmix is disabled; CPU color path remains active.", backend=self.backend_id, backend_name=self.backend_name)
+        if int(np.clip(int(_setting(settings, "foreground_reference_radius", 96)), 0, np.iinfo(np.uint16).max - 1)) <= 0:
+            return _fallback_result("reference_radius_disabled", "Foreground reference radius is disabled; CPU transition repair leaves the tile unchanged.", backend=self.backend_id, backend_name=self.backend_name)
+        if nearest_fg_rgb is None or nearest_fg_valid is None:
+            return _fallback_result("no_foreground_reference", "No foreground reference tile is available for D3D12 transition repair.", backend=self.backend_id, backend_name=self.backend_name)
+        try:
+            rgb = _as_rgb_u8(rgb_tile, "rgb_tile")
+            shape = rgb.shape[:2]
+            max_tile_pixels = int((self.backend._last_availability or {}).get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
+            if int(shape[0]) * int(shape[1]) > max_tile_pixels:
+                return _fallback_result(
+                    "tile_too_large",
+                    f"D3D12 MVP tile {shape[1]}x{shape[0]} exceeds max_tile_pixels={max_tile_pixels}; CPU color path is used to avoid TDR.",
+                    backend=self.backend_id,
+                    backend_name=self.backend_name,
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                    availability=self.backend._last_availability,
+                )
+            alpha = _as_u8_mask(alpha_tile, shape, "alpha_tile")
+            background = _as_u8_mask(background_mask, shape, "background_mask")
+            edge = _as_u8_mask(edge_mask, shape, "edge_mask")
+            probability_u8 = _as_u8_mask(probability, shape, "probability")
+            fringe_u8 = _as_u8_mask(fringe_mask, shape, "fringe_mask")
+            foreground_rgb = _as_rgb_u8(nearest_fg_rgb, "nearest_fg_rgb")
+            foreground_valid = _as_u8_mask(nearest_fg_valid, shape, "nearest_fg_valid")
+            screen_u8 = _as_rgb_u8(screen_tile, "screen_tile") if screen_tile is not None else None
+            out_rgb = np.empty_like(rgb)
+            out_repair = np.empty(shape, dtype=np.uint8)
+            required = {"rgb_only", "screen_tile"} if screen_u8 is not None else {"rgb_only", "constant_screen"}
+            call = validate_native_color_tile_inputs(
+                rgb,
+                alpha,
+                background,
+                edge,
+                probability_u8,
+                fringe_u8,
+                screen_u8,
+                foreground_rgb,
+                foreground_valid,
+                tuple(int(np.clip(c, 0, 255)) for c in screen_color),
+                settings,
+                required_capabilities=required,
+            )
+            out_rgb_buffer = native_buffer_from_array("out_rgb", out_rgb, expected_channels=3)
+            out_repair_buffer = native_buffer_from_array("out_repair_mask", out_repair, expected_channels=1)
+        except Exception as exc:
+            return _fallback_result("invalid_inputs", f"D3D12 transition repair input validation failed: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name)
+        if int(np.max(alpha)) <= 0:
+            return _fallback_result("transparent_tile", "Tile alpha is fully transparent; CPU zero-RGB invariant remains active.", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0)
+        if not np.any(foreground_valid):
+            return _fallback_result("no_foreground_reference", "Foreground reference mask is empty for this tile.", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0)
+        try:
+            status = self.dll.process_color_tile(self.context, call, out_rgb_buffer, out_repair_buffer)
+            if status != IMGKEY_GPU_OK:
+                reason = "d3d12_execution_failed"
+                if int(call.params.fallback_reason) == int(NativeFallbackReason.UNSUPPORTED_CAPABILITY):
+                    reason = "unsupported_capability"
+                return _fallback_result(reason, f"D3D12 transition repair failed: status={status} {self.dll.last_error()}", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0, availability=self.backend._last_availability)
+        except Exception as exc:
+            return _fallback_result("d3d12_execution_failed", f"D3D12 transition repair failed; CPU fallback is required: {type(exc).__name__}: {exc}", backend=self.backend_id, backend_name=self.backend_name, elapsed_ms=(time.perf_counter() - start) * 1000.0, availability=self.backend._last_availability)
+        mode = "forced" if self.force_gpu else "auto"
+        return {
+            "ok": True,
+            "used": True,
+            "backend": self.backend_id,
+            "backend_name": self.backend_name,
+            "reason": None,
+            "message": f"D3D12 transition repair completed ({mode}).",
+            "rgb": out_rgb,
+            "repair_mask": out_repair,
+            "elapsed_ms": (time.perf_counter() - start) * 1000.0,
+            "availability": self.backend._last_availability,
+            "capabilities": capability_names(self.backend.capabilities),
+        }
+
+    def end_render(self) -> None:
+        if not self.ended and self.dll is not None and self.context is not None:
+            self.dll.destroy_context(self.context)
+        self.ended = True
+        self.context = None
+
+
 class FakeNativeBackend:
     backend_id = "fake_native"
     backend_name = "fake native backend"
@@ -535,7 +964,7 @@ class FakeNativeCAbi:
 
 
 def registered_backends() -> list[GpuBackend]:
-    return [CudaCompatBackend()]
+    return [D3D12ComputeBackend(), CudaCompatBackend()]
 
 
 def probe_backends(
@@ -546,7 +975,7 @@ def probe_backends(
     cuda_probe: Callable[..., dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if backends is None:
-        backends = [CudaCompatBackend(cuda_probe=cuda_probe)]
+        backends = [D3D12ComputeBackend(), CudaCompatBackend(cuda_probe=cuda_probe)]
     results: list[dict[str, Any]] = []
     for backend in backends:
         try:
@@ -646,6 +1075,31 @@ def select_backend(
     )
 
 
+def _estimated_render_tile_pixels(settings: Any, image_shape: tuple[int, int] | tuple[int, int, int]) -> int:
+    h = int(image_shape[0]) if len(image_shape) >= 1 else 0
+    w = int(image_shape[1]) if len(image_shape) >= 2 else 0
+    if h <= 0 or w <= 0:
+        return 0
+    use_tiling = bool(_setting(settings, "use_tiling", True))
+    if not use_tiling:
+        return h * w
+    tile_size = max(1, int(_setting(settings, "tile_size", 2048)))
+    return min(h, tile_size) * min(w, tile_size)
+
+
+def _should_try_next_backend_for_tile_limit(selection: BackendSelection, settings: Any, image_shape: tuple[int, int] | tuple[int, int, int], required: BackendCapability) -> bool:
+    if selection.backend is None or selection.backend.backend_id != "d3d12_compute":
+        return False
+    # D3D12 is currently the only backend with screen_tile support; keep it for
+    # local-screen tiles even when a later per-tile CPU fallback is required.
+    if required & BackendCapability.SCREEN_TILE:
+        return False
+    info = selection.backend_info or {}
+    max_tile_pixels = int(info.get("max_tile_pixels") or D3D12_MVP_MAX_TILE_PIXELS)
+    tile_pixels = _estimated_render_tile_pixels(settings, image_shape)
+    return max_tile_pixels > 0 and tile_pixels > max_tile_pixels
+
+
 def begin_render(
     settings: Any,
     image_shape: tuple[int, int] | tuple[int, int, int],
@@ -656,7 +1110,16 @@ def begin_render(
     refresh: bool = False,
 ) -> GpuBackendSession:
     selected_mode = _normalize_mode(_setting(settings, "gpu_acceleration", "Off") if mode is None else mode)
-    selection = select_backend(selected_mode, required_capabilities, backends=backends, refresh=refresh)
+    backend_objects = backends if backends is not None else registered_backends()
+    probed = probe_backends(backends=backend_objects, include_cpu=False, refresh=refresh)
+    selection = select_backend(selected_mode, required_capabilities, backends=backend_objects, probed_backends=probed)
+    required = capabilities_to_mask(required_capabilities)
+    if _should_try_next_backend_for_tile_limit(selection, settings, image_shape, required):
+        fallback_backends = [backend for backend in backend_objects if backend.backend_id != "d3d12_compute"]
+        fallback_probed = [info for info in probed if info.get("id") != "d3d12_compute"]
+        fallback_selection = select_backend(selected_mode, required_capabilities, backends=fallback_backends, probed_backends=fallback_probed)
+        if fallback_selection.backend is not None:
+            selection = fallback_selection
     if selection.backend is None:
         return NoOpGpuSession(selection)
     return selection.backend.begin_render(settings, image_shape, force_gpu=selected_mode == "Force GPU")
@@ -850,6 +1313,10 @@ def validate_native_color_tile_inputs(
         key_vector_despill=float(_clip01(_setting(settings, "key_vector_despill", 0.75))),
         preserve_foreground_luma=float(_clip01(_setting(settings, "preserve_foreground_luma", 0.85))),
         transition_spill_threshold=float(_setting(settings, "transition_spill_threshold", 0.08)),
+        transition_reconstruction_error=float(_setting(settings, "transition_reconstruction_error", 0.08)),
+        clip_foreground=float(_clip01(_setting(settings, "clip_foreground", 0.14))),
+        transition_alpha_min=int(np.clip(int(_setting(settings, "transition_alpha_min", 2)), 0, 255)),
+        transition_alpha_max=int(np.clip(int(_setting(settings, "transition_alpha_max", 253)), 0, 255)),
     )
     _validate_params_struct(params)
     return NativeColorTileCallV1(params=params, buffers=buffers)

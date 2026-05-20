@@ -297,11 +297,12 @@ def _apply_cuda_dll_availability(result: dict[str, Any], availability: dict[str,
 def _apply_backend_registry(result: dict[str, Any], availability: dict[str, Any]) -> None:
     try:
         cuda_backend = gpu_backend.CudaCompatBackend(cuda_probe=lambda **_: availability)
-        backends = gpu_backend.probe_backends(backends=[cuda_backend], include_cpu=True)
+        backend_objects = [gpu_backend.D3D12ComputeBackend(), cuda_backend]
+        backends = gpu_backend.probe_backends(backends=backend_objects, include_cpu=True)
         selection = gpu_backend.select_backend(
             "Auto",
             {"constant_screen", "rgb_only"},
-            backends=[cuda_backend],
+            backends=backend_objects,
             probed_backends=backends,
         )
         result["backend_registry"] = {
@@ -364,6 +365,20 @@ def _unavailable_message(result: dict[str, Any], reason: str) -> str:
     if reason == "cuda_no_device":
         return "Compact CUDA DLL loaded, but it reported no CUDA devices. CPU color path will be used." + _smi_hint(result)
     return "Compact CUDA DLL backend is unavailable. CPU color path will be used." + _smi_hint(result)
+
+
+def _selected_registry_backend(result: dict[str, Any]) -> dict[str, Any] | None:
+    selected = ((result.get("backend_registry") or {}).get("selected_backend") or {})
+    if selected.get("available") and selected.get("backend"):
+        return selected
+    return None
+
+
+def _apply_selected_backend_summary(result: dict[str, Any], selected: dict[str, Any]) -> None:
+    result["backend"] = {
+        "id": selected.get("backend"),
+        "name": selected.get("backend_name"),
+    }
 
 
 def _transition_smoke_fixture(shape: tuple[int, int]) -> tuple[Any, ...]:
@@ -467,14 +482,31 @@ def probe_gpu(
     _apply_cuda_dll_availability(result, availability)
     _apply_backend_registry(result, availability)
     _apply_native_toolchain_probe(result)
+    selected_backend = _selected_registry_backend(result)
     if not result["cuda_dll"]["available"]:
+        if selected_backend is not None:
+            _apply_selected_backend_summary(result, selected_backend)
+            return _set_available(
+                result,
+                f"GPU backend available: {selected_backend.get('backend_name') or selected_backend.get('backend')}. Compact CUDA DLL is unavailable; non-CUDA backend or CPU fallback will be used as needed.",
+            )
         reason = str(result["cuda_dll"].get("reason") or "cuda_dll_unavailable")
         return _set_unavailable(result, reason, _unavailable_message(result, reason))
 
     if run_kernel_smoke:
         result["transition_repair_smoke"] = _run_transition_repair_smoke(dll_path=dll_path)
         if not result["transition_repair_smoke"].get("ok"):
+            if selected_backend is not None and selected_backend.get("backend") != "cuda_compat":
+                _apply_selected_backend_summary(result, selected_backend)
+                return _set_available(
+                    result,
+                    f"GPU backend available: {selected_backend.get('backend_name') or selected_backend.get('backend')}. CUDA DLL smoke failed, so CUDA compatibility remains unavailable for this run.",
+                )
             return _set_unavailable(result, "cuda_dll_smoke_failed", _unavailable_message(result, "cuda_dll_smoke_failed"))
+
+    if selected_backend is not None:
+        _apply_selected_backend_summary(result, selected_backend)
+        return _set_available(result, f"GPU backend available: {selected_backend.get('backend_name') or selected_backend.get('backend')}.")
 
     dll = result["cuda_dll"]
     device = result["cuda"].get("device_name") or dll.get("device") or "CUDA device"
@@ -524,7 +556,7 @@ def format_probe_human(result: dict[str, Any]) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Probe ImgKey compact CUDA DLL runtime availability.")
+    parser = argparse.ArgumentParser(description="Probe ImgKey native GPU backend runtime availability.")
     parser.add_argument("--probe", "--gpu-probe", action="store_true", help="run the GPU runtime probe")
     parser.add_argument("--json", action="store_true", dest="json_output", help="print probe result as JSON")
     parser.add_argument("--dll", dest="dll_path", default=None, help="override imgkey_cuda.dll path for the probe")

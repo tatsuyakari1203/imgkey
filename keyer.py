@@ -426,7 +426,10 @@ def _render_tiled_rgba(
         try:
             import gpu_backend
 
-            gpu_session = gpu_backend.begin_render(settings, (h, w), required_capabilities={"rgb_only"})
+            required = {"rgb_only"}
+            if matte.screen_map is not None or settings.local_screen_model:
+                required.add("screen_tile")
+            gpu_session = gpu_backend.begin_render(settings, (h, w), required_capabilities=required)
         except Exception:
             gpu_session = None
     for index, tile in enumerate(tiles, start=1):

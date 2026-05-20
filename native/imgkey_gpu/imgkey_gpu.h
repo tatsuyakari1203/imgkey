@@ -79,6 +79,10 @@ typedef struct ImgKeyGpuColorTileParamsV1 {
     float key_vector_despill;
     float preserve_foreground_luma;
     float transition_spill_threshold;
+    float transition_reconstruction_error;
+    float clip_foreground;
+    uint32_t transition_alpha_min;
+    uint32_t transition_alpha_max;
 } ImgKeyGpuColorTileParamsV1;
 
 IMGKEY_GPU_API uint32_t IMGKEY_GPU_CALL imgkey_gpu_version(void);
@@ -86,6 +90,11 @@ IMGKEY_GPU_API const char* IMGKEY_GPU_CALL imgkey_gpu_last_error(void);
 IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_probe_v1(void* out_probe_json, uint32_t out_probe_json_bytes);
 IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_create_context_v1(const ImgKeyGpuColorTileParamsV1* params, void** out_context);
 IMGKEY_GPU_API void IMGKEY_GPU_CALL imgkey_gpu_destroy_context_v1(void* context);
+IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_identity_rgba_v1(
+    void* context,
+    const ImgKeyGpuTileBufferV1* rgba,
+    ImgKeyGpuTileBufferV1* out_rgba
+);
 IMGKEY_GPU_API ImgKeyGpuStatus IMGKEY_GPU_CALL imgkey_gpu_process_color_tile_v1(
     void* context,
     ImgKeyGpuColorTileParamsV1* params,

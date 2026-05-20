@@ -1,6 +1,6 @@
 # ImgKey GPU build notes
 
-ImgKey has exactly two public Windows build flavors. Keep them separated so the default app remains lightweight and the optional GPU executable carries only the compact native CUDA DLL backend.
+ImgKey currently has two public Windows build flavors. Keep them separated so the default app remains lightweight while native GPU backend packaging evidence is gathered.
 
 ## 1. Default `ImgKey.exe`
 
@@ -33,6 +33,26 @@ python -m PyInstaller --noconfirm --clean ImgKey-GPU.spec
 ```
 
 `requirements-gpu-runtime-cu128.txt` is now a no-op compatibility note. There are no extra Python GPU packages for this flavor; build `native/imgkey_cuda/build/imgkey_cuda.dll` before running PyInstaller. Set `IMGKEY_CUDA_DLL` only when packaging a DLL from a non-default path.
+
+## 3. D3D12 compute MVP DLL
+
+Phase 5 adds the backend-neutral native `imgkey_gpu.dll` with backend id
+`d3d12_compute`. It is not merged into either PyInstaller spec yet; build and
+probe it locally while the packaging gate remains open.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File native/imgkey_gpu/build.ps1 -Clean
+python -m gpu_runtime --probe --json
+python smoke_test.py --gpu-parity
+python smoke_test.py --gpu-benchmark
+```
+
+`native/imgkey_gpu/build.ps1` compiles HLSL with DXC/FXC at build time, embeds the
+shader bytecode into the DLL, and writes all generated files under ignored
+`native/imgkey_gpu/build/`. End-user machines must not need DXC, FXC, Windows SDK,
+or a runtime shader compiler. The MVP D3D12 transition shader is capped at
+`640*640` pixels per tile to avoid TDR; larger tiles fall back to CPU until the
+full GPU tile pipeline phase adds better splitting/fusion.
 
 ## RTX 5060 Ti / Blackwell constraints
 
@@ -79,12 +99,13 @@ Test generated EXEs on a clean Windows x64 target with an NVIDIA driver only: no
 2. `ImgKey-GPU.exe --gpu-probe --json` reports compact CUDA DLL availability or a clear driver/runtime error, with extraction splash/progress visible during onefile startup.
 3. Confirm `build/`, `dist/`, wheels, caches, and `.artifact/` outputs remain ignored and are not committed.
 
-## Phase 4 native backend gate
+## Phase 4/5 native backend gate
 
 `gpu_backend.py` now owns the backend-neutral Python protocol and wraps the
 existing compact CUDA DLL as the `cuda_compat` backend. `native/imgkey_gpu/`
-defines the future C ABI contract for D3D12/Vulkan backends, but no D3D12 or
-Vulkan shader backend is implemented yet.
+defines the C ABI contract and ships a D3D12 compute MVP for identity,
+constant-screen transition repair, and `screen_tile` local-plate transition repair.
+Vulkan remains deferred.
 
 Run the gate report with:
 
@@ -104,5 +125,5 @@ The JSON includes:
 
 Current decision: one-EXE CPU/GPU merging is **deferred**. Keep `ImgKey.exe` as
 the lightweight default build and `ImgKey-GPU.exe` as the optional compact CUDA
-flavor until D3D12/Vulkan backend binaries, size measurements, dependency audit,
-and clean fallback evidence satisfy the release gates.
+flavor until D3D12 packaging size measurements, dependency audit, sanitized-PATH
+EXE fallback evidence, and explicit approval satisfy the release gates.

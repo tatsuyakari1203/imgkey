@@ -278,7 +278,7 @@ def _one_exe_decision(components: dict[str, Any]) -> dict[str, Any]:
         "approved": False,
         "preferred_max_mb": ONE_EXE_PREFERRED_MAX_MB,
         "hard_stop_mb": ONE_EXE_HARD_STOP_MB,
-        "reason": "No D3D12/Vulkan native backend binaries, size measurements, dependency audit, or clean fallback EXE evidence exist yet.",
+        "reason": "D3D12 MVP binaries may be built locally, but release one-EXE merge still needs size measurements, dependency audit, sanitized-PATH EXE fallback evidence, and explicit approval.",
         "policy": "Keep the current lightweight ImgKey.exe plus optional ImgKey-GPU.exe policy until backend evidence satisfies the size/dependency/fallback gates.",
         "spec_changes_required_now": False,
     }

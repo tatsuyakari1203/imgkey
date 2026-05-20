@@ -3028,13 +3028,21 @@ def run_gpu_runtime_probe_tests() -> None:
         }
 
     missing_probe = gpu_runtime.probe_gpu(gpu_accel_probe=missing_dll_probe, nvidia_smi_probe=lambda: fake_smi, run_kernel_smoke=False)
-    assert missing_probe["status"] == "unavailable"
-    assert missing_probe["available"] is False
-    assert missing_probe["reason"] == "cuda_dll_unavailable"
-    assert missing_probe["backend"]["id"] == "compact_cuda_dll"
-    assert missing_probe["backend_registry"]["backends"][0]["id"] == "cuda_compat"
-    assert missing_probe["backend_registry"]["backends"][0]["legacy_backend"]["id"] == "compact_cuda_dll"
-    assert missing_probe["backend_registry"]["selected_backend"]["status"] == "unavailable"
+    backend_ids = [item["id"] for item in missing_probe["backend_registry"]["backends"]]
+    assert "cuda_compat" in backend_ids
+    cuda_registry = next(item for item in missing_probe["backend_registry"]["backends"] if item["id"] == "cuda_compat")
+    assert cuda_registry["legacy_backend"]["id"] == "compact_cuda_dll"
+    missing_selected = missing_probe["backend_registry"]["selected_backend"]
+    if missing_selected["available"]:
+        assert missing_probe["status"] == "available"
+        assert missing_probe["available"] is True
+        assert missing_selected["backend"] in {"d3d12_compute", "cuda_compat"}
+    else:
+        assert missing_probe["status"] == "unavailable"
+        assert missing_probe["available"] is False
+        assert missing_probe["reason"] == "cuda_dll_unavailable"
+        assert missing_probe["backend"]["id"] == "compact_cuda_dll"
+        assert missing_selected["status"] == "unavailable"
     assert missing_probe["cuda_dll"]["available"] is False
     assert missing_probe["cuda_dll"]["load_success"] is False
     assert missing_probe["cuda"]["is_available"] is False
@@ -3065,7 +3073,7 @@ def run_gpu_runtime_probe_tests() -> None:
     assert dll_probe["cuda"]["is_available"] is True
     assert dll_probe["cuda"]["device_name"] == "NVIDIA Test GPU"
     assert dll_probe["cuda"]["device_capability"] == [12, 0]
-    assert dll_probe["backend_registry"]["selected_backend"]["backend"] == "cuda_compat"
+    assert dll_probe["backend_registry"]["selected_backend"]["backend"] in {"d3d12_compute", "cuda_compat"}
     assert dll_probe["backend_registry"]["selected_backend"]["status"] == "selected"
     assert "rgb_only" in dll_probe["backend_registry"]["selected_backend"]["capabilities"]
     assert dll_probe["transition_repair_smoke"]["ran"] is False
@@ -3268,6 +3276,47 @@ def run_gpu_backend_registry_tests() -> None:
     assert np.array_equal(fake_result["rgb"][alpha_u8 > 0], rgb[alpha_u8 > 0])
     assert np.count_nonzero(fake_result["repair_mask"]) == 0
 
+    d3d12 = gpu_backend.D3D12ComputeBackend()
+    d3d12_info = d3d12.probe(refresh=True)
+    if d3d12_info.get("available"):
+        assert "screen_tile" in d3d12_info.get("capabilities", [])
+        identity_rgba = np.arange(17 * 19 * 4, dtype=np.uint8).reshape(17, 19, 4)
+        identity = d3d12.identity_rgba(identity_rgba)
+        assert identity["used"] is True, f"D3D12 identity expected use, got {identity.get('reason')}: {identity.get('message')}"
+        assert np.array_equal(identity["rgba"], identity_rgba), "D3D12 identity kernel must be byte-exact"
+
+        odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, odd_foreground, odd_valid, odd_key_color, odd_settings = _gpu_transition_tile((65, 97))
+        d3d12_settings = replace(odd_settings, gpu_acceleration="Force GPU")
+        cpu_rgb, cpu_mask = _repair_transition_unmix(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, odd_key_color, None, odd_foreground, odd_valid, odd_settings)
+        d3d12_session = gpu_backend.begin_render(d3d12_settings, odd_rgb.shape, required_capabilities={"constant_screen", "rgb_only"}, backends=[d3d12])
+        d3d12_result = d3d12_session.process_color_tile(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, None, odd_foreground, odd_valid, odd_key_color, d3d12_settings)
+        d3d12_session.end_render()
+        assert d3d12_result["used"] is True, f"D3D12 constant-screen expected use, got {d3d12_result.get('reason')}: {d3d12_result.get('message')}"
+        d3d12_rgb = d3d12_result["rgb"]
+        d3d12_mask = d3d12_result["repair_mask"]
+        rgb_delta = np.abs(cpu_rgb.astype(np.int16) - d3d12_rgb.astype(np.int16))
+        mask_delta = np.abs(cpu_mask.astype(np.int16) - d3d12_mask.astype(np.int16))
+        assert int(rgb_delta.max()) <= 2 and float(np.percentile(rgb_delta, 99)) <= 1.0, "D3D12 constant-screen RGB parity exceeded tolerance"
+        assert int(mask_delta.max()) == 0, "D3D12 constant-screen repair mask must match CPU exactly"
+        assert int(d3d12_rgb[odd_alpha == 0].max(initial=0)) == 0, "D3D12 transparent RGB must remain zero"
+
+        h, w = odd_alpha.shape
+        screen_tile = np.empty_like(odd_rgb)
+        screen_tile[:, :, 0] = odd_key_color[0]
+        screen_tile[:, :, 1] = np.linspace(max(0, odd_key_color[1] - 10), min(255, odd_key_color[1] + 10), w, dtype=np.uint8).reshape(1, w)
+        screen_tile[:, :, 2] = np.linspace(max(0, odd_key_color[2] - 15), odd_key_color[2], h, dtype=np.uint8).reshape(h, 1)
+        cpu_screen_rgb, cpu_screen_mask = _repair_transition_unmix(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, odd_key_color, screen_tile, odd_foreground, odd_valid, odd_settings)
+        d3d12_screen_session = gpu_backend.begin_render(d3d12_settings, odd_rgb.shape, required_capabilities={"screen_tile", "rgb_only"}, backends=[d3d12])
+        d3d12_screen = d3d12_screen_session.process_color_tile(odd_rgb, odd_alpha, odd_background, odd_edge, odd_probability, odd_fringe, screen_tile, odd_foreground, odd_valid, odd_key_color, d3d12_settings)
+        d3d12_screen_session.end_render()
+        assert d3d12_screen["used"] is True, f"D3D12 screen_tile expected use, got {d3d12_screen.get('reason')}: {d3d12_screen.get('message')}"
+        screen_rgb_delta = np.abs(cpu_screen_rgb.astype(np.int16) - d3d12_screen["rgb"].astype(np.int16))
+        screen_mask_delta = np.abs(cpu_screen_mask.astype(np.int16) - d3d12_screen["repair_mask"].astype(np.int16))
+        assert int(screen_rgb_delta.max()) <= 2 and float(np.percentile(screen_rgb_delta, 99)) <= 1.0, "D3D12 screen_tile RGB parity exceeded tolerance"
+        assert int(screen_mask_delta.max()) == 0, "D3D12 screen_tile repair mask must match CPU exactly"
+    else:
+        print(f"D3D12 native backend tests skipped: {d3d12_info.get('reason')} - {d3d12_info.get('message')}")
+
     call = gpu_backend.validate_native_color_tile_inputs(
         rgb,
         alpha_u8,
@@ -3321,7 +3370,9 @@ def run_gpu_parity_tests() -> None:
     gpu_accel = importlib.import_module("gpu_accel")
     gpu_backend = importlib.import_module("gpu_backend")
     availability = gpu_accel.is_available(refresh=True)
-    if not availability.get("available"):
+    backend_objects = gpu_backend.registered_backends()
+    selected = gpu_backend.select_backend("Force GPU", {"constant_screen", "rgb_only"}, backends=backend_objects, refresh=True)
+    if not availability.get("available") and not selected.available:
         print(f"gpu parity skipped: {availability.get('reason')} - {availability.get('message')}")
         return
 
@@ -3339,28 +3390,30 @@ def run_gpu_parity_tests() -> None:
         key_color,
         settings,
     )
-    gpu = gpu_accel.process_color_tile_gpu(
-        rgb,
-        alpha_u8,
-        background_mask,
-        edge_mask,
-        probability,
-        fringe,
-        None,
-        foreground,
-        nearest_valid,
-        key_color,
-        replace(settings, gpu_acceleration="Force GPU"),
-        force_gpu=True,
-    )
-    assert gpu["used"] is True, f"GPU parity expected backend use, got {gpu.get('reason')}: {gpu.get('message')}"
-    gpu_rgb = gpu["rgb"]
-    gpu_mask = gpu["repair_mask"]
-    assert gpu_rgb is not None and gpu_mask is not None
-    max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - gpu_rgb.astype(np.int16))))
-    max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - gpu_mask.astype(np.int16))))
-    assert max_rgb_diff <= 2, f"GPU transition RGB parity max diff too high: {max_rgb_diff}"
-    assert max_mask_diff <= 2, f"GPU transition mask parity max diff too high: {max_mask_diff}"
+    max_rgb_diff = max_mask_diff = None
+    if availability.get("available"):
+        gpu = gpu_accel.process_color_tile_gpu(
+            rgb,
+            alpha_u8,
+            background_mask,
+            edge_mask,
+            probability,
+            fringe,
+            None,
+            foreground,
+            nearest_valid,
+            key_color,
+            replace(settings, gpu_acceleration="Force GPU"),
+            force_gpu=True,
+        )
+        assert gpu["used"] is True, f"GPU parity expected backend use, got {gpu.get('reason')}: {gpu.get('message')}"
+        gpu_rgb = gpu["rgb"]
+        gpu_mask = gpu["repair_mask"]
+        assert gpu_rgb is not None and gpu_mask is not None
+        max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - gpu_rgb.astype(np.int16))))
+        max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - gpu_mask.astype(np.int16))))
+        assert max_rgb_diff <= 2, f"GPU transition RGB parity max diff too high: {max_rgb_diff}"
+        assert max_mask_diff <= 2, f"GPU transition mask parity max diff too high: {max_mask_diff}"
 
     backend_session = gpu_backend.begin_render(replace(settings, gpu_acceleration="Force GPU"), rgb.shape, required_capabilities={"constant_screen", "rgb_only"})
     backend_gpu = backend_session.process_color_tile(
@@ -3377,20 +3430,22 @@ def run_gpu_parity_tests() -> None:
         replace(settings, gpu_acceleration="Force GPU"),
     )
     backend_session.end_render()
-    assert backend_gpu["used"] is True, f"CUDA compat backend expected use, got {backend_gpu.get('reason')}: {backend_gpu.get('message')}"
+    assert backend_gpu["used"] is True, f"backend registry expected use, got {backend_gpu.get('reason')}: {backend_gpu.get('message')}"
     backend_rgb = backend_gpu["rgb"]
     backend_mask = backend_gpu["repair_mask"]
     assert backend_rgb is not None and backend_mask is not None
     max_backend_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - backend_rgb.astype(np.int16))))
     max_backend_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - backend_mask.astype(np.int16))))
-    assert max_backend_rgb_diff <= 2, f"CUDA compat backend RGB parity max diff too high: {max_backend_rgb_diff}"
-    assert max_backend_mask_diff <= 2, f"CUDA compat backend mask parity max diff too high: {max_backend_mask_diff}"
+    assert max_backend_rgb_diff <= 2, f"backend registry RGB parity max diff too high: {max_backend_rgb_diff}"
+    assert max_backend_mask_diff <= 2, f"backend registry mask parity max diff too high: {max_backend_mask_diff}"
 
-    dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
-    max_direct_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
-    max_direct_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
-    assert max_direct_rgb_diff <= 2, f"direct CUDA DLL RGB parity max diff too high: {max_direct_rgb_diff}"
-    assert max_direct_mask_diff <= 2, f"direct CUDA DLL mask parity max diff too high: {max_direct_mask_diff}"
+    max_direct_rgb_diff = max_direct_mask_diff = None
+    if availability.get("available"):
+        dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        max_direct_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+        max_direct_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+        assert max_direct_rgb_diff <= 2, f"direct CUDA DLL RGB parity max diff too high: {max_direct_rgb_diff}"
+        assert max_direct_mask_diff <= 2, f"direct CUDA DLL mask parity max diff too high: {max_direct_mask_diff}"
 
     disabled_settings = replace(settings, gpu_acceleration="Force GPU", foreground_reference_radius=0)
     disabled = gpu_accel.process_color_tile_gpu(
@@ -3441,24 +3496,25 @@ def run_gpu_parity_tests() -> None:
     opaque_edge = np.zeros_like(edge_mask, dtype=bool)
     opaque_probability = np.zeros_like(probability, dtype=np.uint8)
     opaque_fringe = np.zeros_like(fringe, dtype=np.uint8)
-    opaque_noop = gpu_accel.process_color_tile_gpu(
-        foreground,
-        opaque_alpha,
-        opaque_background,
-        opaque_edge,
-        opaque_probability,
-        opaque_fringe,
-        None,
-        foreground,
-        np.ones_like(nearest_valid, dtype=bool),
-        key_color,
-        replace(settings, gpu_acceleration="Force GPU"),
-        force_gpu=True,
-    )
-    assert opaque_noop["used"] is False and opaque_noop["reason"] == "no_eligible_pixels"
+    if availability.get("available"):
+        opaque_noop = gpu_accel.process_color_tile_gpu(
+            foreground,
+            opaque_alpha,
+            opaque_background,
+            opaque_edge,
+            opaque_probability,
+            opaque_fringe,
+            None,
+            foreground,
+            np.ones_like(nearest_valid, dtype=bool),
+            key_color,
+            replace(settings, gpu_acceleration="Force GPU"),
+            force_gpu=True,
+        )
+        assert opaque_noop["used"] is False and opaque_noop["reason"] == "no_eligible_pixels"
     print(
         "gpu parity ok "
-        f"device={availability.get('device')} max_rgb_diff={max_rgb_diff} "
+        f"cuda_device={availability.get('device')} backend={backend_gpu.get('backend')} max_rgb_diff={max_rgb_diff} "
         f"max_mask_diff={max_mask_diff} max_direct_rgb_diff={max_direct_rgb_diff} "
         f"max_backend_rgb_diff={max_backend_rgb_diff}"
     )
@@ -3477,24 +3533,31 @@ def _median_time_ms(callback, *, repeat: int = 5, warmup: int = 1) -> float:
 
 def write_gpu_benchmarks() -> None:
     gpu_accel = importlib.import_module("gpu_accel")
+    gpu_backend = importlib.import_module("gpu_backend")
     availability = gpu_accel.is_available(refresh=True)
+    d3d12 = gpu_backend.D3D12ComputeBackend()
+    d3d12_info = d3d12.probe(refresh=True)
     GPU_BENCHMARK_DIR.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] = {
         "generated_by": "python smoke_test.py --gpu-benchmark",
         "backend": {
-            "id": "compact_cuda_dll",
-            "name": "compact CUDA DLL",
+            "id": "backend_registry",
+            "name": "ImgKey GPU backend registry",
         },
-        "availability": availability,
+        "availability": {
+            "cuda_compat": availability,
+            "d3d12_compute": d3d12_info,
+        },
         "notes": [
             "CPU remains the correctness reference.",
             "CUDA DLL timings include host/device copies performed inside imgkey_cuda_transition_repair_v1.",
+            "D3D12 timings use the persistent D3D12 context and include per-dispatch upload/readback for the MVP backend.",
         ],
         "benchmarks": {},
     }
-    if not availability.get("available"):
+    if not availability.get("available") and not d3d12_info.get("available"):
         (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(f"gpu benchmark skipped: {availability.get('reason')} - {availability.get('message')}")
+        print(f"gpu benchmark skipped: cuda={availability.get('reason')} d3d12={d3d12_info.get('reason')}")
         return
 
     rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((1024, 1024))
@@ -3520,23 +3583,24 @@ def write_gpu_benchmarks() -> None:
         gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
 
     cpu_direct_ms = _median_time_ms(cpu_transition_reference, repeat=5, warmup=1)
-    cuda_direct_ms = _median_time_ms(cuda_dll_transition_direct, repeat=5, warmup=2)
     cpu_rgb, cpu_mask = gpu_accel.transition_repair_cpu_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
-    dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
-    direct_max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
-    direct_max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
-    summary["benchmarks"]["transition_repair_tile_1024_direct"] = {
-        "tile_shape": list(rgb.shape[:2]),
-        "active_repair_pixels": int(np.count_nonzero(transition_strength)),
-        "cpu_reference_ms": cpu_direct_ms,
-        "cuda_dll_ms_including_transfer": cuda_direct_ms,
-        "speedup": cpu_direct_ms / cuda_direct_ms if cuda_direct_ms > 0 else None,
-        "transfer_included": True,
-        "transfer_scope": "imgkey_cuda_transition_repair_v1 copies uint8 host inputs to device and RGB/mask outputs back to host before returning.",
-        "max_rgb_diff_vs_cpu": direct_max_rgb_diff,
-        "max_mask_diff_vs_cpu": direct_max_mask_diff,
-        "faster_than_cpu": cuda_direct_ms < cpu_direct_ms,
-    }
+    if availability.get("available"):
+        cuda_direct_ms = _median_time_ms(cuda_dll_transition_direct, repeat=5, warmup=2)
+        dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
+        direct_max_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
+        direct_max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - dll_mask.astype(np.int16))))
+        summary["benchmarks"]["cuda_transition_repair_tile_1024_direct"] = {
+            "tile_shape": list(rgb.shape[:2]),
+            "active_repair_pixels": int(np.count_nonzero(transition_strength)),
+            "cpu_reference_ms": cpu_direct_ms,
+            "cuda_dll_ms_including_transfer": cuda_direct_ms,
+            "speedup": cpu_direct_ms / cuda_direct_ms if cuda_direct_ms > 0 else None,
+            "transfer_included": True,
+            "transfer_scope": "imgkey_cuda_transition_repair_v1 copies uint8 host inputs to device and RGB/mask outputs back to host before returning.",
+            "max_rgb_diff_vs_cpu": direct_max_rgb_diff,
+            "max_mask_diff_vs_cpu": direct_max_mask_diff,
+            "faster_than_cpu": cuda_direct_ms < cpu_direct_ms,
+        }
 
     def cpu_transition_dispatch() -> None:
         _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
@@ -3559,20 +3623,56 @@ def write_gpu_benchmarks() -> None:
         assert result["used"], result.get("message")
 
     cpu_dispatch_ms = _median_time_ms(cpu_transition_dispatch, repeat=5, warmup=1)
-    cuda_dispatch_ms = _median_time_ms(cuda_dll_transition_dispatch, repeat=5, warmup=2)
     cpu_dispatch_rgb, _ = _repair_transition_unmix(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, key_color, None, foreground, nearest_valid, settings)
-    gpu_result = gpu_accel.process_color_tile_gpu(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings_gpu, force_gpu=True)
-    dispatch_max_rgb_diff = int(np.max(np.abs(cpu_dispatch_rgb.astype(np.int16) - gpu_result["rgb"].astype(np.int16))))
-    summary["benchmarks"]["transition_repair_tile_1024_dispatch"] = {
-        "tile_shape": list(rgb.shape[:2]),
-        "cpu_full_transition_ms": cpu_dispatch_ms,
-        "cuda_dll_dispatch_ms_including_transfer": cuda_dispatch_ms,
-        "speedup": cpu_dispatch_ms / cuda_dispatch_ms if cuda_dispatch_ms > 0 else None,
-        "transfer_included": True,
-        "max_rgb_diff_vs_cpu": dispatch_max_rgb_diff,
-        "faster_than_cpu": cuda_dispatch_ms < cpu_dispatch_ms,
-        "auto_fallback_policy": "GPU remains optional; Auto uses CPU fallback on missing DLL, no device, unsupported tile, or execution error.",
-    }
+    if availability.get("available"):
+        cuda_dispatch_ms = _median_time_ms(cuda_dll_transition_dispatch, repeat=5, warmup=2)
+        gpu_result = gpu_accel.process_color_tile_gpu(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings_gpu, force_gpu=True)
+        dispatch_max_rgb_diff = int(np.max(np.abs(cpu_dispatch_rgb.astype(np.int16) - gpu_result["rgb"].astype(np.int16))))
+        summary["benchmarks"]["cuda_transition_repair_tile_1024_dispatch"] = {
+            "tile_shape": list(rgb.shape[:2]),
+            "cpu_full_transition_ms": cpu_dispatch_ms,
+            "cuda_dll_dispatch_ms_including_transfer": cuda_dispatch_ms,
+            "speedup": cpu_dispatch_ms / cuda_dispatch_ms if cuda_dispatch_ms > 0 else None,
+            "transfer_included": True,
+            "max_rgb_diff_vs_cpu": dispatch_max_rgb_diff,
+            "faster_than_cpu": cuda_dispatch_ms < cpu_dispatch_ms,
+            "auto_fallback_policy": "GPU remains optional; Auto uses CPU fallback on missing DLL, no device, unsupported tile, or execution error.",
+        }
+
+    if d3d12_info.get("available"):
+        d3d12_rgb, d3d12_alpha, d3d12_bg, d3d12_edge, d3d12_probability, d3d12_fringe, d3d12_foreground, d3d12_valid, d3d12_key, d3d12_settings = _gpu_transition_tile((512, 512))
+        d3d12_settings_gpu = replace(d3d12_settings, gpu_acceleration="Force GPU")
+
+        def d3d12_cpu_transition_dispatch() -> None:
+            _repair_transition_unmix(d3d12_rgb, d3d12_alpha, d3d12_bg, d3d12_edge, d3d12_probability, d3d12_fringe, d3d12_key, None, d3d12_foreground, d3d12_valid, d3d12_settings)
+
+        d3d12_cpu_ms = _median_time_ms(d3d12_cpu_transition_dispatch, repeat=5, warmup=1)
+        d3d12_cpu_rgb, d3d12_cpu_mask = _repair_transition_unmix(d3d12_rgb, d3d12_alpha, d3d12_bg, d3d12_edge, d3d12_probability, d3d12_fringe, d3d12_key, None, d3d12_foreground, d3d12_valid, d3d12_settings)
+        d3d12_session = gpu_backend.begin_render(d3d12_settings_gpu, d3d12_rgb.shape, required_capabilities={"constant_screen", "rgb_only"}, backends=[d3d12])
+
+        def d3d12_transition_dispatch() -> None:
+            result = d3d12_session.process_color_tile(d3d12_rgb, d3d12_alpha, d3d12_bg, d3d12_edge, d3d12_probability, d3d12_fringe, None, d3d12_foreground, d3d12_valid, d3d12_key, d3d12_settings_gpu)
+            assert result["used"], result.get("message")
+
+        try:
+            d3d12_dispatch_ms = _median_time_ms(d3d12_transition_dispatch, repeat=5, warmup=2)
+            d3d12_result = d3d12_session.process_color_tile(d3d12_rgb, d3d12_alpha, d3d12_bg, d3d12_edge, d3d12_probability, d3d12_fringe, None, d3d12_foreground, d3d12_valid, d3d12_key, d3d12_settings_gpu)
+        finally:
+            d3d12_session.end_render()
+        d3d12_rgb_delta = np.abs(d3d12_cpu_rgb.astype(np.int16) - d3d12_result["rgb"].astype(np.int16))
+        d3d12_mask_delta = np.abs(d3d12_cpu_mask.astype(np.int16) - d3d12_result["repair_mask"].astype(np.int16))
+        summary["benchmarks"]["d3d12_transition_repair_tile_512_dispatch"] = {
+            "tile_shape": list(d3d12_rgb.shape[:2]),
+            "cpu_full_transition_ms": d3d12_cpu_ms,
+            "d3d12_dispatch_ms_including_transfer": d3d12_dispatch_ms,
+            "speedup": d3d12_cpu_ms / d3d12_dispatch_ms if d3d12_dispatch_ms > 0 else None,
+            "transfer_included": True,
+            "max_rgb_diff_vs_cpu": int(d3d12_rgb_delta.max()),
+            "p99_rgb_diff_vs_cpu": float(np.percentile(d3d12_rgb_delta, 99)),
+            "max_mask_diff_vs_cpu": int(d3d12_mask_delta.max()),
+            "faster_than_cpu": d3d12_dispatch_ms < d3d12_cpu_ms,
+            "auto_fallback_policy": "Backend registry selects D3D12 for constant-screen and screen_tile tiles when available; CPU remains fallback.",
+        }
 
     (GPU_BENCHMARK_DIR / "summary.json").write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"gpu benchmark summary written to {GPU_BENCHMARK_DIR / 'summary.json'}")
@@ -4733,17 +4833,19 @@ def _write_geometric_case_artifacts(case: GeometricBenchmarkCase, result: KeyRes
 
 
 def _geometric_gpu_parity(cases: list[GeometricBenchmarkCase]) -> dict[str, Any]:
-    gpu_accel = importlib.import_module("gpu_accel")
-    availability = gpu_accel.is_available(refresh=True)
+    gpu_backend = importlib.import_module("gpu_backend")
+    backend_objects = gpu_backend.registered_backends()
+    backends = gpu_backend.probe_backends(backends=backend_objects, include_cpu=False, refresh=True)
+    selection = gpu_backend.select_backend("Force GPU", {"constant_screen", "rgb_only"}, backends=backend_objects, probed_backends=backends)
     parity: dict[str, Any] = {
-        "backend": {"id": "compact_cuda_dll", "name": "compact CUDA DLL"},
-        "availability": availability,
+        "backend": {"id": selection.as_dict().get("backend"), "name": selection.as_dict().get("backend_name")},
+        "availability": {"backends": backends, "selected_backend": selection.as_dict()},
         "status": "skipped",
-        "reason": availability.get("reason"),
-        "message": availability.get("message"),
+        "reason": selection.reason,
+        "message": selection.message,
         "cases": {},
     }
-    if not availability.get("available"):
+    if not selection.available:
         return parity
 
     max_rgba_diff = 0
@@ -4796,13 +4898,13 @@ def _geometric_gpu_parity(cases: list[GeometricBenchmarkCase]) -> dict[str, Any]
                 "blocks_gpu_parity_gate": bool(max_rgba_diff > 2 or max_alpha_diff > 1 or used_case_count <= 0),
                 "note": (
                     "Geometry parity is RGB-only outside tolerance; CPU remains the tuning reference, "
-                    "but geometry-level GPU parity should not be considered passing. The direct tile parity "
-                    "test can still pass because it compares the compact DLL against the gpu_accel CPU mirror, "
+                    "but geometry-level GPU parity should not be considered passing. Direct tile parity "
+                    "can still pass because it compares one backend kernel against the tile CPU mirror, "
                     "while this benchmark compares the full keyer CPU path against forced GPU transition repair."
                     if max_rgba_diff > 2 and max_alpha_diff <= 1 and used_case_count > 0
                     else "Geometry parity is within tolerance."
                     if max_rgba_diff <= 2 and max_alpha_diff <= 1 and used_case_count > 0
-                    else "Geometry GPU parity did not use enough compact CUDA tiles or exceeded alpha tolerance."
+                    else "Geometry GPU parity did not use enough GPU tiles or exceeded alpha tolerance."
                 ),
             },
         }

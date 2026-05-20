@@ -335,6 +335,7 @@ def _process_color_tile(
         if gpu_mode != "Off" and _transition_reference_enabled(settings):
             gpu_result: dict
             try:
+                required = {"rgb_only", "screen_tile"} if screen_tile is not None else {"rgb_only", "constant_screen"}
                 gpu_result = gpu_backend.process_color_tile(
                     rgb_tile,
                     alpha_u8,
@@ -348,7 +349,7 @@ def _process_color_tile(
                     screen_color,
                     settings,
                     session=gpu_session,
-                    required_capabilities={"rgb_only"},
+                    required_capabilities=required,
                 )
             except Exception as exc:  # pragma: no cover - defensive backend boundary
                 gpu_result = {
@@ -364,7 +365,7 @@ def _process_color_tile(
             if gpu_result.get("used") and isinstance(gpu_result.get("rgb"), np.ndarray) and isinstance(gpu_result.get("repair_mask"), np.ndarray):
                 transition_rgb = gpu_result["rgb"]
                 transition_mask = gpu_result["repair_mask"]
-            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"cuda_dll_unavailable", "cuda_dll_probe_failed", "cuda_no_device", "cuda_unavailable", "cuda_execution_failed", "backend_unavailable", "backend_probe_failed", "backend_execution_failed", "gpu_exception"}:
+            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in gpu_backend.GPU_BACKEND_ERROR_REASONS:
                 raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but no compatible GPU backend is available."))
 
         if transition_rgb is None or transition_mask is None:

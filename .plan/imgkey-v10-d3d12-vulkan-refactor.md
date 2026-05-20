@@ -439,10 +439,10 @@ Isolation:
 - Own `native/imgkey_gpu/` D3D12 backend, shader build scripts, and Python backend adapter. CPU remains reference.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P5.1 - D3D12 identity backend
 - Implement D3D12 device selection, adapter probe, context lifecycle, command queue/list/fence, descriptor/root signature/PSO setup.
@@ -456,7 +456,7 @@ Acceptance:
 - Identity kernel returns exact byte-for-byte output for RGBA/tile buffers.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -469,7 +469,7 @@ Acceptance:
 - D3D12 does not regress current CUDA/CPU output visually on geometric/transition diagnostics.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -492,10 +492,19 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Added `native/imgkey_gpu/imgkey_gpu.cpp`, `imgkey_gpu_color.hlsl`, and `build.ps1` to build `imgkey_gpu.dll` with MSVC, Windows SDK D3D12/DXGI libs, and DXC/FXC build-time shader compilation. Shader bytecode is embedded in the DLL; generated `.cso`/headers/DLL/import libs stay under ignored `native/imgkey_gpu/build/`.
+- Implemented D3D12 adapter probe, context lifecycle, command queue/list/fence, root signature, compute PSOs, upload/readback path, and byte-exact `imgkey_gpu_identity_rgba_v1` identity kernel. Local identity smoke returned byte-exact output on NVIDIA GeForce RTX 5060 Ti.
+- Ported the RGB-only transition repair kernel to D3D12 for constant-screen and per-pixel `screen_tile` local plate inputs behind backend id `d3d12_compute`, capabilities `constant_screen`, `screen_tile`, `persistent_session`, and `rgb_only`. CPU remains the correctness/fallback reference; CUDA compatibility remains available as `cuda_compat`.
+- Routed backend selection/probe through the registry so `python -m gpu_runtime --probe --json` selects D3D12 when available and keeps compact CUDA details as compatibility telemetry. Local probe reported D3D12 available with `max_tile_pixels=409600`.
+- D3D12 parity passed in smoke: identity exact; constant-screen tile max RGB diff `0`/repair mask diff `0`; `screen_tile` tile max RGB diff `1`/p99 `0`/repair mask diff `0`; geometry GPU parity max RGBA diff `1`, alpha diff `0`, and D3D12 used on all six geometric cases.
+- Documented current MVP limitation: the transition shader is capped at `640*640` pixels per tile to avoid Windows TDR while Phase 6 adds persistent buffers/batching/full tile graph. Larger tiles fall back to CPU rather than crash; `screen_tile` support itself no longer forces CPU fallback.
+- Required Phase 5 verification passed locally: native D3D12 build script, smoke, GPU parity, GPU benchmark, geometric benchmark generation, runtime probe, py_compile/import, no-heavy-runtime startup guard, and `git diff --check` after cleanup.
 
 ---
 
@@ -517,7 +526,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P6.1 - GPU linear conversion / unmix foundation
 - Move the linear/sRGB conversion and base unmix math into backend-supported tile kernels.
@@ -696,4 +705,4 @@ Current:
 
 ## 6) Immediate next step
 
-Proceed to Phase 5 with `deep-worker`: implement the D3D12 compute MVP behind the Phase 4 backend-neutral ABI. Do not begin Vulkan until the D3D12 gate passes.
+Proceed to Phase 6 with `deep-worker`: expand the D3D12 backend from the transition-repair MVP into the full GPU tile color pipeline with persistent buffers/batching, while keeping CPU as the correctness reference. Do not begin Vulkan until the D3D12 full tile pipeline gate passes.
