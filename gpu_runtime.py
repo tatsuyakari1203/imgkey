@@ -13,6 +13,9 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+import gpu_backend
+import native_toolchain
+
 
 NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
 BACKEND_ID = "compact_cuda_dll"
@@ -27,6 +30,12 @@ def _base_probe() -> dict[str, Any]:
         "backend": {
             "id": BACKEND_ID,
             "name": BACKEND_NAME,
+        },
+        "backend_registry": {
+            "schema_version": 1,
+            "backends": [],
+            "selected_backend": None,
+            "required_capabilities": ["constant_screen", "rgb_only"],
         },
         "status": "unavailable",
         "available": False,
@@ -80,6 +89,12 @@ def _base_probe() -> dict[str, Any]:
             "elapsed_ms": None,
             "max_rgb_diff": None,
             "max_mask_diff": None,
+        },
+        "native_toolchain": {
+            "schema_version": native_toolchain.TOOLCHAIN_SCHEMA_VERSION,
+            "probe": "imgkey_native_gpu_toolchain",
+            "status": "not_run",
+            "message": "Native toolchain probe has not run.",
         },
     }
 
@@ -279,6 +294,53 @@ def _apply_cuda_dll_availability(result: dict[str, Any], availability: dict[str,
         cuda["availability_error"] = availability.get("message")
 
 
+def _apply_backend_registry(result: dict[str, Any], availability: dict[str, Any]) -> None:
+    try:
+        cuda_backend = gpu_backend.CudaCompatBackend(cuda_probe=lambda **_: availability)
+        backends = gpu_backend.probe_backends(backends=[cuda_backend], include_cpu=True)
+        selection = gpu_backend.select_backend(
+            "Auto",
+            {"constant_screen", "rgb_only"},
+            backends=[cuda_backend],
+            probed_backends=backends,
+        )
+        result["backend_registry"] = {
+            "schema_version": 1,
+            "backends": backends,
+            "selected_backend": selection.as_dict(),
+            "required_capabilities": ["constant_screen", "rgb_only"],
+        }
+    except Exception as exc:  # pragma: no cover - defensive probe isolation
+        result["backend_registry"] = {
+            "schema_version": 1,
+            "backends": [],
+            "selected_backend": {
+                "mode": "Auto",
+                "status": "unavailable",
+                "available": False,
+                "backend": None,
+                "backend_name": None,
+                "reason": "backend_probe_failed",
+                "message": f"Backend registry probe failed: {type(exc).__name__}: {exc}",
+                "required_capabilities": ["constant_screen", "rgb_only"],
+                "capabilities": [],
+            },
+            "required_capabilities": ["constant_screen", "rgb_only"],
+        }
+
+
+def _apply_native_toolchain_probe(result: dict[str, Any]) -> None:
+    try:
+        result["native_toolchain"] = native_toolchain.probe_native_toolchain()
+    except Exception as exc:  # pragma: no cover - defensive probe isolation
+        result["native_toolchain"] = {
+            "schema_version": native_toolchain.TOOLCHAIN_SCHEMA_VERSION,
+            "probe": "imgkey_native_gpu_toolchain",
+            "status": "error",
+            "message": f"Native toolchain probe failed: {type(exc).__name__}: {exc}",
+        }
+
+
 def _smi_hint(result: dict[str, Any]) -> str:
     smi = result.get("nvidia_smi", {})
     driver = smi.get("driver_version")
@@ -403,6 +465,8 @@ def probe_gpu(
         }
 
     _apply_cuda_dll_availability(result, availability)
+    _apply_backend_registry(result, availability)
+    _apply_native_toolchain_probe(result)
     if not result["cuda_dll"]["available"]:
         reason = str(result["cuda_dll"].get("reason") or "cuda_dll_unavailable")
         return _set_unavailable(result, reason, _unavailable_message(result, reason))
@@ -441,6 +505,21 @@ def format_probe_human(result: dict[str, Any]) -> str:
     lines.append(f"nvidia-smi: available={smi.get('available')} driver={smi.get('driver_version')} cuda={smi.get('cuda_version')}")
     smoke = result.get("transition_repair_smoke", {})
     lines.append(f"transition repair smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} max_rgb_diff={smoke.get('max_rgb_diff')} error={smoke.get('error')}")
+    registry = result.get("backend_registry", {})
+    selected = registry.get("selected_backend") or {}
+    backends = registry.get("backends") or []
+    lines.append(
+        "backend registry: "
+        f"selected={selected.get('backend')} status={selected.get('status')} "
+        f"available={selected.get('available')} count={len(backends)}"
+    )
+    toolchain = result.get("native_toolchain", {})
+    decision = toolchain.get("packaging_decision") or {}
+    lines.append(
+        "native toolchain: "
+        f"status={toolchain.get('status')} one_exe={decision.get('status')} "
+        f"approved={decision.get('approved')}"
+    )
     return "\n".join(lines)
 
 

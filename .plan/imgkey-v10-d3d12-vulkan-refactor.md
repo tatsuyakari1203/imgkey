@@ -352,10 +352,10 @@ Isolation:
 - Own `gpu_backend.py`, native ABI scaffolding, packaging hooks, and existing CUDA adapter wrapping. No D3D12/Vulkan shader port yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
 
 #### P4.1 - Add backend protocol and session lifecycle
 - Replace direct `gpu_accel.process_color_tile_gpu()` calls with a backend registry/session API:
@@ -380,7 +380,7 @@ Acceptance:
 - Fake backend and CUDA compatibility backend pass ABI validation tests.
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
@@ -409,10 +409,18 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Added `gpu_backend.py` as the backend-neutral registry/session layer with `probe_backends()`, `select_backend()`, `begin_render()`, `process_color_tile()`, and `end_render()`; `CudaCompatBackend` wraps the existing compact CUDA DLL while `gpu_accel.py` remains the concrete CUDA compatibility shim.
+- Routed keyer tile dispatch through backend sessions instead of direct `gpu_accel.process_color_tile_gpu()` calls. CUDA behavior remains compact/optional: `cuda_compat` reports `constant_screen` + `rgb_only`, still falls back for `screen_tile`, and CPU remains the reference path.
+- Added the future native C ABI scaffold in `native/imgkey_gpu/` plus matching ctypes structs/status/capability validation and fake native backend/C ABI smoke tests for bad dtype, shape, stride, version, and null-like inputs before unsafe calls.
+- Extended `python -m gpu_runtime --probe --json` with `backend_registry` and `native_toolchain` sections. Local toolchain probe finds MSVC Build Tools, Windows SDK D3D12/DXGI headers/libs, DXC/FXC, and dumpbin; Vulkan probe remains disabled until its phase.
+- One-EXE merge is deferred: no D3D12/Vulkan backend binary, size, dependency, or fallback evidence exists yet, so `ImgKey.spec`/`ImgKey-GPU.spec` remain unchanged and packaging archive/sanitized-PATH checks were not required in this phase.
+- Required Phase 4 verification passed locally: smoke, GPU parity, GPU benchmark, perf baseline generation, runtime probe, py_compile/import, no-heavy-runtime startup guard, and `git diff --check` after plan cleanup.
 
 ---
 
@@ -434,7 +442,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P5.1 - D3D12 identity backend
 - Implement D3D12 device selection, adapter probe, context lifecycle, command queue/list/fence, descriptor/root signature/PSO setup.
@@ -688,4 +696,4 @@ Current:
 
 ## 6) Immediate next step
 
-Proceed to Phase 3 with `deep-worker`: split `app.py` UI/controller responsibilities without UX change. Do not begin backend abstraction or D3D12/Vulkan implementation until the UI/controller refactor is complete and verified.
+Proceed to Phase 5 with `deep-worker`: implement the D3D12 compute MVP behind the Phase 4 backend-neutral ABI. Do not begin Vulkan until the D3D12 gate passes.

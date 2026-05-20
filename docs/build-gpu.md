@@ -78,3 +78,31 @@ Test generated EXEs on a clean Windows x64 target with an NVIDIA driver only: no
 1. `ImgKey.exe` opens and passes a manual import/export smoke path without torch files.
 2. `ImgKey-GPU.exe --gpu-probe --json` reports compact CUDA DLL availability or a clear driver/runtime error, with extraction splash/progress visible during onefile startup.
 3. Confirm `build/`, `dist/`, wheels, caches, and `.artifact/` outputs remain ignored and are not committed.
+
+## Phase 4 native backend gate
+
+`gpu_backend.py` now owns the backend-neutral Python protocol and wraps the
+existing compact CUDA DLL as the `cuda_compat` backend. `native/imgkey_gpu/`
+defines the future C ABI contract for D3D12/Vulkan backends, but no D3D12 or
+Vulkan shader backend is implemented yet.
+
+Run the gate report with:
+
+```powershell
+python -m gpu_runtime --probe --json
+```
+
+The JSON includes:
+
+- `backend_registry.backends` and `backend_registry.selected_backend`;
+- `native_toolchain.components.msvc` for MSVC Build Tools;
+- `native_toolchain.components.windows_sdk` for Windows SDK DirectX headers/libs;
+- `native_toolchain.components.shader_compilers` for DXC/FXC build-time shader compilers;
+- `native_toolchain.components.vulkan` only as a disabled-by-default future gate;
+- `native_toolchain.components.dependency_audit` for `dumpbin` or `llvm-objdump`;
+- `native_toolchain.packaging_decision` for the one-EXE merge gate.
+
+Current decision: one-EXE CPU/GPU merging is **deferred**. Keep `ImgKey.exe` as
+the lightweight default build and `ImgKey-GPU.exe` as the optional compact CUDA
+flavor until D3D12/Vulkan backend binaries, size measurements, dependency audit,
+and clean fallback evidence satisfy the release gates.

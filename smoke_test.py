@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+import ctypes
 from dataclasses import asdict, dataclass, replace
 import gc
 import hashlib
@@ -3031,6 +3032,9 @@ def run_gpu_runtime_probe_tests() -> None:
     assert missing_probe["available"] is False
     assert missing_probe["reason"] == "cuda_dll_unavailable"
     assert missing_probe["backend"]["id"] == "compact_cuda_dll"
+    assert missing_probe["backend_registry"]["backends"][0]["id"] == "cuda_compat"
+    assert missing_probe["backend_registry"]["backends"][0]["legacy_backend"]["id"] == "compact_cuda_dll"
+    assert missing_probe["backend_registry"]["selected_backend"]["status"] == "unavailable"
     assert missing_probe["cuda_dll"]["available"] is False
     assert missing_probe["cuda_dll"]["load_success"] is False
     assert missing_probe["cuda"]["is_available"] is False
@@ -3061,12 +3065,16 @@ def run_gpu_runtime_probe_tests() -> None:
     assert dll_probe["cuda"]["is_available"] is True
     assert dll_probe["cuda"]["device_name"] == "NVIDIA Test GPU"
     assert dll_probe["cuda"]["device_capability"] == [12, 0]
+    assert dll_probe["backend_registry"]["selected_backend"]["backend"] == "cuda_compat"
+    assert dll_probe["backend_registry"]["selected_backend"]["status"] == "selected"
+    assert "rgb_only" in dll_probe["backend_registry"]["selected_backend"]["capabilities"]
     assert dll_probe["transition_repair_smoke"]["ran"] is False
 
     for probe in (missing_probe, dll_probe):
         round_tripped = json.loads(json.dumps(probe))
-        for key in ("schema_version", "status", "message", "backend", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke"):
+        for key in ("schema_version", "status", "message", "backend", "backend_registry", "cuda_dll", "cuda", "nvidia_smi", "transition_repair_smoke", "native_toolchain"):
             assert key in round_tripped, f"gpu runtime probe JSON missing {key}"
+        assert round_tripped["native_toolchain"]["packaging_decision"]["status"] == "deferred"
         assert "torch" not in round_tripped, "compact DLL runtime probe must not expose a torch probe section"
 
     after_probe = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
@@ -3215,8 +3223,103 @@ def run_gpu_accel_backend_tests() -> None:
     assert after_tests == before, f"fake gpu_accel tests must not import heavy runtimes: {after_tests - before}"
 
 
+def run_gpu_backend_registry_tests() -> None:
+    before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    gpu_backend = importlib.import_module("gpu_backend")
+    after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_import == before, f"importing gpu_backend must not import heavy runtimes: {after_import - before}"
+
+    fake = gpu_backend.FakeNativeBackend(capabilities={"constant_screen", "rgb_only", "screen_tile"})
+    probed = gpu_backend.probe_backends(backends=[fake], include_cpu=True)
+    assert [item["id"] for item in probed] == ["fake_native", "cpu_fallback"]
+    assert {"constant_screen", "rgb_only", "screen_tile"}.issubset(set(probed[0]["capabilities"]))
+    selected = gpu_backend.select_backend("Auto", {"constant_screen", "rgb_only"}, backends=[fake], probed_backends=probed)
+    assert selected.backend is fake and selected.status == "selected"
+    assert selected.as_dict()["backend"] == "fake_native"
+    off = gpu_backend.select_backend("Off", {"rgb_only"}, backends=[fake])
+    assert off.status == "off" and off.reason == "gpu_off"
+    constant_only = gpu_backend.FakeNativeBackend(capabilities={"constant_screen", "rgb_only"})
+    no_screen_tile = gpu_backend.select_backend("Auto", {"screen_tile"}, backends=[constant_only])
+    assert no_screen_tile.status == "unavailable" and no_screen_tile.backend is None
+
+    rgb, alpha_u8, background_mask, edge_mask, probability, fringe, foreground, nearest_valid, key_color, settings = _gpu_transition_tile((32, 48))
+    session = gpu_backend.begin_render(
+        settings,
+        rgb.shape,
+        mode="Auto",
+        required_capabilities={"constant_screen", "rgb_only"},
+        backends=[fake],
+    )
+    fake_result = session.process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+    )
+    session.end_render()
+    assert fake_result["used"] is True and fake_result["backend"] == "fake_native"
+    assert np.array_equal(fake_result["rgb"][alpha_u8 > 0], rgb[alpha_u8 > 0])
+    assert np.count_nonzero(fake_result["repair_mask"]) == 0
+
+    call = gpu_backend.validate_native_color_tile_inputs(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        settings,
+    )
+    assert call.params.struct_size == ctypes.sizeof(gpu_backend.ImgKeyNativeColorTileParamsV1)
+    assert call.buffers["rgb"].row_stride_bytes == rgb.strides[0]
+    fake_abi = gpu_backend.FakeNativeCAbi()
+    assert fake_abi.process_color_tile_v1(call.params, rgb=call.buffers["rgb"], alpha=call.buffers["alpha"]) == gpu_backend.IMGKEY_GPU_OK
+
+    invalid_calls = [
+        ("bad rgb dtype", lambda: gpu_backend.validate_native_color_tile_inputs(rgb.astype(np.float32), alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings)),
+        ("bad rgb stride", lambda: gpu_backend.validate_native_color_tile_inputs(rgb[:, ::-1, :], alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground[:, ::-1, :], nearest_valid[:, ::-1], key_color, settings)),
+        ("bad mask shape", lambda: gpu_backend.validate_native_color_tile_inputs(rgb, alpha_u8[:-1], background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings)),
+        ("null foreground", lambda: gpu_backend.validate_native_color_tile_inputs(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, None, nearest_valid, key_color, settings)),
+    ]
+    for label, call_invalid in invalid_calls:
+        try:
+            call_invalid()
+        except gpu_backend.NativeAbiError:
+            pass
+        else:  # pragma: no cover - guard failure path
+            raise AssertionError(f"native ABI validation failed to reject {label}")
+
+    bad_version = gpu_backend.validate_native_color_tile_inputs(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings)
+    bad_version.params.version = 999
+    assert fake_abi.process_color_tile_v1(bad_version.params, rgb=bad_version.buffers["rgb"]) == gpu_backend.IMGKEY_GPU_UNSUPPORTED_VERSION
+    assert "version" in gpu_backend.native_last_error().lower()
+    bad_stride = gpu_backend.validate_native_color_tile_inputs(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings)
+    bad_stride.buffers["rgb"].row_stride_bytes = 0
+    assert fake_abi.process_color_tile_v1(bad_stride.params, rgb=bad_stride.buffers["rgb"]) == gpu_backend.IMGKEY_GPU_INVALID_ARGUMENT
+    assert "stride" in gpu_backend.native_last_error().lower()
+    null_data = gpu_backend.validate_native_color_tile_inputs(rgb, alpha_u8, background_mask, edge_mask, probability, fringe, None, foreground, nearest_valid, key_color, settings)
+    null_data.buffers["rgb"].data = None
+    assert fake_abi.process_color_tile_v1(null_data.params, rgb=null_data.buffers["rgb"]) == gpu_backend.IMGKEY_GPU_INVALID_ARGUMENT
+    assert "null" in gpu_backend.native_last_error().lower()
+
+    after_tests = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
+    assert after_tests == before, f"gpu_backend registry/ABI tests must not import heavy runtimes: {after_tests - before}"
+
+
 def run_gpu_parity_tests() -> None:
     gpu_accel = importlib.import_module("gpu_accel")
+    gpu_backend = importlib.import_module("gpu_backend")
     availability = gpu_accel.is_available(refresh=True)
     if not availability.get("available"):
         print(f"gpu parity skipped: {availability.get('reason')} - {availability.get('message')}")
@@ -3258,6 +3361,30 @@ def run_gpu_parity_tests() -> None:
     max_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - gpu_mask.astype(np.int16))))
     assert max_rgb_diff <= 2, f"GPU transition RGB parity max diff too high: {max_rgb_diff}"
     assert max_mask_diff <= 2, f"GPU transition mask parity max diff too high: {max_mask_diff}"
+
+    backend_session = gpu_backend.begin_render(replace(settings, gpu_acceleration="Force GPU"), rgb.shape, required_capabilities={"constant_screen", "rgb_only"})
+    backend_gpu = backend_session.process_color_tile(
+        rgb,
+        alpha_u8,
+        background_mask,
+        edge_mask,
+        probability,
+        fringe,
+        None,
+        foreground,
+        nearest_valid,
+        key_color,
+        replace(settings, gpu_acceleration="Force GPU"),
+    )
+    backend_session.end_render()
+    assert backend_gpu["used"] is True, f"CUDA compat backend expected use, got {backend_gpu.get('reason')}: {backend_gpu.get('message')}"
+    backend_rgb = backend_gpu["rgb"]
+    backend_mask = backend_gpu["repair_mask"]
+    assert backend_rgb is not None and backend_mask is not None
+    max_backend_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - backend_rgb.astype(np.int16))))
+    max_backend_mask_diff = int(np.max(np.abs(cpu_mask.astype(np.int16) - backend_mask.astype(np.int16))))
+    assert max_backend_rgb_diff <= 2, f"CUDA compat backend RGB parity max diff too high: {max_backend_rgb_diff}"
+    assert max_backend_mask_diff <= 2, f"CUDA compat backend mask parity max diff too high: {max_backend_mask_diff}"
 
     dll_rgb, dll_mask = gpu_accel.transition_repair_dll_v1(rgb, alpha_u8, transition_strength, foreground, foreground_valid_u8, key_color, settings)
     max_direct_rgb_diff = int(np.max(np.abs(cpu_rgb.astype(np.int16) - dll_rgb.astype(np.int16))))
@@ -3332,7 +3459,8 @@ def run_gpu_parity_tests() -> None:
     print(
         "gpu parity ok "
         f"device={availability.get('device')} max_rgb_diff={max_rgb_diff} "
-        f"max_mask_diff={max_mask_diff} max_direct_rgb_diff={max_direct_rgb_diff}"
+        f"max_mask_diff={max_mask_diff} max_direct_rgb_diff={max_direct_rgb_diff} "
+        f"max_backend_rgb_diff={max_backend_rgb_diff}"
     )
 
 
@@ -5571,8 +5699,10 @@ def run_import_compile_tests() -> None:
         Path("app.py"),
         Path("keyer.py"),
         Path("smoke_test.py"),
+        Path("gpu_backend.py"),
         Path("gpu_accel.py"),
         Path("gpu_runtime.py"),
+        Path("native_toolchain.py"),
         Path("screen_analysis.py"),
     ]
     engine_dir = Path("imgkey_engine")
@@ -5585,8 +5715,10 @@ def run_import_compile_tests() -> None:
         py_compile.compile(source, doraise=True)
     importlib.import_module("app")
     importlib.import_module("keyer")
+    importlib.import_module("gpu_backend")
     importlib.import_module("gpu_accel")
     importlib.import_module("gpu_runtime")
+    importlib.import_module("native_toolchain")
 
 
 def run_removed_surface_tests() -> None:
@@ -5688,8 +5820,10 @@ def run_source_surface_guard() -> None:
         Path("smoke_test.py"),
         Path("README.md"),
         Path("AGENTS.md"),
+        Path("gpu_backend.py"),
         Path("gpu_accel.py"),
         Path("gpu_runtime.py"),
+        Path("native_toolchain.py"),
         Path("screen_analysis.py"),
         Path("ImgKey.spec"),
         Path("ImgKey-GPU.spec"),
@@ -5768,6 +5902,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase6_tile_local_nearest_inner_tests()
     run_gpu_runtime_probe_tests()
     run_gpu_accel_backend_tests()
+    run_gpu_backend_registry_tests()
     run_app_ui_tests()
     run_v6_screen_analysis_tests()
     run_geometric_benchmark_gate_tests()

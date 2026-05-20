@@ -120,10 +120,12 @@ def json_object_from_text(text: str) -> dict | None:
 def format_gpu_probe_summary(result: dict) -> str:
     status = result.get("status", "unknown")
     message = str(result.get("message") or "")
+    selected = ((result.get("backend_registry") or {}).get("selected_backend") or {}).get("backend")
     cuda_dll = result.get("cuda_dll") or {}
     device = (result.get("cuda") or {}).get("device_name") or cuda_dll.get("device")
     if device:
-        return f"{status} · {device}. {message}"
+        suffix = f" · {selected}" if selected else ""
+        return f"{status}{suffix} · {device}. {message}"
     return f"{status}. {message}"
 
 
@@ -133,14 +135,20 @@ def format_gpu_probe_details(result: dict) -> str:
     cuda = result.get("cuda") or {}
     smi = result.get("nvidia_smi") or {}
     smoke = result.get("transition_repair_smoke") or {}
+    registry = result.get("backend_registry") or {}
+    selected = registry.get("selected_backend") or {}
+    toolchain = result.get("native_toolchain") or {}
+    decision = toolchain.get("packaging_decision") or {}
     return "\n".join(
         (
             f"GPU runtime: {result.get('status', 'unknown')} - {result.get('message', '')}",
             f"Backend: {backend.get('name', 'compact CUDA DLL')} ({backend.get('id', 'compact_cuda_dll')})",
+            f"Backend registry: selected={selected.get('backend')} status={selected.get('status')} available={selected.get('available')} backends={len(registry.get('backends') or [])}",
             f"CUDA DLL: available={cuda_dll.get('available')} version={cuda_dll.get('version')} devices={cuda_dll.get('device_count')} path={cuda_dll.get('dll_path')}",
             f"CUDA device: available={cuda.get('is_available')} device_count={cuda.get('device_count')} device={cuda.get('device_name')} capability={cuda.get('device_capability')}",
             f"nvidia-smi: available={smi.get('available')} driver={smi.get('driver_version')} cuda={smi.get('cuda_version')}",
             f"transition repair smoke: ran={smoke.get('ran')} ok={smoke.get('ok')} max_rgb_diff={smoke.get('max_rgb_diff')} error={smoke.get('error')}",
+            f"native toolchain: status={toolchain.get('status')} one-EXE={decision.get('status')} approved={decision.get('approved')}",
         )
     )
 

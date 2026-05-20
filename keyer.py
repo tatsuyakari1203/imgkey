@@ -421,6 +421,14 @@ def _render_tiled_rgba(
     if crop is not None:
         tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
     total = max(1, len(tiles))
+    gpu_session = None
+    if _gpu_acceleration_mode(settings) != "Off":
+        try:
+            import gpu_backend
+
+            gpu_session = gpu_backend.begin_render(settings, (h, w), required_capabilities={"rgb_only"})
+        except Exception:
+            gpu_session = None
     for index, tile in enumerate(tiles, start=1):
         _raise_if_cancelled(cancel_callback)
         read_y, read_x, core_y, core_x = tile
@@ -533,11 +541,17 @@ def _render_tiled_rgba(
             transition_nearest_rgb=transition_inner_rgb,
             transition_nearest_valid=transition_inner_valid,
             gpu_stats=gpu_stats,
+            gpu_session=gpu_session,
         )
         rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
         if despill_mask is not None:
             despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
         _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
+    if gpu_session is not None:
+        try:
+            gpu_session.end_render()
+        except Exception:
+            pass
     rgba[alpha_out <= 0, :3] = 0
     return rgba, despill_mask
 

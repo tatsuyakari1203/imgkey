@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
+import gpu_backend
+
 from .color_math import (
     _clip01,
     _compute_key_spill_strength,
@@ -269,6 +271,7 @@ def _process_color_tile(
     transition_nearest_rgb: np.ndarray | None = None,
     transition_nearest_valid: np.ndarray | None = None,
     gpu_stats: dict | None = None,
+    gpu_session=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
     alpha = alpha_u8.astype(np.float32) / 255.0
@@ -332,9 +335,7 @@ def _process_color_tile(
         if gpu_mode != "Off" and _transition_reference_enabled(settings):
             gpu_result: dict
             try:
-                import gpu_accel
-
-                gpu_result = gpu_accel.process_color_tile_gpu(
+                gpu_result = gpu_backend.process_color_tile(
                     rgb_tile,
                     alpha_u8,
                     background_mask,
@@ -346,14 +347,15 @@ def _process_color_tile(
                     repair_nearest_valid,
                     screen_color,
                     settings,
-                    force_gpu=gpu_mode == "Force GPU",
+                    session=gpu_session,
+                    required_capabilities={"rgb_only"},
                 )
             except Exception as exc:  # pragma: no cover - defensive backend boundary
                 gpu_result = {
                     "ok": False,
                     "used": False,
-                    "backend": "compact_cuda_dll",
-                    "backend_name": "compact CUDA DLL",
+                    "backend": "gpu_backend",
+                    "backend_name": "GPU backend registry",
                     "reason": "gpu_exception",
                     "message": f"GPU transition repair failed before launch; CPU fallback is required: {type(exc).__name__}: {exc}",
                     "elapsed_ms": None,
@@ -362,8 +364,8 @@ def _process_color_tile(
             if gpu_result.get("used") and isinstance(gpu_result.get("rgb"), np.ndarray) and isinstance(gpu_result.get("repair_mask"), np.ndarray):
                 transition_rgb = gpu_result["rgb"]
                 transition_mask = gpu_result["repair_mask"]
-            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"cuda_dll_unavailable", "cuda_dll_probe_failed", "cuda_no_device", "cuda_unavailable", "cuda_execution_failed", "gpu_exception"}:
-                raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but the CUDA backend is unavailable."))
+            elif gpu_mode == "Force GPU" and gpu_result.get("reason") in {"cuda_dll_unavailable", "cuda_dll_probe_failed", "cuda_no_device", "cuda_unavailable", "cuda_execution_failed", "backend_unavailable", "backend_probe_failed", "backend_execution_failed", "gpu_exception"}:
+                raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but no compatible GPU backend is available."))
 
         if transition_rgb is None or transition_mask is None:
             transition_rgb, transition_mask = _repair_transition_unmix(

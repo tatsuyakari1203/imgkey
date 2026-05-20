@@ -499,7 +499,7 @@ class MainWindow(QMainWindow):
         self.gpu_acceleration.addItems(GPU_ACCELERATION_MODES)
         gpu_default = str(getattr(self.settings, "gpu_acceleration", "Off") or "Off")
         self.gpu_acceleration.setCurrentText(gpu_default if gpu_default in GPU_ACCELERATION_MODES else "Off")
-        self.gpu_acceleration.setToolTip("Optional compact CUDA DLL acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
+        self.gpu_acceleration.setToolTip("Optional native GPU backend acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
         self.gpu_acceleration.currentTextChanged.connect(self._on_gpu_acceleration_changed)
         layout.addLayout(label_row("GPU Acceleration", self.gpu_acceleration))
 
@@ -1039,7 +1039,7 @@ class MainWindow(QMainWindow):
             if mode == "Off":
                 text = "GPU Status: acceleration off; CPU path used."
             else:
-                text = f"GPU Status: {mode}; waiting for next preview/export. Use GPU Status to probe the compact CUDA DLL runtime."
+                text = f"GPU Status: {mode}; waiting for next preview/export. Use GPU Status to probe native GPU backends."
             self.gpu_probe_status.setText(text)
             return
         status = str(info.get("status") or "unknown")
