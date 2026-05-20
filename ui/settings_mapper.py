@@ -43,7 +43,7 @@ APP_DEFAULT_SETTINGS = KeySettings(
     foreground_reference_pull=0.75,
     screen_cleanup_strength=1.00,
     screen_cleanup_similarity=8,
-    gpu_acceleration="Off",
+    gpu_acceleration="Auto",
 )
 
 
@@ -94,7 +94,7 @@ def current_settings_from_window(window) -> KeySettings:
             else 0.0
         ),
         screen_cleanup_similarity=APP_DEFAULT_SETTINGS.screen_cleanup_similarity,
-        gpu_acceleration=window.gpu_acceleration.currentText() if hasattr(window, "gpu_acceleration") else "Off",
+        gpu_acceleration=window.gpu_acceleration.currentText() if hasattr(window, "gpu_acceleration") else APP_DEFAULT_SETTINGS.gpu_acceleration,
         luminance_protect=float(window.luminance_restore.value()),
         preview_scale=float(window.current_display_scale),
         use_tiling=True,

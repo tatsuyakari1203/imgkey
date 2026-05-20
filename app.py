@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
         self.gpu_acceleration = QComboBox()
         self.gpu_acceleration.setObjectName("GPUAccelerationCombo")
         self.gpu_acceleration.addItems(GPU_ACCELERATION_MODES)
-        gpu_default = str(getattr(self.settings, "gpu_acceleration", "Off") or "Off")
+        gpu_default = str(getattr(self.settings, "gpu_acceleration", APP_DEFAULT_SETTINGS.gpu_acceleration) or APP_DEFAULT_SETTINGS.gpu_acceleration)
         self.gpu_acceleration.setCurrentText(gpu_default if gpu_default in GPU_ACCELERATION_MODES else "Off")
         self.gpu_acceleration.setToolTip("Optional native GPU backend acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
         self.gpu_acceleration.currentTextChanged.connect(self._on_gpu_acceleration_changed)
@@ -508,7 +508,11 @@ class MainWindow(QMainWindow):
         self.gpu_status_btn.clicked.connect(self.show_gpu_status)
         layout.addWidget(self.gpu_status_btn)
 
-        self.gpu_probe_status = QLabel("GPU Status: acceleration off; CPU path used.")
+        if self.gpu_acceleration.currentText() == "Off":
+            gpu_status_text = "GPU Status: acceleration off; CPU path used."
+        else:
+            gpu_status_text = f"GPU Status: {self.gpu_acceleration.currentText()}; waiting for next preview/export. Use GPU Status to probe native GPU backends."
+        self.gpu_probe_status = QLabel(gpu_status_text)
         self.gpu_probe_status.setObjectName("HintText")
         self.gpu_probe_status.setWordWrap(True)
         layout.addWidget(self.gpu_probe_status)
@@ -1194,6 +1198,11 @@ class MainWindow(QMainWindow):
             self.policy.blockSignals(True)
             self.policy.setCurrentText("Aggressive Interior Removal")
             self.policy.blockSignals(False)
+            self.gpu_acceleration.blockSignals(True)
+            gpu_default = str(APP_DEFAULT_SETTINGS.gpu_acceleration or "Off")
+            self.gpu_acceleration.setCurrentText(gpu_default if gpu_default in GPU_ACCELERATION_MODES else "Off")
+            self.gpu_acceleration.blockSignals(False)
+            self._sync_gpu_usage_status()
             self.pick_action.setChecked(False)
             self.set_key_color(APP_DEFAULT_SETTINGS.key_color, refresh=False)
         self.statusBar().showMessage(f"Preset {name} applied")
