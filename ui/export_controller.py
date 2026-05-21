@@ -6,6 +6,7 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from imgkey_engine.cache import ProcessCache, ProcessCacheContext, ProcessCacheTransaction
 from keyer import KeySettings, process_key_image, write_png_rgba
 
 
@@ -23,6 +24,8 @@ class ExportThread(QThread):
         keep_mask: np.ndarray | None,
         remove_mask: np.ndarray | None,
         alpha_hint: np.ndarray | None,
+        process_cache: ProcessCache | None = None,
+        cache_context: ProcessCacheContext | None = None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -32,13 +35,18 @@ class ExportThread(QThread):
         self.keep_mask = keep_mask
         self.remove_mask = remove_mask
         self.alpha_hint = alpha_hint
+        self.process_cache = process_cache
+        self.cache_context = cache_context
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
 
     def run(self) -> None:
+        cache_transaction: ProcessCacheTransaction | None = None
         try:
+            if self.process_cache is not None and self.cache_context is not None:
+                cache_transaction = self.process_cache.begin(self.cache_context)
             result = process_key_image(
                 self.rgb,
                 self.settings,
@@ -49,12 +57,23 @@ class ExportThread(QThread):
                 progress_callback=lambda value, stage: self.progress.emit(value, stage),
                 cancel_callback=lambda: self._cancel_requested,
                 include_debug=False,
+                cache_transaction=cache_transaction,
             )
             if self._cancel_requested:
+                if cache_transaction is not None:
+                    cache_transaction.discard()
                 raise RuntimeError("Processing cancelled")
             write_png_rgba(self.path, result.rgba)
+            if self._cancel_requested:
+                if cache_transaction is not None:
+                    cache_transaction.discard()
+                raise RuntimeError("Processing cancelled")
+            if cache_transaction is not None:
+                cache_transaction.commit()
             self.done.emit(self.path)
         except Exception as exc:  # pragma: no cover - UI boundary
+            if cache_transaction is not None:
+                cache_transaction.discard()
             self.failed.emit(str(exc))
 
 
@@ -92,6 +111,8 @@ class ExportController:
             owner.keep_mask,
             owner.remove_mask,
             alpha_hint,
+            getattr(owner, "process_cache", None),
+            owner._cache_context("full", owner.full_rgb.shape[:2]) if hasattr(owner, "_cache_context") else None,
         )
         owner.export_thread.progress.connect(owner.on_export_progress)
         owner.export_thread.done.connect(owner.on_export_done)

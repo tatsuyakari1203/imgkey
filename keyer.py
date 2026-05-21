@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
 
+from imgkey_engine.cache import (
+    BaseMatteRecord,
+    ProcessCache,
+    ProcessCacheContext,
+    ProcessCacheTransaction,
+    ReferencePrepRecord,
+    TransitionAlphaRecord,
+    mutable_result_copy,
+    readonly_array,
+)
+from imgkey_engine.cache_keys import (
+    reference_prep_cache_fingerprint,
+    runtime_base_matte_cache_fingerprint,
+    transition_alpha_cache_fingerprint,
+)
 from imgkey_engine.color_math import (
     _LINEAR_LUMA_WEIGHTS,
     _clip01,
@@ -57,7 +74,7 @@ from imgkey_engine.matte import (
     _refine_alpha_guided,
     _remove_small_components,
 )
-from imgkey_engine.profiling import record_count, time_block
+from imgkey_engine.profiling import record_count, record_metadata, time_block
 from imgkey_engine.references import (
     _bool_mask_or_empty,
     _bounded_tile_local_nearest_inner_radius,
@@ -159,6 +176,9 @@ def process_key_image(
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
     include_debug: bool = True,
+    process_cache: ProcessCache | None = None,
+    cache_context: ProcessCacheContext | None = None,
+    cache_transaction: ProcessCacheTransaction | None = None,
 ) -> KeyResult:
     """Run the v2 classical keying engine and return debug outputs.
 
@@ -181,65 +201,256 @@ def process_key_image(
     if settings.mode not in {"GraphicExact", "ProChroma", "ImportedMatte"}:
         raise ValueError(f"Unsupported keying mode: {settings.mode}")
 
-    _raise_if_cancelled(cancel_callback)
-    with time_block("global_matte.total"):
-        global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, progress_callback, cancel_callback)
-    _report(progress_callback, 0.18, "global matte")
-    _raise_if_cancelled(cancel_callback)
-
-    crop = _normalized_crop(settings.full_res_crop, w, h)
-    gpu_stats = _new_gpu_stats(settings)
-    with time_block("render.tiled_rgba_total"):
-        rgba, despill_mask = _render_tiled_rgba(
+    transaction, auto_commit = _prepare_cache_transaction(process_cache, cache_context, cache_transaction)
+    try:
+        _raise_if_cancelled(cancel_callback)
+        global_matte = _build_global_matte_with_cache(
             rgb,
             settings,
-            global_matte,
+            original_alpha,
+            keep,
+            remove,
+            hint,
             progress_callback,
             cancel_callback,
-            render_crop=crop,
-            include_debug=include_debug,
-            gpu_stats=gpu_stats,
+            transaction,
         )
-    with time_block("result.debug_output_conversion"):
-        if include_debug:
-            foreground = rgba[:, :, :3].copy()
-            if crop is not None:
-                x0, y0, x1, y1 = crop
-                alpha = global_matte.alpha[y0:y1, x0:x1].copy()
-                background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-                edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-                fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
-                probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
-                hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
+        _raise_if_cancelled(cancel_callback)
+
+        crop = _normalized_crop(settings.full_res_crop, w, h)
+        gpu_stats = _new_gpu_stats(settings)
+        with time_block("render.tiled_rgba_total"):
+            rgba, despill_mask = _render_tiled_rgba(
+                rgb,
+                settings,
+                global_matte,
+                progress_callback,
+                cancel_callback,
+                render_crop=crop,
+                include_debug=include_debug,
+                gpu_stats=gpu_stats,
+            )
+        cache_info = _cache_info_dict(transaction)
+        if cache_info is not None:
+            record_metadata("cache", cache_info)
+        with time_block("result.debug_output_conversion"):
+            if include_debug:
+                foreground = rgba[:, :, :3].copy()
+                if crop is not None:
+                    x0, y0, x1, y1 = crop
+                    alpha = mutable_result_copy(global_matte.alpha[y0:y1, x0:x1])
+                    background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+                    edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+                    fringe_mask = mutable_result_copy(global_matte.fringe_mask[y0:y1, x0:x1])
+                    probability = mutable_result_copy(global_matte.screen_probability[y0:y1, x0:x1])
+                    hint_out = None if global_matte.alpha_hint is None else mutable_result_copy(global_matte.alpha_hint[y0:y1, x0:x1])
+                else:
+                    alpha = mutable_result_copy(global_matte.alpha)
+                    background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
+                    edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
+                    fringe_mask = mutable_result_copy(global_matte.fringe_mask)
+                    probability = mutable_result_copy(global_matte.screen_probability)
+                    hint_out = None if global_matte.alpha_hint is None else mutable_result_copy(global_matte.alpha_hint)
             else:
-                alpha = global_matte.alpha
-                background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
-                edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
-                fringe_mask = global_matte.fringe_mask
-                probability = global_matte.screen_probability
-                hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint.copy()
-        else:
-            foreground = None
-            alpha = rgba[:, :, 3]
-            background_mask = None
-            edge_mask = None
-            fringe_mask = None
-            probability = None
-            hint_out = None
-    return KeyResult(
-        rgba=rgba,
-        alpha=alpha,
-        foreground=foreground,
-        background_mask=background_mask,
-        edge_mask=edge_mask,
-        despill_mask=despill_mask,
-        preview_scale=float(settings.preview_scale),
-        screen_probability=probability,
-        screen_color=global_matte.screen_color,
-        alpha_hint=hint_out,
-        fringe_mask=fringe_mask,
-        gpu_acceleration=_finalize_gpu_stats(settings, gpu_stats),
+                foreground = None
+                alpha = rgba[:, :, 3]
+                background_mask = None
+                edge_mask = None
+                fringe_mask = None
+                probability = None
+                hint_out = None
+        result = KeyResult(
+            rgba=rgba,
+            alpha=alpha,
+            foreground=foreground,
+            background_mask=background_mask,
+            edge_mask=edge_mask,
+            despill_mask=despill_mask,
+            preview_scale=float(settings.preview_scale),
+            screen_probability=probability,
+            screen_color=global_matte.screen_color,
+            alpha_hint=hint_out,
+            fringe_mask=fringe_mask,
+            gpu_acceleration=_finalize_gpu_stats(settings, gpu_stats),
+            cache_info=cache_info,
+        )
+        if auto_commit and transaction is not None:
+            transaction.commit()
+            result.cache_info = transaction.info.as_dict()
+            record_metadata("cache", result.cache_info)
+        return result
+    except Exception:
+        if auto_commit and transaction is not None:
+            transaction.discard()
+        raise
+
+
+def _prepare_cache_transaction(
+    process_cache: ProcessCache | None,
+    cache_context: ProcessCacheContext | None,
+    cache_transaction: ProcessCacheTransaction | None,
+) -> tuple[ProcessCacheTransaction | None, bool]:
+    if cache_transaction is not None:
+        return cache_transaction, False
+    if process_cache is None or cache_context is None:
+        return None, False
+    return process_cache.begin(cache_context), True
+
+
+def _cache_info_dict(transaction: ProcessCacheTransaction | None) -> dict | None:
+    if transaction is None:
+        return None
+    return transaction.info.as_dict()
+
+
+def _build_global_matte_with_cache(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    original_alpha: np.ndarray | None,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    alpha_hint: np.ndarray | None,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    transaction: ProcessCacheTransaction | None,
+) -> _GlobalMatte:
+    h, w = rgb.shape[:2]
+    if transaction is None:
+        with time_block("global_matte.total"):
+            matte = _build_global_matte(rgb, settings, original_alpha, keep_mask, remove_mask, alpha_hint, progress_callback, cancel_callback)
+        _report(progress_callback, 0.18, "global matte")
+        return matte
+
+    context_shape = transaction.context.shape
+    if context_shape is not None and context_shape != (h, w):
+        transaction.info.base_matte = "disabled"
+        transaction.info.reference_prep = "disabled"
+        transaction.info.transition_alpha = "disabled"
+        transaction.info.cache_hit = False
+        transaction.info.cache_miss_reason = "context_shape_mismatch"
+        with time_block("global_matte.total"):
+            matte = _build_global_matte(rgb, settings, original_alpha, keep_mask, remove_mask, alpha_hint, progress_callback, cancel_callback)
+        _report(progress_callback, 0.18, "global matte (cache context mismatch)")
+        return matte
+
+    transaction.remember_source(original_alpha is not None)
+    source_key = transaction.context.source_key
+    mask_key = transaction.context.mask_key
+    base_key = runtime_base_matte_cache_fingerprint(settings, source_key, mask_key)
+    reference_key = reference_prep_cache_fingerprint(settings, base_key)
+    transition_key = transition_alpha_cache_fingerprint(settings, base_key, reference_key)
+    transaction.info.details.update(
+        {
+            "base_key": base_key[:16],
+            "reference_key": reference_key[:16],
+            "transition_key": transition_key[:16],
+            "source": transaction.context.source_fingerprint[:16],
+            "mask": transaction.context.mask_fingerprint[:16],
+        }
     )
+
+    base = transaction.get_base(base_key)
+    screen_map_for_reference: np.ndarray | None = None
+    if base is None:
+        transaction.info.base_matte = "miss"
+        transaction.info.reference_prep = "miss"
+        transaction.info.transition_alpha = "miss"
+        transaction.info.cache_hit = False
+        transaction.info.cache_miss_reason = "base_matte_not_found"
+        record_count("cache.base_matte.miss")
+        with time_block("global_matte.total"):
+            base, screen_map_for_reference = _build_base_matte_record(
+                rgb,
+                settings,
+                original_alpha,
+                keep_mask,
+                remove_mask,
+                alpha_hint,
+                progress_callback,
+                cancel_callback,
+                cache_key=base_key,
+                source_fingerprint=transaction.context.source_fingerprint,
+                mask_fingerprint=transaction.context.mask_fingerprint,
+                resolution=transaction.context.resolution,
+            )
+            transaction.stage_base(base)
+            reference = _build_reference_prep_record(
+                rgb,
+                settings,
+                base,
+                progress_callback,
+                cancel_callback,
+                cache_key=reference_key,
+                screen_map=screen_map_for_reference,
+            )
+            transaction.stage_reference(reference)
+            transition = _build_transition_alpha_record(
+                rgb,
+                settings,
+                original_alpha,
+                keep_mask,
+                remove_mask,
+                base,
+                reference,
+                progress_callback,
+                cancel_callback,
+                cache_key=transition_key,
+            )
+            transaction.stage_transition(transition)
+        _report(progress_callback, 0.18, "global matte (cache miss: base matte)")
+        return _compose_global_matte(base, reference, transition)
+
+    transaction.info.base_matte = "hit"
+    record_count("cache.base_matte.hit")
+
+    reference = transaction.get_reference(reference_key)
+    if reference is None:
+        transaction.info.reference_prep = "miss"
+        transaction.info.cache_hit = "base_matte"
+        transaction.info.cache_miss_reason = "reference_prep_not_found"
+        record_count("cache.reference_prep.miss")
+        reference = _build_reference_prep_record(
+            rgb,
+            settings,
+            base,
+            progress_callback,
+            cancel_callback,
+            cache_key=reference_key,
+            screen_map=None,
+        )
+        transaction.stage_reference(reference)
+    else:
+        transaction.info.reference_prep = "hit"
+        record_count("cache.reference_prep.hit")
+
+    transition = transaction.get_transition(transition_key)
+    if transition is None:
+        transaction.info.transition_alpha = "miss"
+        transaction.info.cache_hit = "base_matte" if transaction.info.reference_prep == "hit" else "base_matte_partial"
+        transaction.info.cache_miss_reason = "transition_alpha_not_found"
+        record_count("cache.transition_alpha.miss")
+        transition = _build_transition_alpha_record(
+            rgb,
+            settings,
+            original_alpha,
+            keep_mask,
+            remove_mask,
+            base,
+            reference,
+            progress_callback,
+            cancel_callback,
+            cache_key=transition_key,
+        )
+        transaction.stage_transition(transition)
+        _report(progress_callback, 0.18, "transition alpha (cached base matte)")
+    else:
+        transaction.info.transition_alpha = "hit"
+        transaction.info.cache_hit = "matte"
+        transaction.info.cache_miss_reason = None
+        record_count("cache.transition_alpha.hit")
+        _report(progress_callback, 0.18, "cached matte")
+
+    return _compose_global_matte(base, reference, transition)
 
 
 def _build_global_matte(
@@ -252,6 +463,59 @@ def _build_global_matte(
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
 ) -> _GlobalMatte:
+    base, screen_map = _build_base_matte_record(
+        rgb,
+        settings,
+        original_alpha,
+        keep_mask,
+        remove_mask,
+        alpha_hint,
+        progress_callback,
+        cancel_callback,
+        cache_key="uncached-base",
+        source_fingerprint="uncached-source",
+        mask_fingerprint="uncached-mask",
+        resolution="direct",
+    )
+    reference = _build_reference_prep_record(
+        rgb,
+        settings,
+        base,
+        progress_callback,
+        cancel_callback,
+        cache_key="uncached-reference",
+        screen_map=screen_map,
+    )
+    transition = _build_transition_alpha_record(
+        rgb,
+        settings,
+        original_alpha,
+        keep_mask,
+        remove_mask,
+        base,
+        reference,
+        progress_callback,
+        cancel_callback,
+        cache_key="uncached-transition",
+    )
+    return _compose_global_matte(base, reference, transition)
+
+
+def _build_base_matte_record(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    original_alpha: np.ndarray | None,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    alpha_hint: np.ndarray | None,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    *,
+    cache_key: str,
+    source_fingerprint: str,
+    mask_fingerprint: str,
+    resolution: str,
+) -> tuple[BaseMatteRecord, np.ndarray | None]:
     h, w = rgb.shape[:2]
     with time_block("global_matte.sample_screen"):
         screen_color = _sample_screen_color(rgb, settings)
@@ -355,34 +619,97 @@ def _build_global_matte(
             remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
             background |= remove_effective
             edge_mask[remove_effective] = False
+
+    record = BaseMatteRecord(
+        key=str(cache_key),
+        source_fingerprint=str(source_fingerprint),
+        mask_fingerprint=str(mask_fingerprint),
+        resolution=str(resolution),
+        shape=(int(h), int(w)),
+        screen_color=tuple(int(c) for c in screen_color),
+        screen_probability=readonly_array(probability),
+        background_mask=readonly_array(background.astype(bool, copy=False)),
+        edge_mask=readonly_array(edge_mask.astype(bool, copy=False)),
+        alpha=readonly_array(alpha),
+        alpha_hint=readonly_array(alpha_hint, copy=True),
+    )
+    return record, screen_map
+
+
+def _build_reference_prep_record(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    base: BaseMatteRecord,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    *,
+    cache_key: str,
+    screen_map: np.ndarray | None,
+) -> ReferencePrepRecord:
+    bg_threshold = int(round(_clip01(settings.clip_background) * 255.0))
+    if screen_map is None:
+        with time_block("screen_reference.screen_map_global"):
+            screen_map = _estimate_screen_map(rgb, base.screen_probability >= bg_threshold, base.screen_color, settings)
+        _report(progress_callback, 0.17, "screen model")
+        _raise_if_cancelled(cancel_callback)
     with time_block("global_matte.fringe_map"):
-        fringe_mask = _build_fringe_mask(rgb, alpha, edge_mask, probability, screen_color, settings, progress_callback, cancel_callback)
+        fringe_mask = _build_fringe_mask(rgb, base.alpha, base.edge_mask, base.screen_probability, base.screen_color, settings, progress_callback, cancel_callback)
     _report(progress_callback, 0.175, "fringe map")
     _raise_if_cancelled(cancel_callback)
     with time_block("screen_reference.nearest_inner_global"):
-        inner_labels, inner_label_to_flat, inner_distance = _build_nearest_inner_reference_map(
-            alpha,
-            background,
-            probability,
-            fringe_mask,
+        reference_settings = replace(
             settings,
+            transition_unmix=True,
+            inner_color_pull=max(float(settings.inner_color_pull), 1.0),
+            edge_color_repair=max(float(settings.edge_color_repair), 1.0),
+        )
+        inner_labels, inner_label_to_flat, inner_distance = _build_nearest_inner_reference_map(
+            base.alpha,
+            base.background_mask,
+            base.screen_probability,
+            fringe_mask,
+            reference_settings,
         )
     _report(progress_callback, 0.18, "inner color map")
     _raise_if_cancelled(cancel_callback)
-    color_alpha = alpha.copy() if bool(settings.transition_unmix) and _clip01(settings.alpha_recover_strength) > 0 else None
+    return ReferencePrepRecord(
+        key=str(cache_key),
+        base_key=str(base.key),
+        screen_map=readonly_array(screen_map),
+        fringe_mask=readonly_array(fringe_mask),
+        inner_labels=readonly_array(inner_labels),
+        inner_label_to_flat=readonly_array(inner_label_to_flat),
+        inner_distance=readonly_array(inner_distance),
+    )
+
+
+def _build_transition_alpha_record(
+    rgb: np.ndarray,
+    settings: KeySettings,
+    original_alpha: np.ndarray | None,
+    keep_mask: np.ndarray | None,
+    remove_mask: np.ndarray | None,
+    base: BaseMatteRecord,
+    reference: ReferencePrepRecord,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    *,
+    cache_key: str,
+) -> TransitionAlphaRecord:
+    color_alpha = base.alpha.copy() if bool(settings.transition_unmix) and _clip01(settings.alpha_recover_strength) > 0 else None
     with time_block("transition_alpha.global_recovery"):
         alpha = _recover_transition_alpha_global(
             rgb,
-            alpha,
-            background,
-            edge_mask,
-            probability,
-            fringe_mask,
-            screen_color,
-            screen_map,
-            inner_labels,
-            inner_label_to_flat,
-            inner_distance,
+            base.alpha,
+            base.background_mask,
+            base.edge_mask,
+            base.screen_probability,
+            reference.fringe_mask,
+            base.screen_color,
+            reference.screen_map,
+            reference.inner_labels,
+            reference.inner_label_to_flat,
+            reference.inner_distance,
             settings,
             original_alpha,
             keep_mask,
@@ -391,19 +718,33 @@ def _build_global_matte(
             cancel_callback,
         )
     _report(progress_callback, 0.18, "transition alpha")
+    return TransitionAlphaRecord(
+        key=str(cache_key),
+        base_key=str(base.key),
+        reference_key=str(reference.key),
+        alpha=readonly_array(alpha),
+        color_alpha=readonly_array(color_alpha),
+    )
+
+
+def _compose_global_matte(
+    base: BaseMatteRecord,
+    reference: ReferencePrepRecord,
+    transition: TransitionAlphaRecord,
+) -> _GlobalMatte:
     return _GlobalMatte(
-        screen_color=screen_color,
-        screen_probability=probability,
-        screen_map=screen_map,
-        background_mask=background,
-        edge_mask=edge_mask,
-        alpha=alpha,
-        color_alpha=color_alpha,
-        alpha_hint=alpha_hint,
-        fringe_mask=fringe_mask,
-        inner_labels=inner_labels,
-        inner_label_to_flat=inner_label_to_flat,
-        inner_distance=inner_distance,
+        screen_color=base.screen_color,
+        screen_probability=base.screen_probability,
+        screen_map=reference.screen_map,
+        background_mask=base.background_mask,
+        edge_mask=base.edge_mask,
+        alpha=transition.alpha,
+        color_alpha=transition.color_alpha,
+        alpha_hint=base.alpha_hint,
+        fringe_mask=reference.fringe_mask,
+        inner_labels=reference.inner_labels,
+        inner_label_to_flat=reference.inner_label_to_flat,
+        inner_distance=reference.inner_distance,
     )
 
 

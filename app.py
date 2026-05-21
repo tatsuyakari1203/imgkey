@@ -46,6 +46,8 @@ from keyer import (
     resize_for_preview,
     write_grayscale_mask,
 )
+from imgkey_engine.cache import ProcessCache, ProcessCacheContext, ProcessingGenerations
+from imgkey_engine.cache_keys import mask_generation_key, source_generation_key
 from ui.canvas import (
     BACKGROUND_MODES,
     VIEW_MODES,
@@ -73,6 +75,7 @@ from ui.gpu_probe_controller import (
 from ui.preview_controller import (
     PreviewController,
     PreviewJob,
+    PreviewResult,
     PreviewThread,
     resize_alpha_for_preview,
     resize_alpha_hint_mask,
@@ -182,6 +185,8 @@ class MainWindow(QMainWindow):
         self.keep_mask: np.ndarray | None = None
         self.remove_mask: np.ndarray | None = None
         self.alpha_hint_mask: np.ndarray | None = None
+        self.processing_generations = ProcessingGenerations()
+        self.process_cache = ProcessCache()
         self.last_sample_rgb: tuple[int, int, int] | None = None
         self.last_cursor_rgb: tuple[int, int, int] | None = None
         self.settings = app_default_settings()
@@ -785,6 +790,8 @@ class MainWindow(QMainWindow):
         self.keep_mask = None
         self.remove_mask = None
         self.alpha_hint_mask = None
+        self.processing_generations.bump_source()
+        self.process_cache.clear()
         if hasattr(self, "output_mode"):
             self.output_mode.blockSignals(True)
             self.output_mode.setCurrentText("Classical")
@@ -809,6 +816,36 @@ class MainWindow(QMainWindow):
 
     def current_settings(self) -> KeySettings:
         return current_settings_from_window(self)
+
+    def _image_identity_for_cache(self) -> str:
+        if self.image_path is None:
+            return f"in-memory:{self.processing_generations.source_generation}"
+        try:
+            stat = self.image_path.stat()
+            return f"{self.image_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            return str(self.image_path)
+
+    def _cache_context(self, resolution: str, shape: tuple[int, int]) -> ProcessCacheContext:
+        generations = self.processing_generations
+        proxy_generation = generations.proxy_generation if resolution == "proxy" else 0
+        source_key = source_generation_key(
+            self._image_identity_for_cache(),
+            generations.source_generation,
+            decode_generation=generations.decode_generation,
+            original_alpha_generation=generations.original_alpha_generation,
+            proxy_generation=proxy_generation,
+            resolution=resolution,
+            shape=shape,
+        )
+        mask_key = mask_generation_key(
+            mask_generation=generations.mask_generation,
+            keep_generation=generations.keep_generation,
+            remove_generation=generations.remove_generation,
+            imported_matte_generation=generations.imported_matte_generation,
+            alpha_hint_generation=generations.alpha_hint_generation,
+        )
+        return ProcessCacheContext(source_key=source_key, mask_key=mask_key)
 
     def _processing_alpha_input(self, settings: KeySettings, shape: tuple[int, int]) -> np.ndarray | None:
         return processing_alpha_input(settings, self.alpha_hint_mask, shape)
@@ -879,22 +916,31 @@ class MainWindow(QMainWindow):
         if generation == self._preview_generation:
             self.statusBar().showMessage(f"Preview {int(value * 100):d}% · {stage}")
 
-    def on_preview_done(self, generation: int, result: KeyResult) -> None:
+    def on_preview_done(self, generation: int, result: KeyResult | PreviewResult) -> None:
         job = self._preview_jobs.pop(generation, None)
+        cache_transaction = result.cache_transaction if isinstance(result, PreviewResult) else None
+        key_result = result.result if isinstance(result, PreviewResult) else result
         if generation != self._preview_generation or job is None:
+            if cache_transaction is not None:
+                cache_transaction.discard()
             return
-        self.current_result = result
+        if cache_transaction is not None:
+            cache_transaction.commit()
+            key_result.cache_info = cache_transaction.info.as_dict()
+        self.current_result = key_result
         self._set_current_source(job.display_rgb, job.display_alpha, job.display_scale, job.crop_origin, job.label, reset_view=False)
-        if result.screen_color is not None:
-            self.color_chip.setToolTip(f"Screen sample used by engine: RGB {result.screen_color}")
+        if key_result.screen_color is not None:
+            self.color_chip.setToolTip(f"Screen sample used by engine: RGB {key_result.screen_color}")
             key_rgb = self.settings.key_color
-            self.sample_status.setText(f"Key RGB {key_rgb[0]},{key_rgb[1]},{key_rgb[2]} · engine RGB {result.screen_color[0]},{result.screen_color[1]},{result.screen_color[2]}")
+            self.sample_status.setText(f"Key RGB {key_rgb[0]},{key_rgb[1]},{key_rgb[2]} · engine RGB {key_result.screen_color[0]},{key_result.screen_color[1]},{key_result.screen_color[2]}")
             if self.key_mode.currentText() == "Auto":
-                r, g, b = result.screen_color
+                r, g, b = key_result.screen_color
                 self.color_chip.setStyleSheet(f"background: rgb({r}, {g}, {b});")
-        engine_text = f" · engine RGB {result.screen_color}" if result.screen_color is not None else ""
-        self.statusBar().showMessage(f"Preview ready · {job.label}{engine_text}")
-        self._sync_gpu_usage_status(result.gpu_acceleration)
+        engine_text = f" · engine RGB {key_result.screen_color}" if key_result.screen_color is not None else ""
+        cache = key_result.cache_info or {}
+        cache_text = f" · cache {cache.get('cache_hit')}" if cache.get("cache_hit") else ""
+        self.statusBar().showMessage(f"Preview ready · {job.label}{engine_text}{cache_text}")
+        self._sync_gpu_usage_status(key_result.gpu_acceleration)
         self._update_enabled_state()
 
     def on_preview_failed(self, generation: int, message: str) -> None:
@@ -960,10 +1006,13 @@ class MainWindow(QMainWindow):
             return
         if kind == "keep":
             self.keep_mask = mask
+            self.processing_generations.bump_keep()
             self.statusBar().showMessage(f"Imported keep mask {Path(path).name}")
         else:
             self.remove_mask = mask
+            self.processing_generations.bump_remove()
             self.statusBar().showMessage(f"Imported remove mask {Path(path).name}")
+        self.process_cache.clear()
         self.schedule_preview()
 
     def import_imported_matte(self) -> None:
@@ -982,6 +1031,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Matte import failed", str(exc))
             return
+        self.processing_generations.bump_imported_matte()
+        self.process_cache.clear()
         self.output_mode.setCurrentText("Imported Matte")
         self._sync_imported_matte_status(Path(path).name)
         self._sync_output_mode_status()
@@ -993,6 +1044,8 @@ class MainWindow(QMainWindow):
         if self.alpha_hint_mask is None:
             return
         self.alpha_hint_mask = None
+        self.processing_generations.bump_imported_matte()
+        self.process_cache.clear()
         if self.output_mode.currentText() == "Imported Matte":
             self.output_mode.setCurrentText("Classical")
         self._sync_imported_matte_status()

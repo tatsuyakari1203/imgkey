@@ -123,3 +123,9 @@ def record_count(name: str, amount: int = 1) -> None:
     profiler = active_profiler()
     if profiler is not None:
         profiler.count(name, amount)
+
+
+def record_metadata(name: str, value: Any) -> None:
+    profiler = active_profiler()
+    if profiler is not None:
+        profiler.metadata[str(name)] = value

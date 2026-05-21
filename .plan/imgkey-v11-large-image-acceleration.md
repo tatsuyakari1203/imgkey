@@ -113,6 +113,9 @@ The implementation must define and test all `KeySettings` fields against at leas
 
 If a setting is ambiguous, classify it as matte-affecting until tests prove otherwise.
 
+
+Current:
+- No
 ### Cache contracts
 
 The implementation must keep cache layers separate and immutable to consumers:
@@ -132,6 +135,9 @@ Cache publication rules:
 - Default memory budget target for one active 25MP image is roughly `300-600 MiB` for source + masks/cache metadata, excluding transient tile float buffers and final export RGBA. If a phase exceeds this, it must document measured peak memory and add eviction/release rules.
 - Evict/release old full-resolution cache generations on image change, mask/imported matte change, or conservative settings invalidation.
 
+
+Current:
+- No
 ### Target metrics
 
 Use the three user PNGs plus synthetic baselines:
@@ -141,6 +147,9 @@ Use the three user PNGs plus synthetic baselines:
 - Export target: if preview already computed a valid full matte, export should avoid the `~22-36s` global recompute.
 - Full export fresh target: reduce D3D12 Auto+PNG below current `~33-54s` by optimizing transition/reference/prep and PNG options.
 
+
+Current:
+- No
 ### Required full verification floor
 
 Unless a phase explicitly says targeted-only, final verification must include:
@@ -176,6 +185,9 @@ Scheduling note:
 - Phase 6.2 (`Export progress and cache visibility`) depends on Phase 2 cache metadata; before Phase 2 it may only add generic stage progress, not cache-hit/cache-miss UX.
 - Phase 5 (`Persistent D3D12 large-image batch pipeline`) is conditional/follow-on: do not implement native batch/readback work unless Phase 4/P7 profiling proves color-stage overhead is still a meaningful whole-pipeline bottleneck after cache and CPU-prep improvements.
 
+
+Current:
+- No
 ### Phase 1 - Durable large-image profiler and cache-key classification
 
 Category:
@@ -193,8 +205,6 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
 
 Progress notes:
 - Phase 1 added reusable in-engine profiling hooks plus `python smoke_test.py --profile-large-images <image_dir>`, writing JSON/markdown under `.artifact/large-image-perf/` with load/decode, proxy, global matte, transition alpha, screen/reference prep, D3D12 tile, allocation/composite, PNG, and GUI-adjacent conversion timings.
@@ -226,8 +236,6 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
 
 Progress notes:
 - Implemented `imgkey_engine.profiling.PipelineProfiler` and instrumented keyer/global matte, transition-alpha, tile prep, CPU/D3D12 color, result allocation/composite, and smoke-test load/proxy/PNG/GUI-adjacent stages.
@@ -256,14 +264,10 @@ Verification:
 Status:
 - Completed
 
-Current:
-- No
 
 Progress notes:
 - Implemented `imgkey_engine.cache_keys` with conservative field classification, stable settings/cache fingerprints, and source/mask/imported-matte generation-key payloads.
 - Added smoke regression coverage proving color-only/backend settings preserve matte fingerprints while source/original-alpha generations, key/tolerance/matte fields, imported matte/mask generations, transition-alpha fields, and tile geometry/local-screen caps invalidate the appropriate matte pipeline keys.
-
----
 
 ### Phase 2 - Matte/transition cache split and export reuse
 
@@ -280,10 +284,18 @@ Isolation:
 - Own cache structures and preview/export integration. Preserve existing public `process_key_image` behavior for callers without cache.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress notes:
+- Added `imgkey_engine.cache` with internal source/base matte/reference-prep/transition-alpha/color-render cache records, staged transactions, read-only cached arrays, `ProcessCacheContext`, and UI-owned `ProcessingGenerations` counters.
+- `process_key_image` now accepts optional cache/context/transaction inputs while preserving existing behavior for callers without cache; preview workers stage cache publication and only commit after latest-generation UI acceptance, while cancelled/stale work discards staged records.
+- Full-resolution Full Crop preview and export share full-source matte/transition cache keys; proxy cache keys stay resolution-separated and cannot satisfy full export.
+- Color-only changes reuse matte/transition records and rerun color render only; cache metadata reports `cache_hit` and `cache_miss_reason` through `KeyResult.cache_info` and profiler metadata.
+- Focused smoke tests cover cache contracts, full/proxy boundaries, stale/cancel discard, synthetic parity, user PNG parity/timing, and color-only no-global-matte rerender.
+
 
 #### P2.1 - Define internal cache API contract
 - Define internal cache objects and optional `process_key_image` cache input/output contract before implementing runtime reuse.
@@ -307,10 +319,8 @@ Verification:
 - `python smoke_test.py`
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
 
 #### P2.2 - Introduce source/base/transition cache records
 - Add cache records for decoded source identity, original alpha, manual/imported mask generations, full-resolution base matte, alpha, trimap/core/background masks, transition/recovered alpha, and optional reference metadata.
@@ -335,10 +345,9 @@ Verification:
 - `python smoke_test.py`
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+
 
 #### P2.3 - Reuse full matte between preview and export
 - When preview has built a valid full-resolution matte for the current image/settings/masks, export must reuse it instead of recomputing global matte/transition prep.
@@ -361,10 +370,9 @@ Verification:
 - `python smoke_test.py --gpu-parity`
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
+
 
 #### P2.4 - Avoid matte rebuild for color-only changes
 - For color-only slider changes, reuse matte/transition cache and rerun only color render/composite stages.
@@ -387,12 +395,9 @@ Verification:
 - `python smoke_test.py --write-geometric-benchmark`
 
 Status:
-- Planned
+- Completed
 
-Current:
-- No
 
----
 
 ### Phase 3 - Progressive preview and responsive large-image UX
 
@@ -419,7 +424,9 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
+
+
 
 #### P3.1 - Define exact vs draft preview semantics
 - Keep `Proxy` as fast whole-image preview.
@@ -446,8 +453,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P3.2 - Progressive latest-wins preview scheduler
 - Keep previous result visible during new work.
@@ -477,8 +483,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P3.3 - Expensive slider debounce/tracking policy
 - Split cheap UI value updates from expensive processing for high-cost controls.
@@ -502,11 +507,13 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 ---
 
+
+Current:
+- No
 ### Phase 4 - CPU bottleneck reduction for transition/reference prep
 
 Category:
@@ -524,8 +531,7 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P4.1 - Optimize transition alpha and global matte substages on CPU
 - Use Phase 1 profiler to target the slowest substage first.
@@ -550,8 +556,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P4.2 - Reuse tile-local screen/reference prep inside a render generation
 - Avoid recomputing tile-local screen/reference data when rendering multiple color-only variants for the same matte/tile geometry.
@@ -574,8 +579,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P4.3 - Decide D3D12 port candidates for remaining dense CPU stages
 - Based on measured post-cache/post-CPU timing, decide whether to port transition alpha/screen probability/reference prep to D3D12.
@@ -598,11 +602,13 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 ---
 
+
+Current:
+- No
 ### Phase 5 - Conditional persistent D3D12 large-image batch pipeline
 
 Category:
@@ -623,8 +629,7 @@ Precondition:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P5.1 - Add native tile-batch ABI and persistent resource plan
 - Add or finalize `imgkey_gpu_process_tile_batch_v1` behind capability flags.
@@ -650,8 +655,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P5.2 - Async/batched readback and reduced Python/native round trips
 - Record many tile dispatches per command list and read back in batches.
@@ -676,8 +680,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P5.3 - Optional D3D12 port of selected dense prep stage
 - Only execute if Phase 4 proves a dense stage is a good GPU-resident candidate.
@@ -701,11 +704,13 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 ---
 
+
+Current:
+- No
 ### Phase 6 - Fast export path and PNG encode options
 
 Category:
@@ -723,8 +728,7 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P6.1 - Add Fast PNG compression option
 - Add an export option for faster PNG compression level while preserving lossless pixels.
@@ -749,8 +753,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P6.2 - Export progress and cache visibility
 - Export progress should show whether it is using cached matte, running CPU global matte, D3D12 color render, or PNG encode.
@@ -772,11 +775,13 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 ---
 
+
+Current:
+- No
 ### Phase 7 - Full verification, packaging, and release-readiness gate
 
 Category:
@@ -794,8 +799,7 @@ Isolation:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P7.1 - Full real-image benchmark matrix
 - Run CPU/D3D12 Off/Auto/Force on the three user PNGs for proxy, exact crop, cold export, preview-then-export cache-hit export, and fast PNG export.
@@ -818,8 +822,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P7.2 - Full regression/build gate
 - Run the full verification floor.
@@ -847,8 +850,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 #### P7.3 - Complete docs and plan
 - Update README/docs/build notes only where user-visible behavior changed.
@@ -872,8 +874,7 @@ Verification:
 Status:
 - Planned
 
-Current:
-- No
+
 
 ---
 
@@ -891,8 +892,8 @@ Stop and ask the user before:
 
 ## 8) Immediate next step
 
-If execution is approved, start with Phase 1 using `deep-worker`:
+Next execution target is Phase 3 using `deep-worker`:
 
-1. Add durable profiling for real image directories and backend/stage breakdowns.
-2. Add settings fingerprint/cache-key classification tests.
-3. Commit Phase 1 only after targeted profiling plus smoke/GPU parity verification pass.
+1. Clarify exact vs draft preview semantics and cache status in UI/HUD.
+2. Add progressive latest-wins preview scheduling and stronger cancellation checkpoints.
+3. Add expensive-slider debounce/tracking policy without changing final export semantics.

@@ -119,6 +119,87 @@ MATTE_PIPELINE_FINGERPRINT_CATEGORIES: tuple[SettingsCategory, ...] = (
 COLOR_FINGERPRINT_CATEGORIES: tuple[SettingsCategory, ...] = (COLOR,)
 BACKEND_FINGERPRINT_CATEGORIES: tuple[SettingsCategory, ...] = (BACKEND,)
 
+# Runtime cache fingerprints deliberately split the global matte pipeline more
+# narrowly than the Phase 1 classification helpers.  Full-resolution crop is a
+# render target, not a global-matte input, so it is normalized out to allow a
+# Full Crop preview to seed a later full export.  Tile size is retained for the
+# transition-alpha key because the large-image tile-local transition fallback can
+# use it when global nearest-inner labels are skipped.
+BASE_MATTE_RUNTIME_FIELDS: tuple[str, ...] = (
+    "mode",
+    "alpha_hint_foreground_threshold",
+    "alpha_hint_minimum_alpha",
+    "alpha_hint_strength",
+    "key_color",
+    "tolerance",
+    "softness",
+    "edge_blur",
+    "cleanup",
+    "sample_size",
+    "auto_border_sample",
+    "auto_detect_key_color",
+    "border_sample_width",
+    "brightness_tolerance",
+    "clip_background",
+    "clip_foreground",
+    "matte_gamma",
+    "core_strength",
+    "edge_refine_radius",
+    "edge_softness",
+    "erode_expand",
+    "despeckle_min_area",
+    "aggressive_interior_removal",
+    "aggressive_threshold",
+    "aggressive_min_area",
+    "fringe_band_radius",
+    "guided_alpha_refine",
+    "guided_radius",
+    "guided_eps",
+    "guided_max_pixels",
+    "screen_cleanup_strength",
+    "screen_cleanup_similarity",
+    "local_screen_model",
+    "max_local_screen_model_pixels",
+)
+
+REFERENCE_PREP_RUNTIME_FIELDS: tuple[str, ...] = (
+    "local_screen_model",
+    "max_local_screen_model_pixels",
+    "foreground_reference_radius",
+)
+
+TRANSITION_ALPHA_RUNTIME_FIELDS: tuple[str, ...] = (
+    "transition_unmix",
+    "alpha_recover_strength",
+    "transition_spill_threshold",
+    "transition_reconstruction_error",
+    "foreground_reference_radius",
+    "foreground_candidate_count",
+    "transition_alpha_min",
+    "transition_alpha_max",
+    "tile_size",
+    "local_screen_model",
+)
+
+COLOR_RENDER_RUNTIME_FIELDS: tuple[str, ...] = (
+    "despill",
+    "decontaminate",
+    "luminance_restore",
+    "unmix_amount",
+    "fringe_remove",
+    "edge_color_repair",
+    "inner_color_pull",
+    "luminance_protect",
+    "foreground_reference_pull",
+    "key_vector_despill",
+    "preserve_foreground_luma",
+    "full_res_crop",
+    "use_tiling",
+    "tile_size",
+    "tile_overlap",
+    "gpu_acceleration",
+)
+
 
 def _key_settings_field_names() -> tuple[str, ...]:
     return tuple(field.name for field in fields(KeySettings))
@@ -160,6 +241,17 @@ def settings_payload(settings: KeySettings, categories: Iterable[SettingsCategor
         for name in _key_settings_field_names()
         if SETTING_FIELD_CATEGORIES[name] in requested
     }
+
+
+def settings_fields_payload(settings: KeySettings, field_names: Iterable[str]) -> dict[str, Any]:
+    values = asdict(settings)
+    payload: dict[str, Any] = {}
+    valid = set(_key_settings_field_names())
+    for name in field_names:
+        if name not in valid:
+            raise KeyError(f"Unknown KeySettings field in cache fingerprint: {name}")
+        payload[name] = values[name]
+    return payload
 
 
 def stable_fingerprint(payload: Any) -> str:
@@ -278,5 +370,69 @@ def matte_pipeline_cache_fingerprint(settings: KeySettings, source_key: dict[str
             "settings": settings_payload(settings, MATTE_PIPELINE_FINGERPRINT_CATEGORIES),
             "source": source_key,
             "mask": mask_key,
+        }
+    )
+
+
+def runtime_base_matte_cache_fingerprint(settings: KeySettings, source_key: dict[str, Any], mask_key: dict[str, Any]) -> str:
+    """Fingerprint the base global matte, excluding render crop/color/backend.
+
+    This key includes local-screen cap settings because screen-residue cleanup can
+    use the local screen plate to change alpha.  It intentionally excludes
+    ``full_res_crop`` so crop previews can seed a full-resolution export.
+    """
+
+    return stable_fingerprint(
+        {
+            "kind": "runtime_base_matte_cache",
+            "algorithm_version": ALGORITHM_VERSION,
+            "settings": settings_fields_payload(settings, BASE_MATTE_RUNTIME_FIELDS),
+            "source": source_key,
+            "mask": mask_key,
+        }
+    )
+
+
+def reference_prep_cache_fingerprint(settings: KeySettings, base_key: str) -> str:
+    """Fingerprint global screen/reference prep derived from a base matte."""
+
+    return stable_fingerprint(
+        {
+            "kind": "reference_tile_prep_cache",
+            "algorithm_version": ALGORITHM_VERSION,
+            "base_key": str(base_key),
+            "settings": settings_fields_payload(settings, REFERENCE_PREP_RUNTIME_FIELDS),
+        }
+    )
+
+
+def transition_alpha_cache_fingerprint(settings: KeySettings, base_key: str, reference_key: str) -> str:
+    """Fingerprint recovered alpha derived from base matte + reference prep."""
+
+    return stable_fingerprint(
+        {
+            "kind": "transition_alpha_cache",
+            "algorithm_version": ALGORITHM_VERSION,
+            "base_key": str(base_key),
+            "reference_key": str(reference_key),
+            "settings": settings_fields_payload(settings, TRANSITION_ALPHA_RUNTIME_FIELDS),
+        }
+    )
+
+
+def color_render_cache_fingerprint(settings: KeySettings, transition_key: str, *, render_shape: tuple[int, int]) -> str:
+    """Fingerprint optional rendered RGBA outputs.
+
+    Phase 2 defines the color cache contract but keeps publication conservative;
+    callers can use this helper once retaining rendered crops is desirable.
+    """
+
+    return stable_fingerprint(
+        {
+            "kind": "color_render_cache",
+            "algorithm_version": ALGORITHM_VERSION,
+            "transition_key": str(transition_key),
+            "render_shape": [int(render_shape[0]), int(render_shape[1])],
+            "settings": settings_fields_payload(settings, COLOR_RENDER_RUNTIME_FIELDS),
         }
     )

@@ -7,6 +7,8 @@ import numpy as np
 from PySide6.QtCore import QThread, QTimer, Signal
 
 from keyer import KeyResult, KeySettings, process_key_image
+from imgkey_engine.cache import ProcessCache, ProcessCacheContext, ProcessCacheTransaction
+from imgkey_engine.cache_keys import matte_pipeline_settings_fingerprint
 
 
 @dataclass(slots=True)
@@ -22,6 +24,14 @@ class PreviewJob:
     display_scale: float
     crop_origin: tuple[int, int]
     label: str
+    process_cache: ProcessCache | None = None
+    cache_context: ProcessCacheContext | None = None
+
+
+@dataclass(slots=True)
+class PreviewResult:
+    result: KeyResult
+    cache_transaction: ProcessCacheTransaction | None = None
 
 
 class PreviewThread(QThread):
@@ -42,7 +52,10 @@ class PreviewThread(QThread):
         return self._cancel_requested
 
     def run(self) -> None:
+        cache_transaction = None
         try:
+            if self.job.process_cache is not None and self.job.cache_context is not None:
+                cache_transaction = self.job.process_cache.begin(self.job.cache_context)
             result = process_key_image(
                 self.job.input_rgb,
                 self.job.settings,
@@ -54,11 +67,16 @@ class PreviewThread(QThread):
                 if self._cancel_requested
                 else self.progress.emit(self.generation, value, stage),
                 cancel_callback=self._is_cancelled,
+                cache_transaction=cache_transaction,
             )
             if self._cancel_requested:
+                if cache_transaction is not None:
+                    cache_transaction.discard()
                 return
-            self.done.emit(self.generation, result)
+            self.done.emit(self.generation, PreviewResult(result, cache_transaction))
         except Exception as exc:  # pragma: no cover - UI boundary
+            if cache_transaction is not None:
+                cache_transaction.discard()
             if self._cancel_requested and "cancel" in str(exc).lower():
                 return
             self.failed.emit(self.generation, str(exc))
@@ -81,7 +99,12 @@ class PreviewController:
         owner = self.owner
         if owner.full_rgb is None:
             return
-        owner.settings = owner.current_settings()
+        next_settings = owner.current_settings()
+        if matte_pipeline_settings_fingerprint(next_settings) != matte_pipeline_settings_fingerprint(owner.settings):
+            cache = getattr(owner, "process_cache", None)
+            if cache is not None:
+                cache.clear()
+        owner.settings = next_settings
         owner._sync_output_mode_status()
         owner._preview_generation += 1
         owner._preview_jobs.clear()
@@ -155,6 +178,8 @@ class PreviewController:
                 display_scale=1.0,
                 crop_origin=(x0, y0),
                 label=f"Full crop {x1 - x0}×{y1 - y0}",
+                process_cache=getattr(owner, "process_cache", None),
+                cache_context=owner._cache_context("full", owner.full_rgb.shape[:2]) if hasattr(owner, "_cache_context") else None,
             )
 
         assert owner.proxy_rgb is not None
@@ -175,6 +200,8 @@ class PreviewController:
             display_scale=owner.proxy_scale,
             crop_origin=(0, 0),
             label="Proxy",
+            process_cache=getattr(owner, "process_cache", None),
+            cache_context=owner._cache_context("proxy", owner.proxy_rgb.shape[:2]) if hasattr(owner, "_cache_context") else None,
         )
 
     def forget_preview_thread(self, thread: PreviewThread) -> None:

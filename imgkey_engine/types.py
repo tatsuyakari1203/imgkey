@@ -136,6 +136,7 @@ class KeyResult:
     repaired_edge: np.ndarray | None = None
     foreground_rgb: np.ndarray | None = None
     gpu_acceleration: dict | None = None
+    cache_info: dict | None = None
 
 
 @dataclass(slots=True)

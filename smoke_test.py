@@ -61,10 +61,14 @@ from imgkey_engine.cache_keys import (
     mask_generation_key,
     matte_pipeline_cache_fingerprint,
     matte_pipeline_settings_fingerprint,
+    reference_prep_cache_fingerprint,
+    runtime_base_matte_cache_fingerprint,
     source_generation_fingerprint,
     source_generation_key,
+    transition_alpha_cache_fingerprint,
     validate_settings_classification,
 )
+from imgkey_engine.cache import ProcessCache, ProcessCacheContext
 from imgkey_engine.profiling import PipelineProfiler, profile_scope
 
 
@@ -2318,11 +2322,153 @@ def run_cache_key_classification_tests() -> None:
     assert matte_pipeline_cache_fingerprint(replace(base, alpha_recover_strength=0.2), source_full, mask_base) != pipeline_key
     assert matte_pipeline_cache_fingerprint(replace(base, tile_size=512), source_full, mask_base) != pipeline_key
 
+    runtime_base = runtime_base_matte_cache_fingerprint(base, source_full, mask_base)
+    assert runtime_base_matte_cache_fingerprint(color_changed, source_full, mask_base) == runtime_base
+    assert runtime_base_matte_cache_fingerprint(replace(base, full_res_crop=(0, 0, 64, 64)), source_full, mask_base) == runtime_base
+    assert runtime_base_matte_cache_fingerprint(replace(base, local_screen_model=False), source_full, mask_base) != runtime_base
+    runtime_reference = reference_prep_cache_fingerprint(base, runtime_base)
+    runtime_transition = transition_alpha_cache_fingerprint(base, runtime_base, runtime_reference)
+    assert transition_alpha_cache_fingerprint(color_changed, runtime_base, runtime_reference) == runtime_transition
+    assert transition_alpha_cache_fingerprint(replace(base, full_res_crop=(0, 0, 64, 64)), runtime_base, runtime_reference) == runtime_transition
+    assert transition_alpha_cache_fingerprint(replace(base, alpha_recover_strength=0.2), runtime_base, runtime_reference) != runtime_transition
+    proxy_source = source_generation_key("image-a.png", 1, resolution="proxy", shape=(50, 60), proxy_generation=1)
+    assert runtime_base_matte_cache_fingerprint(base, proxy_source, mask_base) != runtime_base, "proxy and full cache keys must stay separate"
+
     print(
         "Cache-key classification checks: "
         f"fields={len(field_names)} categories="
         + ", ".join(f"{category}:{len(classified[category])}" for category in (SOURCE, MASK, BASE_MATTE, TRANSITION_ALPHA, TILE_PREP, COLOR, BACKEND))
     )
+
+
+def _cache_context(identity: str, shape: tuple[int, int], *, resolution: str = "full", source_generation: int = 1, mask_generation: int = 1) -> ProcessCacheContext:
+    source_key = source_generation_key(
+        identity,
+        source_generation,
+        decode_generation=source_generation,
+        original_alpha_generation=source_generation,
+        proxy_generation=source_generation if resolution == "proxy" else 0,
+        resolution=resolution,
+        shape=shape,
+    )
+    mask_key = mask_generation_key(
+        mask_generation=mask_generation,
+        keep_generation=mask_generation,
+        remove_generation=mask_generation,
+        imported_matte_generation=mask_generation,
+        alpha_hint_generation=mask_generation,
+    )
+    return ProcessCacheContext(source_key=source_key, mask_key=mask_key)
+
+
+def _profiled_process_key_image(*args: Any, **kwargs: Any) -> tuple[KeyResult, dict[str, Any]]:
+    profiler = PipelineProfiler()
+    with profile_scope(profiler):
+        result = process_key_image(*args, **kwargs)
+    return result, profiler.snapshot()
+
+
+def run_process_cache_contract_tests() -> None:
+    fixture = blue_flat_fixture()
+    rgb = fixture.rgb
+    settings = replace(
+        fixture.settings,
+        auto_border_sample=True,
+        transition_unmix=True,
+        alpha_recover_strength=0.85,
+        edge_color_repair=0.75,
+        inner_color_pull=0.55,
+        use_tiling=True,
+        tile_size=257,
+        tile_overlap=32,
+        gpu_acceleration="Off",
+    )
+    cold = process_key_image(rgb, settings)
+    cache = ProcessCache()
+    full_context = _cache_context("cache-contract-full", rgb.shape[:2], resolution="full")
+
+    first, first_profile = _profiled_process_key_image(rgb, settings, process_cache=cache, cache_context=full_context)
+    assert first.cache_info is not None and first.cache_info["base_matte"] == "miss"
+    assert cache.stats()["transition_alphas"] == 1, "auto-committed cache run should publish transition alpha"
+    assert np.array_equal(first.rgba, cold.rgba), "cold and cached-publish first run must match"
+    assert "global_matte.total" in first_profile["timings"], "cold cache population must run global matte"
+
+    second, second_profile = _profiled_process_key_image(rgb, settings, process_cache=cache, cache_context=full_context)
+    assert second.cache_info is not None and second.cache_info["cache_hit"] == "matte", second.cache_info
+    assert "global_matte.total" not in second_profile["timings"], "matte cache hit must skip global matte total"
+    assert "transition_alpha.global_recovery" not in second_profile["timings"], "matte cache hit must skip transition alpha"
+    assert np.array_equal(second.rgba, cold.rgba), "cache hit output must match cold output"
+    assert np.array_equal(second.alpha, cold.alpha), "cache hit alpha must match cold alpha"
+    assert transparent_rgb_zero(second.rgba)["ok"], "cache hit must preserve zero RGB where alpha is zero"
+    assert second.screen_probability is not None
+    mutated_alpha = second.alpha
+    mutated_probability = second.screen_probability
+    mutated_alpha[:] = 0
+    mutated_probability[:] = 0
+    third = process_key_image(rgb, settings, process_cache=cache, cache_context=full_context)
+    assert np.array_equal(third.alpha, cold.alpha), "mutating KeyResult alpha must not mutate cached alpha"
+    assert np.array_equal(third.screen_probability, cold.screen_probability), "mutating KeyResult probability must not mutate cached probability"
+
+    color_settings = replace(settings, despill=0.05, decontaminate=0.10, fringe_remove=0.20, inner_color_pull=0.15)
+    color_cold = process_key_image(rgb, color_settings)
+    color_hit, color_profile = _profiled_process_key_image(rgb, color_settings, process_cache=cache, cache_context=full_context)
+    assert color_hit.cache_info is not None and color_hit.cache_info["cache_hit"] == "matte", color_hit.cache_info
+    assert "global_matte.total" not in color_profile["timings"], "color-only change must not rerun global matte"
+    assert "transition_alpha.global_recovery" not in color_profile["timings"], "color-only change must not rerun transition alpha"
+    assert np.array_equal(color_hit.rgba, color_cold.rgba), "color-only cache hit must equal cold final settings"
+
+    alpha_changed = replace(settings, tolerance=min(0.44, settings.tolerance + 0.04))
+    alpha_miss, alpha_profile = _profiled_process_key_image(rgb, alpha_changed, process_cache=cache, cache_context=full_context)
+    assert alpha_miss.cache_info is not None and alpha_miss.cache_info["cache_hit"] is False
+    assert alpha_miss.cache_info["cache_miss_reason"] == "base_matte_not_found"
+    assert "global_matte.total" in alpha_profile["timings"], "alpha-affecting change must rebuild global matte"
+
+    proxy_rgb = cv2.resize(rgb, (rgb.shape[1] // 2, rgb.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    proxy_context = _cache_context("cache-contract-full", proxy_rgb.shape[:2], resolution="proxy", source_generation=1, mask_generation=1)
+    proxy_cache = ProcessCache()
+    proxy_result = process_key_image(proxy_rgb, replace(settings, preview_scale=0.5), process_cache=proxy_cache, cache_context=proxy_context)
+    assert proxy_result.cache_info is not None and proxy_result.cache_info["resolution"] == "proxy"
+    full_after_proxy, full_after_proxy_profile = _profiled_process_key_image(rgb, settings, process_cache=proxy_cache, cache_context=full_context)
+    assert full_after_proxy.cache_info is not None and full_after_proxy.cache_info["cache_hit"] is False
+    assert "global_matte.total" in full_after_proxy_profile["timings"], "full export must not reuse proxy matte"
+
+    crop_settings = replace(settings, full_res_crop=(40, 30, 360, 300), preview_scale=1.0)
+    crop_cache = ProcessCache()
+    crop_preview = process_key_image(rgb, crop_settings, process_cache=crop_cache, cache_context=full_context)
+    assert crop_preview.cache_info is not None and crop_preview.cache_info["base_matte"] == "miss"
+    export_after_crop, export_after_crop_profile = _profiled_process_key_image(
+        rgb,
+        replace(settings, full_res_crop=None, preview_scale=1.0),
+        process_cache=crop_cache,
+        cache_context=full_context,
+        include_debug=False,
+    )
+    assert export_after_crop.cache_info is not None and export_after_crop.cache_info["cache_hit"] == "matte"
+    assert "global_matte.total" not in export_after_crop_profile["timings"], "full crop preview should seed full export matte"
+    assert transparent_rgb_zero(export_after_crop.rgba)["ok"]
+
+    stale_cache = ProcessCache()
+    stale_tx = stale_cache.begin(full_context)
+    stale_result = process_key_image(rgb, settings, cache_transaction=stale_tx)
+    assert stale_result.cache_info is not None and stale_result.cache_info["base_matte"] == "miss"
+    assert stale_cache.stats()["transition_alphas"] == 0, "staged preview cache must not publish before UI acceptance"
+    stale_tx.discard()
+    stale_after, stale_after_profile = _profiled_process_key_image(rgb, settings, process_cache=stale_cache, cache_context=full_context)
+    assert stale_after.cache_info is not None and stale_after.cache_info["cache_hit"] is False
+    assert "global_matte.total" in stale_after_profile["timings"], "discarded stale preview must not seed cache"
+
+    cancel_cache = ProcessCache()
+    cancel_tx = cancel_cache.begin(full_context)
+    try:
+        process_key_image(rgb, settings, cache_transaction=cancel_tx, cancel_callback=lambda: True)
+    except RuntimeError as exc:
+        assert "cancel" in str(exc).lower()
+    else:
+        raise AssertionError("cancelled process_key_image should raise")
+    cancel_tx.discard()
+    assert cancel_cache.stats()["transition_alphas"] == 0, "cancelled preview must not publish cache"
+
+    print("Process cache contract checks: full/proxy boundaries, crop export reuse, color-only matte hit, stale/cancel discard")
 
 
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
@@ -4595,6 +4741,9 @@ def _merge_profiler_snapshot(report: dict[str, Any], profiler: PipelineProfiler)
     counters = snapshot.get("counters", {})
     if counters:
         report["counters"] = {str(name): int(value) for name, value in counters.items()}
+    metadata = snapshot.get("metadata", {})
+    if metadata:
+        report["metadata"] = dict(metadata)
 
 
 def _profile_keyer_run(
@@ -6819,6 +6968,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
     run_cache_key_classification_tests()
+    run_process_cache_contract_tests()
     run_gpu_runtime_probe_tests()
     run_gpu_accel_backend_tests()
     run_gpu_backend_registry_tests()
