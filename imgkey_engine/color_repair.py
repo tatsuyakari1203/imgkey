@@ -22,6 +22,7 @@ from .references import (
     _transition_reference_enabled,
     _u8_mask_or_empty,
 )
+from .profiling import record_count, record_timing, time_block
 from .types import KeySettings
 
 
@@ -278,23 +279,24 @@ def _process_color_tile(
         full_result: dict | None = None
         try:
             required = {"rgb_only", "full_color_tile", "screen_tile"} if screen_tile is not None else {"rgb_only", "full_color_tile", "constant_screen"}
-            full_result = gpu_backend.process_full_color_tile(
-                rgb_tile,
-                alpha_u8,
-                background_mask,
-                edge_mask,
-                probability,
-                fringe_mask,
-                screen_tile,
-                nearest_inner_rgb,
-                nearest_inner_valid,
-                screen_color,
-                settings,
-                transition_nearest_rgb=transition_nearest_rgb,
-                transition_nearest_valid=transition_nearest_valid,
-                session=gpu_session,
-                required_capabilities=required,
-            )
+            with time_block("gpu.full_color_tile_call_wall"):
+                full_result = gpu_backend.process_full_color_tile(
+                    rgb_tile,
+                    alpha_u8,
+                    background_mask,
+                    edge_mask,
+                    probability,
+                    fringe_mask,
+                    screen_tile,
+                    nearest_inner_rgb,
+                    nearest_inner_valid,
+                    screen_color,
+                    settings,
+                    transition_nearest_rgb=transition_nearest_rgb,
+                    transition_nearest_valid=transition_nearest_valid,
+                    session=gpu_session,
+                    required_capabilities=required,
+                )
         except Exception as exc:  # pragma: no cover - defensive backend boundary
             full_result = {
                 "ok": False,
@@ -306,18 +308,22 @@ def _process_color_tile(
                 "elapsed_ms": None,
             }
         if full_result.get("used") and isinstance(full_result.get("rgb"), np.ndarray) and isinstance(full_result.get("repair_mask"), np.ndarray):
+            record_count("gpu.full_color_tile.used")
+            record_timing("gpu.full_color_tile_reported_elapsed", full_result.get("elapsed_ms"))
             _record_gpu_tile_result(gpu_stats, full_result)
             return full_result["rgb"], full_result["repair_mask"]
+        record_count("gpu.full_color_tile.fallback")
         if gpu_mode == "Force GPU" and full_result.get("reason") in gpu_backend.GPU_BACKEND_ERROR_REASONS:
             _record_gpu_tile_result(gpu_stats, full_result)
             raise RuntimeError(str(full_result.get("message") or "Force GPU requested, but full color GPU processing failed."))
 
-    rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
-    alpha = alpha_u8.astype(np.float32) / 255.0
-    if screen_tile is None:
-        screen = _srgb_u8_to_linear_f32(np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3))
-    else:
-        screen = _srgb_u8_to_linear_f32(screen_tile)
+    with time_block("color.cpu_linear_prep"):
+        rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
+        alpha = alpha_u8.astype(np.float32) / 255.0
+        if screen_tile is None:
+            screen = _srgb_u8_to_linear_f32(np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3))
+        else:
+            screen = _srgb_u8_to_linear_f32(screen_tile)
 
     out = rgb_linear.copy()
     edge_strength = np.clip(alpha * (1.0 - alpha) * 4.0, 0.0, 1.0)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import contextmanager
 import ctypes
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 import gc
 import hashlib
 import importlib
@@ -17,6 +17,7 @@ import tempfile
 import time
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -44,6 +45,27 @@ from keyer import (
     process_chroma_key,
     process_key_image,
 )
+from imgkey_engine.cache_keys import (
+    BACKEND,
+    BASE_MATTE,
+    COLOR,
+    MASK,
+    SOURCE,
+    TILE_PREP,
+    TRANSITION_ALPHA,
+    base_matte_cache_fingerprint,
+    base_matte_settings_fingerprint,
+    classified_settings_fields,
+    color_settings_fingerprint,
+    mask_generation_fingerprint,
+    mask_generation_key,
+    matte_pipeline_cache_fingerprint,
+    matte_pipeline_settings_fingerprint,
+    source_generation_fingerprint,
+    source_generation_key,
+    validate_settings_classification,
+)
+from imgkey_engine.profiling import PipelineProfiler, profile_scope
 
 
 ARTIFACT_DIR = Path(".artifact") / "smoke-fixtures"
@@ -53,6 +75,7 @@ TRANSITION_UNMIX_DIAGNOSTIC_DIR = Path(".artifact") / "transition-unmix-diagnost
 GPU_BENCHMARK_DIR = Path(".artifact") / "gpu-benchmarks"
 GEOMETRIC_BENCHMARK_DIR = Path(".artifact") / "geometric-benchmark"
 PERF_BASELINE_DIR = Path(".artifact") / "perf"
+LARGE_IMAGE_PERF_DIR = Path(".artifact") / "large-image-perf"
 HEAVY_OPTIONAL_MODULES = frozenset(
     {
         "accelerate",
@@ -2107,6 +2130,198 @@ def run_phase6_tile_local_nearest_inner_tests() -> None:
         f"seam alpha={seam['max_alpha_diff']} rgb={seam['max_rgb_diff_opaque_nonfringe']} "
         f"checker={seam['max_checker_diff_visible']}; "
         f"crop max_rgba_diff={max_crop_rgba_diff} max_alpha_diff={max_crop_alpha_diff}"
+    )
+
+
+def run_cache_key_classification_tests() -> None:
+    validate_settings_classification()
+    field_names = {field.name for field in fields(KeySettings)}
+    classified = classified_settings_fields()
+    flattened = {name for names in classified.values() for name in names}
+    assert flattened == field_names, f"KeySettings cache categories must cover every field: {field_names - flattened}"
+    assert not any(name in classified[COLOR] for name in classified[BASE_MATTE]), "settings categories must be exclusive"
+    assert classified[SOURCE] == ("preview_scale",), classified[SOURCE]
+    assert {"mode", "alpha_hint_foreground_threshold", "alpha_hint_minimum_alpha", "alpha_hint_strength"}.issubset(
+        set(classified[MASK])
+    )
+    assert {"key_color", "tolerance", "brightness_tolerance", "aggressive_interior_removal", "screen_cleanup_strength"}.issubset(
+        set(classified[BASE_MATTE])
+    )
+    assert {"transition_unmix", "alpha_recover_strength", "foreground_reference_radius", "transition_alpha_min"}.issubset(
+        set(classified[TRANSITION_ALPHA])
+    )
+    assert {"local_screen_model", "max_local_screen_model_pixels", "tile_size", "tile_overlap", "full_res_crop"}.issubset(
+        set(classified[TILE_PREP])
+    )
+    assert {"despill", "decontaminate", "luminance_restore", "fringe_remove", "inner_color_pull"}.issubset(
+        set(classified[COLOR])
+    )
+    assert classified[BACKEND] == ("gpu_acceleration",), classified[BACKEND]
+
+    base = KeySettings(
+        key_color=(30, 80, 235),
+        tolerance=0.26,
+        softness=0.02,
+        edge_refine_radius=24,
+        transition_unmix=True,
+        alpha_recover_strength=0.90,
+        local_screen_model=True,
+        max_local_screen_model_pixels=12_000_000,
+        use_tiling=True,
+        tile_size=2048,
+        tile_overlap=128,
+        gpu_acceleration="Auto",
+    )
+    base_matte = base_matte_settings_fingerprint(base)
+    base_pipeline = matte_pipeline_settings_fingerprint(base)
+    base_color = color_settings_fingerprint(base)
+
+    color_changed = replace(
+        base,
+        despill=0.12,
+        decontaminate=0.13,
+        luminance_restore=0.14,
+        unmix_amount=0.15,
+        fringe_remove=0.16,
+        edge_color_repair=0.17,
+        inner_color_pull=0.18,
+        luminance_protect=0.19,
+        foreground_reference_pull=0.20,
+        key_vector_despill=0.21,
+        preserve_foreground_luma=0.22,
+    )
+    assert base_matte_settings_fingerprint(color_changed) == base_matte, "color-only fields must not invalidate base matte"
+    assert matte_pipeline_settings_fingerprint(color_changed) == base_pipeline, "color-only fields must not invalidate matte pipeline"
+    assert color_settings_fingerprint(color_changed) != base_color, "color fingerprint must change for color-only fields"
+
+    backend_changed = replace(base, gpu_acceleration="Force GPU")
+    assert matte_pipeline_settings_fingerprint(backend_changed) == base_pipeline, "backend-only fields must not invalidate matte"
+
+    for field_name, value in (
+        ("key_color", (0, 220, 50)),
+        ("tolerance", 0.31),
+        ("softness", 0.08),
+        ("brightness_tolerance", 0.45),
+        ("clip_background", 0.88),
+        ("clip_foreground", 0.11),
+        ("matte_gamma", 1.7),
+        ("core_strength", 0.35),
+        ("edge_refine_radius", 12),
+        ("erode_expand", -3),
+        ("despeckle_min_area", 5),
+        ("aggressive_interior_removal", not base.aggressive_interior_removal),
+        ("aggressive_threshold", 0.77),
+        ("guided_alpha_refine", 0.5),
+        ("screen_cleanup_strength", 0.66),
+        ("screen_cleanup_similarity", 3),
+    ):
+        changed = replace(base, **{field_name: value})
+        assert base_matte_settings_fingerprint(changed) != base_matte, f"{field_name} must invalidate base matte"
+        assert matte_pipeline_settings_fingerprint(changed) != base_pipeline, f"{field_name} must invalidate matte pipeline"
+
+    for field_name, value in (
+        ("mode", "ImportedMatte"),
+        ("alpha_hint_foreground_threshold", 180),
+        ("alpha_hint_minimum_alpha", 12),
+        ("alpha_hint_strength", 0.5),
+    ):
+        changed = replace(base, **{field_name: value})
+        assert base_matte_settings_fingerprint(changed) != base_matte, f"{field_name} must invalidate imported-matte/mask matte"
+
+    for field_name, value in (
+        ("transition_unmix", False),
+        ("alpha_recover_strength", 0.25),
+        ("transition_spill_threshold", 0.14),
+        ("transition_reconstruction_error", 0.12),
+        ("foreground_reference_radius", 24),
+        ("foreground_candidate_count", 8),
+        ("transition_alpha_min", 8),
+        ("transition_alpha_max", 240),
+    ):
+        changed = replace(base, **{field_name: value})
+        assert base_matte_settings_fingerprint(changed) == base_matte, f"{field_name} should not invalidate base matte"
+        assert matte_pipeline_settings_fingerprint(changed) != base_pipeline, f"{field_name} must invalidate transition matte"
+
+    for field_name, value in (
+        ("local_screen_model", False),
+        ("max_local_screen_model_pixels", 1),
+        ("tile_size", 1024),
+        ("tile_overlap", 64),
+        ("full_res_crop", (0, 0, 64, 64)),
+        ("use_tiling", False),
+    ):
+        changed = replace(base, **{field_name: value})
+        assert base_matte_settings_fingerprint(changed) == base_matte, f"{field_name} should stay out of base matte"
+        assert matte_pipeline_settings_fingerprint(changed) != base_pipeline, f"{field_name} must invalidate tile/prep matte"
+
+    source_full = source_generation_key(
+        "image-a.png",
+        1,
+        decode_generation=1,
+        original_alpha_generation=1,
+        proxy_generation=0,
+        resolution="full",
+        shape=(100, 120),
+    )
+    mask_base = mask_generation_key(mask_generation=1, keep_generation=1, remove_generation=1, imported_matte_generation=1)
+    source_fp = source_generation_fingerprint(
+        "image-a.png",
+        1,
+        decode_generation=1,
+        original_alpha_generation=1,
+        proxy_generation=0,
+        resolution="full",
+        shape=(100, 120),
+    )
+    assert source_fp != source_generation_fingerprint(
+        "image-a.png",
+        2,
+        decode_generation=1,
+        original_alpha_generation=1,
+        proxy_generation=0,
+        resolution="full",
+        shape=(100, 120),
+    ), "source generation must invalidate source key"
+    assert source_fp != source_generation_fingerprint(
+        "image-a.png",
+        1,
+        decode_generation=1,
+        original_alpha_generation=2,
+        proxy_generation=0,
+        resolution="full",
+        shape=(100, 120),
+    ), "original alpha generation must invalidate source key"
+    assert source_fp != source_generation_fingerprint(
+        "image-a.png",
+        1,
+        decode_generation=1,
+        original_alpha_generation=1,
+        proxy_generation=1,
+        resolution="proxy",
+        shape=(50, 60),
+    ), "proxy generation/resolution must invalidate source key"
+
+    mask_fp = mask_generation_fingerprint(mask_generation=1, keep_generation=1, remove_generation=1, imported_matte_generation=1)
+    assert mask_fp != mask_generation_fingerprint(mask_generation=2, keep_generation=1, remove_generation=1, imported_matte_generation=1)
+    assert mask_fp != mask_generation_fingerprint(mask_generation=1, keep_generation=2, remove_generation=1, imported_matte_generation=1)
+    assert mask_fp != mask_generation_fingerprint(mask_generation=1, keep_generation=1, remove_generation=2, imported_matte_generation=1)
+    assert mask_fp != mask_generation_fingerprint(mask_generation=1, keep_generation=1, remove_generation=1, imported_matte_generation=2)
+
+    cache_key = base_matte_cache_fingerprint(base, source_full, mask_base)
+    assert base_matte_cache_fingerprint(color_changed, source_full, mask_base) == cache_key
+    assert base_matte_cache_fingerprint(replace(base, tolerance=0.32), source_full, mask_base) != cache_key
+    assert base_matte_cache_fingerprint(base, source_generation_key("image-a.png", 2, resolution="full", shape=(100, 120)), mask_base) != cache_key
+    assert base_matte_cache_fingerprint(base, source_full, mask_generation_key(keep_generation=2)) != cache_key
+
+    pipeline_key = matte_pipeline_cache_fingerprint(base, source_full, mask_base)
+    assert matte_pipeline_cache_fingerprint(color_changed, source_full, mask_base) == pipeline_key
+    assert matte_pipeline_cache_fingerprint(replace(base, alpha_recover_strength=0.2), source_full, mask_base) != pipeline_key
+    assert matte_pipeline_cache_fingerprint(replace(base, tile_size=512), source_full, mask_base) != pipeline_key
+
+    print(
+        "Cache-key classification checks: "
+        f"fields={len(field_names)} categories="
+        + ", ".join(f"{category}:{len(classified[category])}" for category in (SOURCE, MASK, BASE_MATTE, TRANSITION_ALPHA, TILE_PREP, COLOR, BACKEND))
     )
 
 
@@ -4317,6 +4532,345 @@ def write_perf_baseline() -> None:
     print(f"wrote pipeline performance baseline report to {report_path}")
 
 
+def _large_image_profile_settings(gpu_acceleration: str) -> KeySettings:
+    return KeySettings(
+        key_color=(30, 80, 235),
+        tolerance=0.26,
+        softness=0.02,
+        edge_blur=(24 - 1) / 4.0,
+        cleanup=0,
+        despill=0.80,
+        sample_size=10,
+        auto_border_sample=True,
+        auto_detect_key_color=False,
+        clip_background=0.95,
+        clip_foreground=0.08,
+        matte_gamma=1.60,
+        core_strength=0.45,
+        edge_refine_radius=24,
+        edge_softness=0.04,
+        erode_expand=-4,
+        despeckle_min_area=0,
+        aggressive_interior_removal=True,
+        decontaminate=0.70,
+        luminance_restore=0.85,
+        fringe_remove=0.85,
+        edge_color_repair=0.80,
+        inner_color_pull=0.60,
+        fringe_band_radius=5,
+        luminance_protect=0.85,
+        transition_unmix=True,
+        alpha_recover_strength=0.90,
+        key_vector_despill=0.85,
+        foreground_reference_pull=0.75,
+        screen_cleanup_strength=1.00,
+        screen_cleanup_similarity=8,
+        gpu_acceleration=gpu_acceleration,
+        use_tiling=True,
+        tile_size=2048,
+        tile_overlap=128,
+    )
+
+
+def _large_profile_image_paths(image_dir: Path) -> list[Path]:
+    extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+    if not image_dir.exists() or not image_dir.is_dir():
+        return []
+    return sorted(path for path in image_dir.iterdir() if path.is_file() and path.suffix.lower() in extensions)
+
+
+def _resize_profile_alpha(alpha: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:
+    if alpha is None:
+        return None
+    if alpha.shape == shape:
+        return alpha.copy()
+    return cv2.resize(alpha.astype(np.float32, copy=False), (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+
+
+def _merge_profiler_snapshot(report: dict[str, Any], profiler: PipelineProfiler) -> None:
+    snapshot = profiler.snapshot()
+    timings = report.setdefault("timings", {})
+    for stage, record in snapshot.get("timings", {}).items():
+        timings[stage] = dict(record)
+    counters = snapshot.get("counters", {})
+    if counters:
+        report["counters"] = {str(name): int(value) for name, value in counters.items()}
+
+
+def _profile_keyer_run(
+    name: str,
+    rgb: np.ndarray,
+    original_alpha: np.ndarray | None,
+    settings: KeySettings,
+    *,
+    include_debug: bool,
+    output_path: Path | None = None,
+    measure_gui_conversion: bool = False,
+) -> dict[str, Any]:
+    run: dict[str, Any] = {
+        "name": name,
+        "settings": asdict(settings),
+        "include_debug": bool(include_debug),
+        "timings": {},
+    }
+    profiler = PipelineProfiler()
+    start = time.perf_counter()
+    with profile_scope(profiler):
+        result = process_key_image(rgb, settings, original_alpha=original_alpha, include_debug=include_debug)
+    _record_perf_timing(run, "process_key_image_total", (time.perf_counter() - start) * 1000.0)
+    _merge_profiler_snapshot(run, profiler)
+    run["result"] = {
+        "rgba_shape": list(result.rgba.shape),
+        "alpha_nonzero_pixels": int(np.count_nonzero(result.alpha)),
+        "alpha_mean": float(np.mean(result.alpha)),
+        "transparent_rgb_zero": transparent_rgb_zero(result.rgba),
+        "gpu_acceleration": result.gpu_acceleration,
+    }
+    if measure_gui_conversion:
+        start = time.perf_counter()
+        preview_rgb = checkerboard_composite(result.rgba)
+        _record_perf_timing(run, "gui_checkerboard_composite", (time.perf_counter() - start) * 1000.0)
+        start = time.perf_counter()
+        preview_image = Image.fromarray(preview_rgb, mode="RGB")
+        _record_perf_timing(run, "gui_pillow_image_fromarray", (time.perf_counter() - start) * 1000.0)
+        run["gui_conversion"] = {"preview_rgb_shape": list(preview_rgb.shape), "pillow_mode": preview_image.mode}
+        del preview_image
+        del preview_rgb
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        start = time.perf_counter()
+        keyer_module.write_png_rgba(output_path, result.rgba)
+        _record_perf_timing(run, "png_encode", (time.perf_counter() - start) * 1000.0)
+        run["output_path"] = str(output_path)
+        run["output_png_bytes"] = int(output_path.stat().st_size)
+    _finalize_perf_timings(run)
+    del result
+    gc.collect()
+    return run
+
+
+def _write_synthetic_large_profile_sources() -> list[Path]:
+    source_dir = LARGE_IMAGE_PERF_DIR / "synthetic_sources"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    cases = {case.background_name: case for case in geometric_benchmark_cases()}
+    specs = [
+        ("synthetic_blue_flat_2048", cases["blue_flat"], 2048),
+        ("synthetic_blue_gradient_3072", cases["blue_uneven_gradient"], 3072),
+    ]
+    paths: list[Path] = []
+    for name, case, size in specs:
+        path = source_dir / f"{name}.png"
+        if not path.exists():
+            rgb = _large_perf_source_from_case(case, size)
+            _save_rgb(path, rgb)
+        paths.append(path)
+    return paths
+
+
+def _profile_large_image_path(path: Path, *, source_kind: str) -> dict[str, Any]:
+    case: dict[str, Any] = {
+        "name": path.stem,
+        "source_kind": source_kind,
+        "source_path": str(path),
+        "source_bytes": int(path.stat().st_size),
+        "timings": {},
+        "runs": [],
+    }
+    start = time.perf_counter()
+    rgb, original_alpha = keyer_module.read_image_rgb(path)
+    _record_perf_timing(case, "load_decode", (time.perf_counter() - start) * 1000.0)
+    h, w = rgb.shape[:2]
+    case["shape"] = [int(h), int(w), 3]
+    case["megapixels"] = _perf_ms((h * w) / 1_000_000.0)
+    case["original_alpha_present"] = original_alpha is not None
+
+    start = time.perf_counter()
+    preview_rgb, preview_scale = keyer_module.resize_for_preview(rgb, max_side=1800)
+    _record_perf_timing(case, "proxy_resize", (time.perf_counter() - start) * 1000.0)
+    start = time.perf_counter()
+    preview_alpha = _resize_profile_alpha(original_alpha, preview_rgb.shape[:2])
+    _record_perf_timing(case, "proxy_alpha_resize", (time.perf_counter() - start) * 1000.0)
+    case["proxy"] = {"shape": list(preview_rgb.shape), "scale": float(preview_scale), "alpha_present": preview_alpha is not None}
+
+    exports_dir = LARGE_IMAGE_PERF_DIR / "exports"
+    for label, gpu_mode, input_rgb, input_alpha, include_debug, output_path, gui in (
+        ("preview_cpu", "Off", preview_rgb, preview_alpha, True, None, True),
+        ("preview_d3d12_auto", "Auto", preview_rgb, preview_alpha, True, None, True),
+        ("export_cpu", "Off", rgb, original_alpha, False, exports_dir / f"{path.stem}_cpu.png", False),
+        ("export_d3d12_auto", "Auto", rgb, original_alpha, False, exports_dir / f"{path.stem}_d3d12_auto.png", False),
+    ):
+        settings = _large_image_profile_settings(gpu_mode)
+        settings.preview_scale = float(preview_scale if label.startswith("preview") else 1.0)
+        run = _profile_keyer_run(
+            label,
+            input_rgb,
+            input_alpha,
+            settings,
+            include_debug=include_debug,
+            output_path=output_path,
+            measure_gui_conversion=gui,
+        )
+        case["runs"].append(run)
+
+    _finalize_perf_timings(case)
+    del preview_rgb
+    del preview_alpha
+    del rgb
+    gc.collect()
+    return case
+
+
+def _timing_total(report: dict[str, Any], stage: str) -> float:
+    return float(report.get("timings", {}).get(stage, {}).get("total_ms", 0.0))
+
+
+def _timing_prefix_total(report: dict[str, Any], prefix: str) -> float:
+    return float(
+        sum(float(record.get("total_ms", 0.0)) for stage, record in report.get("timings", {}).items() if str(stage).startswith(prefix))
+    )
+
+
+def _large_image_profile_report_text(summary: dict[str, Any]) -> str:
+    lines = [
+        "# ImgKey large-image performance profile",
+        "",
+        f"Generated by: `{summary['generated_by']}`",
+        f"Input directory: `{summary['input_dir']}`",
+        f"Input status: {summary['input_status']}",
+        f"Artifact dir: `{summary['artifact_dir']}`",
+        "",
+        "This command profiles current behavior only. It does not enable runtime caching or change keyer output.",
+        "",
+    ]
+    if summary.get("notes"):
+        lines.append("## Notes")
+        lines.extend(f"- {note}" for note in summary["notes"])
+        lines.append("")
+    tracked = [
+        "process_key_image_total",
+        "global_matte.total",
+        "global_matte.screen_probability",
+        "global_matte.connected_background",
+        "global_matte.trimap_alpha",
+        "global_matte.screen_cleanup",
+        "transition_alpha.global_recovery",
+        "transition_alpha.block",
+        "screen_reference.screen_map_global",
+        "screen_reference.transition_screen_tile_local",
+        "screen_reference.transition_nearest_inner_tile_local",
+        "screen_reference.screen_tile_resolve",
+        "screen_reference.nearest_inner_global",
+        "screen_reference.nearest_inner_tile",
+        "render.result_allocation",
+        "render.tiled_rgba_total",
+        "render.per_tile_color_render",
+        "render.tile_composite_write",
+        "gpu.begin_render",
+        "gpu.full_color_tile_call_wall",
+        "gpu.full_color_tile_reported_elapsed",
+        "png_encode",
+        "gui_checkerboard_composite",
+        "gui_pillow_image_fromarray",
+    ]
+    lines.append("## Cases")
+    for case in summary.get("cases", []):
+        lines.extend(
+            [
+                "",
+                f"### {case.get('name')} ({case.get('source_kind')})",
+                "",
+                f"- Source: `{case.get('source_path')}`",
+                f"- Shape: {case.get('shape')} ({case.get('megapixels')} MP)",
+                f"- Load/decode: {_timing_total(case, 'load_decode'):.3f} ms",
+                f"- Proxy resize: {_timing_total(case, 'proxy_resize'):.3f} ms; alpha resize: {_timing_total(case, 'proxy_alpha_resize'):.3f} ms",
+                "",
+                "| Run | Backend status | Used/Fallback tiles | Process ms | Global matte ms | Transition alpha ms | Screen/ref prep ms | GPU wall ms | PNG ms | GUI convert ms |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for run in case.get("runs", []):
+            gpu = run.get("result", {}).get("gpu_acceleration", {})
+            used = int(gpu.get("used_tiles", 0) or 0)
+            fallback = int(gpu.get("fallback_tiles", 0) or 0)
+            screen_ref = _timing_prefix_total(run, "screen_reference.")
+            gui_ms = _timing_total(run, "gui_checkerboard_composite") + _timing_total(run, "gui_pillow_image_fromarray")
+            lines.append(
+                f"| {run.get('name')} | {gpu.get('status')} / {gpu.get('backend')} | {used}/{fallback} | "
+                f"{_timing_total(run, 'process_key_image_total'):.3f} | {_timing_total(run, 'global_matte.total'):.3f} | "
+                f"{_timing_total(run, 'transition_alpha.global_recovery'):.3f} | {screen_ref:.3f} | "
+                f"{_timing_total(run, 'gpu.full_color_tile_call_wall'):.3f} | {_timing_total(run, 'png_encode'):.3f} | {gui_ms:.3f} |"
+            )
+        lines.append("")
+        for run in case.get("runs", []):
+            lines.append(f"#### {run.get('name')} stage timings")
+            lines.append("")
+            lines.append("| Stage | Total ms | Calls | Median ms | Max ms |")
+            lines.append("| --- | ---: | ---: | ---: | ---: |")
+            for stage in tracked:
+                record = run.get("timings", {}).get(stage)
+                if not record or float(record.get("total_ms", 0.0)) <= 0.0:
+                    continue
+                lines.append(
+                    f"| `{stage}` | {float(record.get('total_ms', 0.0)):.3f} | {int(record.get('calls', 0))} | "
+                    f"{float(record.get('median_ms', 0.0)):.3f} | {float(record.get('max_ms', 0.0)):.3f} |"
+                )
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def profile_large_images(image_dir: Path) -> None:
+    LARGE_IMAGE_PERF_DIR.mkdir(parents=True, exist_ok=True)
+    notes: list[str] = []
+    paths = _large_profile_image_paths(image_dir)
+    input_status = "real_images"
+    source_kind = "real"
+    if not image_dir.exists():
+        input_status = "missing_real_image_dir_synthetic_fallback"
+        notes.append(f"Input directory `{image_dir}` was absent; synthetic fallback fixtures were profiled instead.")
+        print(f"large-image profile: {image_dir} is absent; profiling synthetic fallback fixtures")
+        paths = _write_synthetic_large_profile_sources()
+        source_kind = "synthetic_fallback"
+    elif not paths:
+        input_status = "empty_real_image_dir_synthetic_fallback"
+        notes.append(f"Input directory `{image_dir}` contained no supported image files; synthetic fallback fixtures were profiled instead.")
+        print(f"large-image profile: {image_dir} has no supported images; profiling synthetic fallback fixtures")
+        paths = _write_synthetic_large_profile_sources()
+        source_kind = "synthetic_fallback"
+    summary: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_by": f"python smoke_test.py --profile-large-images {image_dir}",
+        "artifact_dir": str(LARGE_IMAGE_PERF_DIR),
+        "input_dir": str(image_dir),
+        "input_status": input_status,
+        "notes": notes,
+        "python": sys.version,
+        "cases": [],
+    }
+    for path in paths:
+        print(f"profiling large image {path}")
+        try:
+            summary["cases"].append(_profile_large_image_path(path, source_kind=source_kind))
+        except Exception as exc:
+            summary["cases"].append(
+                {
+                    "name": path.stem,
+                    "source_kind": source_kind,
+                    "source_path": str(path),
+                    "status": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            print(f"large-image profile failed for {path}: {type(exc).__name__}: {exc}")
+    report_text = _large_image_profile_report_text(summary)
+    summary_path = LARGE_IMAGE_PERF_DIR / "large_image_profile.json"
+    report_path = LARGE_IMAGE_PERF_DIR / "large_image_profile.md"
+    summary_path.write_text(json.dumps(_json_ready(summary), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(report_text, encoding="utf-8")
+    print(report_text.rstrip())
+    print(f"wrote large-image profile JSON to {summary_path}")
+    print(f"wrote large-image profile report to {report_path}")
+
+
 GEOMETRIC_PRIMARY_FEATURES = (
     "transparency_bands",
     "dots_speckles",
@@ -6217,14 +6771,39 @@ def main(argv: list[str] | None = None) -> None:
         "--gpu-benchmark",
         "--write-perf-baseline",
     }
-    unknown = [arg for arg in args if arg not in allowed]
-    if unknown:
+    usage = (
+        "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
+        "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--write-geometric-benchmark] "
+        "[--tune-geometric-defaults] [--gpu-parity] [--gpu-benchmark] [--write-perf-baseline] "
+        "[--profile-large-images <image_dir>]"
+    )
+    flags: list[str] = []
+    profile_dirs: list[Path] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-h", "--help"}:
+            print(usage)
+            return
+        if arg == "--profile-large-images":
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                raise SystemExit(f"{usage}; --profile-large-images requires <image_dir>")
+            profile_dirs.append(Path(args[index + 1]))
+            index += 2
+            continue
+        if arg in allowed:
+            flags.append(arg)
+            index += 1
+            continue
         raise SystemExit(
-            "usage: python smoke_test.py [--write-diagnostics] [--write-edge-repair-diagnostics] "
-            "[--write-algorithm-baseline] [--write-transition-unmix-diagnostics] [--write-geometric-benchmark] "
-            "[--tune-geometric-defaults] [--gpu-parity] [--gpu-benchmark] [--write-perf-baseline]; "
-            f"unknown: {', '.join(unknown)}"
+            f"{usage}; unknown: {arg}"
         )
+    args = flags
+
+    if profile_dirs and not args:
+        for image_dir in profile_dirs:
+            profile_large_images(image_dir)
+        return
 
     writing_algorithm_baseline = "--write-algorithm-baseline" in args
 
@@ -6239,6 +6818,7 @@ def main(argv: list[str] | None = None) -> None:
         run_phase4_tile_local_screen_tests()
         run_phase5_crop_render_tests()
         run_phase6_tile_local_nearest_inner_tests()
+    run_cache_key_classification_tests()
     run_gpu_runtime_probe_tests()
     run_gpu_accel_backend_tests()
     run_gpu_backend_registry_tests()
@@ -6267,6 +6847,8 @@ def main(argv: list[str] | None = None) -> None:
         write_gpu_benchmarks()
     if "--write-perf-baseline" in args:
         write_perf_baseline()
+    for image_dir in profile_dirs:
+        profile_large_images(image_dir)
     print("smoke ok", rgba.shape)
 
 

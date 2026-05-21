@@ -1,7 +1,7 @@
 # 11 - ImgKey Large-Image Acceleration
 
 Date: 2026-05-21
-Status: Planned
+Status: In progress
 Owner: ImgKey Large-Image Pipeline + GUI Responsiveness
 Scope: Make 25MP+ blue/green-key workflows feel materially faster by reducing CPU-global recomputation, improving preview responsiveness, and extending D3D12 acceleration where whole-pipeline profiling shows ROI.
 
@@ -191,10 +191,15 @@ Isolation:
 - Own profiling utilities, smoke/perf tests, and classification helpers. No behavior-changing cache yet.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress notes:
+- Phase 1 added reusable in-engine profiling hooks plus `python smoke_test.py --profile-large-images <image_dir>`, writing JSON/markdown under `.artifact/large-image-perf/` with load/decode, proxy, global matte, transition alpha, screen/reference prep, D3D12 tile, allocation/composite, PNG, and GUI-adjacent conversion timings.
+- Real-image profiling on `C:\Users\Admin\Downloads\zzz` completed and recorded CPU/D3D12 preview/export breakdowns with backend usage/fallback counts.
+- Cache-key helpers now classify every `KeySettings` field into source/mask/base-matte/transition-alpha/tile-prep/color/backend categories and provide generation-key fingerprint helpers for source/proxy/original-alpha and masks/imported matte. No runtime cache behavior was enabled.
 
 #### P1.1 - Add first-class real-image profiling command
 - Add a durable CLI/test path for profiling arbitrary input directories, expected command shape: `python smoke_test.py --profile-large-images <image_dir>` or an equivalent documented command. If `C:\Users\Admin\Downloads\zzz` is absent, skip it gracefully and run synthetic fallback fixtures.
@@ -219,10 +224,14 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress notes:
+- Implemented `imgkey_engine.profiling.PipelineProfiler` and instrumented keyer/global matte, transition-alpha, tile prep, CPU/D3D12 color, result allocation/composite, and smoke-test load/proxy/PNG/GUI-adjacent stages.
+- Added `--profile-large-images <image_dir>` with synthetic fallback when the directory is missing or has no supported image files; reports are `.artifact/large-image-perf/large_image_profile.json` and `.artifact/large-image-perf/large_image_profile.md`.
 
 #### P1.2 - Classify settings and cache invalidation keys
 - Add explicit helpers/tests that split `KeySettings` into source/mask/matte/color/backend-affecting fingerprints.
@@ -245,10 +254,14 @@ Verification:
 - py_compile expanded file list
 
 Status:
-- Planned
+- Completed
 
 Current:
 - No
+
+Progress notes:
+- Implemented `imgkey_engine.cache_keys` with conservative field classification, stable settings/cache fingerprints, and source/mask/imported-matte generation-key payloads.
+- Added smoke regression coverage proving color-only/backend settings preserve matte fingerprints while source/original-alpha generations, key/tolerance/matte fields, imported matte/mask generations, transition-alpha fields, and tile geometry/local-screen caps invalidate the appropriate matte pipeline keys.
 
 ---
 
@@ -270,7 +283,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P2.1 - Define internal cache API contract
 - Define internal cache objects and optional `process_key_image` cache input/output contract before implementing runtime reuse.
@@ -297,7 +310,7 @@ Status:
 - Planned
 
 Current:
-- No
+- Yes
 
 #### P2.2 - Introduce source/base/transition cache records
 - Add cache records for decoded source identity, original alpha, manual/imported mask generations, full-resolution base matte, alpha, trimap/core/background masks, transition/recovered alpha, and optional reference metadata.

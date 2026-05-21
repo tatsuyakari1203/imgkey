@@ -57,6 +57,7 @@ from imgkey_engine.matte import (
     _refine_alpha_guided,
     _remove_small_components,
 )
+from imgkey_engine.profiling import record_count, time_block
 from imgkey_engine.references import (
     _bool_mask_or_empty,
     _bounded_tile_local_nearest_inner_radius,
@@ -181,47 +182,50 @@ def process_key_image(
         raise ValueError(f"Unsupported keying mode: {settings.mode}")
 
     _raise_if_cancelled(cancel_callback)
-    global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, progress_callback, cancel_callback)
+    with time_block("global_matte.total"):
+        global_matte = _build_global_matte(rgb, settings, original_alpha, keep, remove, hint, progress_callback, cancel_callback)
     _report(progress_callback, 0.18, "global matte")
     _raise_if_cancelled(cancel_callback)
 
     crop = _normalized_crop(settings.full_res_crop, w, h)
     gpu_stats = _new_gpu_stats(settings)
-    rgba, despill_mask = _render_tiled_rgba(
-        rgb,
-        settings,
-        global_matte,
-        progress_callback,
-        cancel_callback,
-        render_crop=crop,
-        include_debug=include_debug,
-        gpu_stats=gpu_stats,
-    )
-    if include_debug:
-        foreground = rgba[:, :, :3].copy()
-        if crop is not None:
-            x0, y0, x1, y1 = crop
-            alpha = global_matte.alpha[y0:y1, x0:x1].copy()
-            background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-            edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
-            fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
-            probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
-            hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
+    with time_block("render.tiled_rgba_total"):
+        rgba, despill_mask = _render_tiled_rgba(
+            rgb,
+            settings,
+            global_matte,
+            progress_callback,
+            cancel_callback,
+            render_crop=crop,
+            include_debug=include_debug,
+            gpu_stats=gpu_stats,
+        )
+    with time_block("result.debug_output_conversion"):
+        if include_debug:
+            foreground = rgba[:, :, :3].copy()
+            if crop is not None:
+                x0, y0, x1, y1 = crop
+                alpha = global_matte.alpha[y0:y1, x0:x1].copy()
+                background_mask = (global_matte.background_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+                edge_mask = (global_matte.edge_mask[y0:y1, x0:x1].astype(np.uint8) * 255)
+                fringe_mask = global_matte.fringe_mask[y0:y1, x0:x1].copy()
+                probability = global_matte.screen_probability[y0:y1, x0:x1].copy()
+                hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint[y0:y1, x0:x1].copy()
+            else:
+                alpha = global_matte.alpha
+                background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
+                edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
+                fringe_mask = global_matte.fringe_mask
+                probability = global_matte.screen_probability
+                hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint.copy()
         else:
-            alpha = global_matte.alpha
-            background_mask = (global_matte.background_mask.astype(np.uint8) * 255)
-            edge_mask = (global_matte.edge_mask.astype(np.uint8) * 255)
-            fringe_mask = global_matte.fringe_mask
-            probability = global_matte.screen_probability
-            hint_out = None if global_matte.alpha_hint is None else global_matte.alpha_hint.copy()
-    else:
-        foreground = None
-        alpha = rgba[:, :, 3]
-        background_mask = None
-        edge_mask = None
-        fringe_mask = None
-        probability = None
-        hint_out = None
+            foreground = None
+            alpha = rgba[:, :, 3]
+            background_mask = None
+            edge_mask = None
+            fringe_mask = None
+            probability = None
+            hint_out = None
     return KeyResult(
         rgba=rgba,
         alpha=alpha,
@@ -249,46 +253,39 @@ def _build_global_matte(
     cancel_callback: CancelCallback | None,
 ) -> _GlobalMatte:
     h, w = rgb.shape[:2]
-    screen_color = _sample_screen_color(rgb, settings)
+    with time_block("global_matte.sample_screen"):
+        screen_color = _sample_screen_color(rgb, settings)
     _report(progress_callback, 0.02, "sample screen")
     _raise_if_cancelled(cancel_callback)
-    probability = _compute_screen_probability(rgb, screen_color, settings, progress_callback, cancel_callback)
+    with time_block("global_matte.screen_probability"):
+        probability = _compute_screen_probability(rgb, screen_color, settings, progress_callback, cancel_callback)
     _report(progress_callback, 0.10, "screen probability")
     _raise_if_cancelled(cancel_callback)
 
-    bg_threshold = int(round(_clip01(settings.clip_background) * 255.0))
-    fg_threshold = int(round(_clip01(settings.clip_foreground) * 255.0))
-    candidates = probability >= bg_threshold
+    with time_block("global_matte.connected_background"):
+        bg_threshold = int(round(_clip01(settings.clip_background) * 255.0))
+        fg_threshold = int(round(_clip01(settings.clip_foreground) * 255.0))
+        candidates = probability >= bg_threshold
 
-    if settings.erode_expand != 0:
-        k = _ellipse_kernel(abs(int(settings.erode_expand)))
-        if settings.erode_expand > 0:
-            candidates = cv2.dilate(candidates.astype(np.uint8), k) > 0
-        else:
-            candidates = cv2.erode(candidates.astype(np.uint8), k) > 0
+        if settings.erode_expand != 0:
+            k = _ellipse_kernel(abs(int(settings.erode_expand)))
+            if settings.erode_expand > 0:
+                candidates = cv2.dilate(candidates.astype(np.uint8), k) > 0
+            else:
+                candidates = cv2.erode(candidates.astype(np.uint8), k) > 0
 
-    background = _border_connected(candidates)
+        background = _border_connected(candidates)
     _report(progress_callback, 0.12, "connected background")
     _raise_if_cancelled(cancel_callback)
-    if settings.aggressive_interior_removal:
-        aggressive = probability >= int(round(_clip01(settings.aggressive_threshold) * 255.0))
-        if settings.aggressive_min_area > 1:
-            aggressive = _remove_small_components(aggressive, int(settings.aggressive_min_area), protect_border=False)
-        background |= aggressive
+    with time_block("global_matte.aggressive_background"):
+        if settings.aggressive_interior_removal:
+            aggressive = probability >= int(round(_clip01(settings.aggressive_threshold) * 255.0))
+            if settings.aggressive_min_area > 1:
+                aggressive = _remove_small_components(aggressive, int(settings.aggressive_min_area), protect_border=False)
+            background |= aggressive
 
-    hint_foreground = _alpha_hint_foreground_mask(alpha_hint, settings)
-    if hint_foreground is not None:
-        background &= ~hint_foreground
-    if keep_mask is not None:
-        background &= ~keep_mask
-    if remove_mask is not None:
-        remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
-        background |= remove_effective
-
-    min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
-    if min_area > 0:
-        background = _remove_small_components(background, min_area, protect_border=True)
-        background = _fill_small_holes(background, min_area)
+    with time_block("global_matte.mask_merge"):
+        hint_foreground = _alpha_hint_foreground_mask(alpha_hint, settings)
         if hint_foreground is not None:
             background &= ~hint_foreground
         if keep_mask is not None:
@@ -297,38 +294,57 @@ def _build_global_matte(
             remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
             background |= remove_effective
 
-    edge_mask, alpha = _build_alpha_from_trimap(background, probability, fg_threshold, bg_threshold, settings)
+    with time_block("global_matte.cleanup"):
+        min_area = max(int(settings.despeckle_min_area), int(settings.cleanup) * 12)
+        if min_area > 0:
+            background = _remove_small_components(background, min_area, protect_border=True)
+            background = _fill_small_holes(background, min_area)
+            if hint_foreground is not None:
+                background &= ~hint_foreground
+            if keep_mask is not None:
+                background &= ~keep_mask
+            if remove_mask is not None:
+                remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+                background |= remove_effective
+
+    with time_block("global_matte.trimap_alpha"):
+        edge_mask, alpha = _build_alpha_from_trimap(background, probability, fg_threshold, bg_threshold, settings)
     _report(progress_callback, 0.15, "trimap")
     _raise_if_cancelled(cancel_callback)
-    if keep_mask is not None:
-        alpha[keep_mask] = 255
-        edge_mask[keep_mask] = False
-    if alpha_hint is not None:
-        _apply_alpha_hint(alpha, edge_mask, background, alpha_hint, settings)
-    if remove_mask is not None:
-        remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
-        alpha[remove_effective] = 0
-        background[remove_effective] = True
+    with time_block("global_matte.mask_alpha_apply"):
+        if keep_mask is not None:
+            alpha[keep_mask] = 255
+            edge_mask[keep_mask] = False
+        if alpha_hint is not None:
+            _apply_alpha_hint(alpha, edge_mask, background, alpha_hint, settings)
+        if remove_mask is not None:
+            remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
+            alpha[remove_effective] = 0
+            background[remove_effective] = True
 
-    alpha = _refine_alpha_guided(rgb, alpha, edge_mask, background, probability, fg_threshold, bg_threshold, settings)
+    with time_block("global_matte.guided_alpha_refine"):
+        alpha = _refine_alpha_guided(rgb, alpha, edge_mask, background, probability, fg_threshold, bg_threshold, settings)
 
-    screen_map = _estimate_screen_map(rgb, probability >= bg_threshold, screen_color, settings)
+    with time_block("screen_reference.screen_map_global"):
+        screen_map = _estimate_screen_map(rgb, probability >= bg_threshold, screen_color, settings)
     _report(progress_callback, 0.17, "screen model")
     _raise_if_cancelled(cancel_callback)
-    alpha = _apply_original_alpha(alpha, original_alpha)
-    alpha, screen_cleanup = _apply_screen_residue_alpha_cleanup(
-        rgb,
-        alpha,
-        probability,
-        screen_color,
-        screen_map,
-        settings,
-        keep_mask,
-        remove_mask,
-        alpha_hint,
-        progress_callback,
-        cancel_callback,
-    )
+    with time_block("global_matte.original_alpha_apply"):
+        alpha = _apply_original_alpha(alpha, original_alpha)
+    with time_block("global_matte.screen_cleanup"):
+        alpha, screen_cleanup = _apply_screen_residue_alpha_cleanup(
+            rgb,
+            alpha,
+            probability,
+            screen_color,
+            screen_map,
+            settings,
+            keep_mask,
+            remove_mask,
+            alpha_hint,
+            progress_callback,
+            cancel_callback,
+        )
     if screen_cleanup is not None and np.any(screen_cleanup):
         background |= screen_cleanup
         edge_mask[screen_cleanup] = False
@@ -339,38 +355,41 @@ def _build_global_matte(
             remove_effective = remove_mask if keep_mask is None else (remove_mask & ~keep_mask)
             background |= remove_effective
             edge_mask[remove_effective] = False
-    fringe_mask = _build_fringe_mask(rgb, alpha, edge_mask, probability, screen_color, settings, progress_callback, cancel_callback)
+    with time_block("global_matte.fringe_map"):
+        fringe_mask = _build_fringe_mask(rgb, alpha, edge_mask, probability, screen_color, settings, progress_callback, cancel_callback)
     _report(progress_callback, 0.175, "fringe map")
     _raise_if_cancelled(cancel_callback)
-    inner_labels, inner_label_to_flat, inner_distance = _build_nearest_inner_reference_map(
-        alpha,
-        background,
-        probability,
-        fringe_mask,
-        settings,
-    )
+    with time_block("screen_reference.nearest_inner_global"):
+        inner_labels, inner_label_to_flat, inner_distance = _build_nearest_inner_reference_map(
+            alpha,
+            background,
+            probability,
+            fringe_mask,
+            settings,
+        )
     _report(progress_callback, 0.18, "inner color map")
     _raise_if_cancelled(cancel_callback)
     color_alpha = alpha.copy() if bool(settings.transition_unmix) and _clip01(settings.alpha_recover_strength) > 0 else None
-    alpha = _recover_transition_alpha_global(
-        rgb,
-        alpha,
-        background,
-        edge_mask,
-        probability,
-        fringe_mask,
-        screen_color,
-        screen_map,
-        inner_labels,
-        inner_label_to_flat,
-        inner_distance,
-        settings,
-        original_alpha,
-        keep_mask,
-        remove_mask,
-        progress_callback,
-        cancel_callback,
-    )
+    with time_block("transition_alpha.global_recovery"):
+        alpha = _recover_transition_alpha_global(
+            rgb,
+            alpha,
+            background,
+            edge_mask,
+            probability,
+            fringe_mask,
+            screen_color,
+            screen_map,
+            inner_labels,
+            inner_label_to_flat,
+            inner_distance,
+            settings,
+            original_alpha,
+            keep_mask,
+            remove_mask,
+            progress_callback,
+            cancel_callback,
+        )
     _report(progress_callback, 0.18, "transition alpha")
     return _GlobalMatte(
         screen_color=screen_color,
@@ -410,16 +429,19 @@ def _render_tiled_rgba(
         out_h, out_w = out_y1 - out_y0, out_x1 - out_x0
         alpha_out = matte.alpha[out_y0:out_y1, out_x0:out_x1]
 
-    rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
-    rgba[:, :, 3] = alpha_out
-    despill_mask = np.zeros((out_h, out_w), dtype=np.uint8) if include_debug else None
+    with time_block("render.result_allocation"):
+        rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+        rgba[:, :, 3] = alpha_out
+        despill_mask = np.zeros((out_h, out_w), dtype=np.uint8) if include_debug else None
     reference_alpha = matte.alpha if matte.color_alpha is None else matte.color_alpha
-    screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
-    local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
-    extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
-    tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=extra_overlap))
-    if crop is not None:
-        tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
+    with time_block("render.tile_enumeration"):
+        screen_radius = _screen_model_radius_for_shape((h, w)) if settings.local_screen_model and matte.screen_map is None else 0
+        local_nearest_radius = _tile_local_nearest_inner_radius(settings) if matte.inner_labels is None else 0
+        extra_overlap = _tile_extra_overlap(settings, (h, w), screen_radius, local_nearest_radius)
+        tiles = list(_iter_tiles(h, w, settings, _effective_edge_radius(settings), extra_overlap=extra_overlap))
+        if crop is not None:
+            tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
+    record_count("render.tiles", len(tiles))
     total = max(1, len(tiles))
     gpu_session = None
     if _gpu_acceleration_mode(settings) != "Off":
@@ -429,7 +451,8 @@ def _render_tiled_rgba(
             required = {"rgb_only"}
             if matte.screen_map is not None or settings.local_screen_model:
                 required.add("screen_tile")
-            gpu_session = gpu_backend.begin_render(settings, (h, w), required_capabilities=required)
+            with time_block("gpu.begin_render"):
+                gpu_session = gpu_backend.begin_render(settings, (h, w), required_capabilities=required)
         except Exception:
             gpu_session = None
     for index, tile in enumerate(tiles, start=1):
@@ -451,111 +474,117 @@ def _render_tiled_rgba(
         out_y = slice(write_y0 - out_y0, write_y1 - out_y0)
         out_x = slice(write_x0 - out_x0, write_x1 - out_x0)
         rgb_read = rgb[read_y, read_x]
-        if matte.screen_map is not None:
-            screen_tile = matte.screen_map[read_y, read_x]
-        elif settings.local_screen_model:
-            screen_tile = _estimate_screen_tile(
-                rgb_read,
-                matte.background_mask[read_y, read_x],
-                matte.screen_color,
-                screen_radius,
-            )
-        else:
-            screen_tile = None
-        if matte.inner_labels is not None and matte.inner_label_to_flat is not None:
-            nearest_inner_rgb, nearest_inner_valid = _nearest_inner_rgb_for_slice(
-                rgb,
-                matte.inner_labels,
-                matte.inner_label_to_flat,
-                read_y,
-                read_x,
-            )
-            if _transition_reference_enabled(settings):
-                transition_inner_rgb, transition_inner_valid, _ = _foreground_reference_for_slice(
+        with time_block("screen_reference.screen_tile_resolve"):
+            if matte.screen_map is not None:
+                screen_tile = matte.screen_map[read_y, read_x]
+            elif settings.local_screen_model:
+                screen_tile = _estimate_screen_tile(
+                    rgb_read,
+                    matte.background_mask[read_y, read_x],
+                    matte.screen_color,
+                    screen_radius,
+                )
+            else:
+                screen_tile = None
+        with time_block("screen_reference.nearest_inner_tile"):
+            if matte.inner_labels is not None and matte.inner_label_to_flat is not None:
+                nearest_inner_rgb, nearest_inner_valid = _nearest_inner_rgb_for_slice(
                     rgb,
                     matte.inner_labels,
                     matte.inner_label_to_flat,
-                    matte.inner_distance,
                     read_y,
                     read_x,
-                    _foreground_reference_radius(settings),
-                )
-            else:
-                transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
-        else:
-            bounded_local_radius = _bounded_tile_local_nearest_inner_radius(
-                local_nearest_radius,
-                read_y,
-                read_x,
-                core_y,
-                core_x,
-                (h, w),
-            )
-            if _can_build_tile_local_nearest_inner(read_y, read_x, core_y, core_x, (h, w)):
-                nearest_inner_rgb, nearest_inner_valid = _build_tile_local_nearest_inner_rgb(
-                    rgb_read,
-                    reference_alpha[read_y, read_x],
-                    matte.background_mask[read_y, read_x],
-                    matte.screen_probability[read_y, read_x],
-                    matte.fringe_mask[read_y, read_x],
-                    settings,
-                    bounded_local_radius,
                 )
                 if _transition_reference_enabled(settings):
-                    bounded_transition_radius = _bounded_tile_local_nearest_inner_radius(
-                        _foreground_reference_radius(settings),
+                    transition_inner_rgb, transition_inner_valid, _ = _foreground_reference_for_slice(
+                        rgb,
+                        matte.inner_labels,
+                        matte.inner_label_to_flat,
+                        matte.inner_distance,
                         read_y,
                         read_x,
-                        core_y,
-                        core_x,
-                        (h, w),
+                        _foreground_reference_radius(settings),
                     )
-                    if bounded_transition_radius == bounded_local_radius:
-                        transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
-                    elif bounded_transition_radius > 0:
-                        transition_inner_rgb, transition_inner_valid = _build_tile_local_nearest_inner_rgb(
-                            rgb_read,
-                            reference_alpha[read_y, read_x],
-                            matte.background_mask[read_y, read_x],
-                            matte.screen_probability[read_y, read_x],
-                            matte.fringe_mask[read_y, read_x],
-                            settings,
-                            bounded_transition_radius,
-                        )
-                    else:
-                        transition_inner_rgb, transition_inner_valid = None, None
                 else:
                     transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
             else:
-                nearest_inner_rgb, nearest_inner_valid = None, None
-                transition_inner_rgb, transition_inner_valid = None, None
-        rgb_tile, spill_tile = _process_color_tile(
-            rgb_read,
-            matte.alpha[read_y, read_x],
-            matte.background_mask[read_y, read_x],
-            matte.edge_mask[read_y, read_x],
-            matte.screen_probability[read_y, read_x],
-            matte.fringe_mask[read_y, read_x],
-            screen_tile,
-            nearest_inner_rgb,
-            nearest_inner_valid,
-            matte.screen_color,
-            settings,
-            transition_nearest_rgb=transition_inner_rgb,
-            transition_nearest_valid=transition_inner_valid,
-            gpu_stats=gpu_stats,
-            gpu_session=gpu_session,
-        )
-        rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
-        if despill_mask is not None:
-            despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
+                bounded_local_radius = _bounded_tile_local_nearest_inner_radius(
+                    local_nearest_radius,
+                    read_y,
+                    read_x,
+                    core_y,
+                    core_x,
+                    (h, w),
+                )
+                if _can_build_tile_local_nearest_inner(read_y, read_x, core_y, core_x, (h, w)):
+                    nearest_inner_rgb, nearest_inner_valid = _build_tile_local_nearest_inner_rgb(
+                        rgb_read,
+                        reference_alpha[read_y, read_x],
+                        matte.background_mask[read_y, read_x],
+                        matte.screen_probability[read_y, read_x],
+                        matte.fringe_mask[read_y, read_x],
+                        settings,
+                        bounded_local_radius,
+                    )
+                    if _transition_reference_enabled(settings):
+                        bounded_transition_radius = _bounded_tile_local_nearest_inner_radius(
+                            _foreground_reference_radius(settings),
+                            read_y,
+                            read_x,
+                            core_y,
+                            core_x,
+                            (h, w),
+                        )
+                        if bounded_transition_radius == bounded_local_radius:
+                            transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
+                        elif bounded_transition_radius > 0:
+                            transition_inner_rgb, transition_inner_valid = _build_tile_local_nearest_inner_rgb(
+                                rgb_read,
+                                reference_alpha[read_y, read_x],
+                                matte.background_mask[read_y, read_x],
+                                matte.screen_probability[read_y, read_x],
+                                matte.fringe_mask[read_y, read_x],
+                                settings,
+                                bounded_transition_radius,
+                            )
+                        else:
+                            transition_inner_rgb, transition_inner_valid = None, None
+                    else:
+                        transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
+                else:
+                    nearest_inner_rgb, nearest_inner_valid = None, None
+                    transition_inner_rgb, transition_inner_valid = None, None
+        with time_block("render.per_tile_color_render"):
+            rgb_tile, spill_tile = _process_color_tile(
+                rgb_read,
+                matte.alpha[read_y, read_x],
+                matte.background_mask[read_y, read_x],
+                matte.edge_mask[read_y, read_x],
+                matte.screen_probability[read_y, read_x],
+                matte.fringe_mask[read_y, read_x],
+                screen_tile,
+                nearest_inner_rgb,
+                nearest_inner_valid,
+                matte.screen_color,
+                settings,
+                transition_nearest_rgb=transition_inner_rgb,
+                transition_nearest_valid=transition_inner_valid,
+                gpu_stats=gpu_stats,
+                gpu_session=gpu_session,
+            )
+        with time_block("render.tile_composite_write"):
+            rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
+            if despill_mask is not None:
+                despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
         _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
     if gpu_session is not None:
         try:
-            gpu_session.end_render()
+            with time_block("gpu.end_render"):
+                gpu_session.end_render()
         except Exception:
             pass
-    rgba[alpha_out <= 0, :3] = 0
+    with time_block("render.transparent_rgb_zero"):
+        rgba[alpha_out <= 0, :3] = 0
     return rgba, despill_mask
 
 

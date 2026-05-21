@@ -16,6 +16,7 @@ from .references import (
 )
 from .screen_model import _estimate_screen_tile
 from .tiling import _raise_if_cancelled, _report, _screen_model_radius_for_shape
+from .profiling import time_block
 from .types import (
     CancelCallback,
     KeySettings,
@@ -74,32 +75,34 @@ def _recover_transition_alpha_global(
             y1 = min(h, y0 + stripe_rows)
             read_y = slice(y0, y1)
             read_x = slice(0, w)
-            foreground_ref_rgb, foreground_ref_valid, foreground_ref_distance = _foreground_reference_for_slice(
-                rgb,
-                inner_labels,
-                inner_label_to_flat,
-                inner_distance,
-                read_y,
-                read_x,
-                radius,
-            )
-            _recover_transition_alpha_block(
-                rgb[read_y, read_x],
-                alpha[read_y, read_x],
-                background_mask[read_y, read_x],
-                edge_mask[read_y, read_x],
-                probability[read_y, read_x],
-                fringe_mask[read_y, read_x],
-                screen_color,
-                None if screen_map is None else screen_map[read_y, read_x],
-                foreground_ref_rgb,
-                foreground_ref_valid,
-                foreground_ref_distance,
-                foreground_core[read_y, read_x],
-                None if keep_mask is None else keep_mask[read_y, read_x],
-                None if remove_mask is None else remove_mask[read_y, read_x],
-                settings,
-            )
+            with time_block("screen_reference.transition_nearest_inner_slice"):
+                foreground_ref_rgb, foreground_ref_valid, foreground_ref_distance = _foreground_reference_for_slice(
+                    rgb,
+                    inner_labels,
+                    inner_label_to_flat,
+                    inner_distance,
+                    read_y,
+                    read_x,
+                    radius,
+                )
+            with time_block("transition_alpha.block"):
+                _recover_transition_alpha_block(
+                    rgb[read_y, read_x],
+                    alpha[read_y, read_x],
+                    background_mask[read_y, read_x],
+                    edge_mask[read_y, read_x],
+                    probability[read_y, read_x],
+                    fringe_mask[read_y, read_x],
+                    screen_color,
+                    None if screen_map is None else screen_map[read_y, read_x],
+                    foreground_ref_rgb,
+                    foreground_ref_valid,
+                    foreground_ref_distance,
+                    foreground_core[read_y, read_x],
+                    None if keep_mask is None else keep_mask[read_y, read_x],
+                    None if remove_mask is None else remove_mask[read_y, read_x],
+                    settings,
+                )
             _report(progress_callback, 0.175 + 0.005 * (index / total), "transition alpha")
     else:
         _recover_transition_alpha_tile_local(
@@ -181,15 +184,16 @@ def _recover_transition_alpha_tile_local(
     for index, (read_y, read_x, core_y, core_x) in enumerate(tiles, start=1):
         _raise_if_cancelled(cancel_callback)
         bounded_radius = _bounded_tile_local_nearest_inner_radius(radius, read_y, read_x, core_y, core_x, (h, w))
-        foreground_ref_rgb, foreground_ref_valid, foreground_ref_distance = _build_tile_local_nearest_inner_reference(
-            rgb[read_y, read_x],
-            baseline_alpha[read_y, read_x],
-            background_mask[read_y, read_x],
-            probability[read_y, read_x],
-            fringe_mask[read_y, read_x],
-            settings,
-            bounded_radius,
-        )
+        with time_block("screen_reference.transition_nearest_inner_tile_local"):
+            foreground_ref_rgb, foreground_ref_valid, foreground_ref_distance = _build_tile_local_nearest_inner_reference(
+                rgb[read_y, read_x],
+                baseline_alpha[read_y, read_x],
+                background_mask[read_y, read_x],
+                probability[read_y, read_x],
+                fringe_mask[read_y, read_x],
+                settings,
+                bounded_radius,
+            )
         if foreground_ref_rgb is None or foreground_ref_valid is None:
             _report(progress_callback, 0.175 + 0.005 * (index / total), "transition alpha")
             continue
@@ -197,30 +201,32 @@ def _recover_transition_alpha_tile_local(
         rel_x = slice(core_x.start - read_x.start, core_x.stop - read_x.start)
         screen_tile = None if screen_map is None else screen_map[core_y, core_x]
         if screen_tile is None and settings.local_screen_model:
-            screen_read = _facade_callable("_estimate_screen_tile", _estimate_screen_tile)(
-                rgb[read_y, read_x],
-                background_mask[read_y, read_x],
-                screen_color,
-                _screen_model_radius_for_shape((h, w)),
-            )
+            with time_block("screen_reference.transition_screen_tile_local"):
+                screen_read = _facade_callable("_estimate_screen_tile", _estimate_screen_tile)(
+                    rgb[read_y, read_x],
+                    background_mask[read_y, read_x],
+                    screen_color,
+                    _screen_model_radius_for_shape((h, w)),
+                )
             screen_tile = screen_read[rel_y, rel_x]
-        _recover_transition_alpha_block(
-            rgb[core_y, core_x],
-            alpha[core_y, core_x],
-            background_mask[core_y, core_x],
-            edge_mask[core_y, core_x],
-            probability[core_y, core_x],
-            fringe_mask[core_y, core_x],
-            screen_color,
-            screen_tile,
-            foreground_ref_rgb[rel_y, rel_x],
-            foreground_ref_valid[rel_y, rel_x],
-            None if foreground_ref_distance is None else foreground_ref_distance[rel_y, rel_x],
-            foreground_core[core_y, core_x],
-            None if keep_mask is None else keep_mask[core_y, core_x],
-            None if remove_mask is None else remove_mask[core_y, core_x],
-            settings,
-        )
+        with time_block("transition_alpha.block"):
+            _recover_transition_alpha_block(
+                rgb[core_y, core_x],
+                alpha[core_y, core_x],
+                background_mask[core_y, core_x],
+                edge_mask[core_y, core_x],
+                probability[core_y, core_x],
+                fringe_mask[core_y, core_x],
+                screen_color,
+                screen_tile,
+                foreground_ref_rgb[rel_y, rel_x],
+                foreground_ref_valid[rel_y, rel_x],
+                None if foreground_ref_distance is None else foreground_ref_distance[rel_y, rel_x],
+                foreground_core[core_y, core_x],
+                None if keep_mask is None else keep_mask[core_y, core_x],
+                None if remove_mask is None else remove_mask[core_y, core_x],
+                settings,
+            )
         _report(progress_callback, 0.175 + 0.005 * (index / total), "transition alpha")
 
 
