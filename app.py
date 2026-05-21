@@ -204,6 +204,7 @@ class MainWindow(QMainWindow):
         self._sync_key_chip()
         self._sync_imported_matte_status()
         self._sync_output_mode_status()
+        self._sync_preview_status()
         self._update_enabled_state()
 
     def _build_ui(self) -> None:
@@ -242,7 +243,7 @@ class MainWindow(QMainWindow):
         hud_layout.setSpacing(8)
         self.hud_zoom = QLabel("Zoom —")
         self.hud_zoom.setObjectName("HudText")
-        self.hud_preview = QLabel("Preview Proxy")
+        self.hud_preview = QLabel("Preview Proxy · cache idle")
         self.hud_preview.setObjectName("HudText")
         self.hud_hint = QLabel("Hold Space to pan")
         self.hud_hint.setObjectName("HudHint")
@@ -524,8 +525,28 @@ class MainWindow(QMainWindow):
 
         self.preview_quality = QComboBox()
         self.preview_quality.addItems(("Proxy", "Full Crop"))
+        self.preview_quality.setToolTip(
+            "Proxy is a fast whole-image preview. Full Crop is an exact pinned full-resolution ROI; "
+            "cold crops may run the full-image matte and never change full PNG export scope."
+        )
         self.preview_quality.currentTextChanged.connect(self._on_preview_quality_changed)
-        layout.addLayout(label_row("Preview", self.preview_quality))
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(8)
+        preview_label = QLabel("Preview")
+        preview_label.setObjectName("ControlLabel")
+        preview_row.addWidget(preview_label)
+        preview_row.addWidget(self.preview_quality, 1)
+        self.refresh_crop_btn = QPushButton("Refresh Crop")
+        self.refresh_crop_btn.setObjectName("SecondaryButton")
+        self.refresh_crop_btn.setToolTip("Pin the current viewport as the exact Full Crop preview ROI. Export still saves the full image.")
+        self.refresh_crop_btn.clicked.connect(self.refresh_full_crop)
+        preview_row.addWidget(self.refresh_crop_btn)
+        layout.addLayout(preview_row)
+
+        self.preview_status = QLabel("Preview: Proxy fast whole-image preview; exact export remains full resolution.")
+        self.preview_status.setObjectName("HintText")
+        self.preview_status.setWordWrap(True)
+        layout.addWidget(self.preview_status)
 
         mask_row = QHBoxLayout()
         self.import_keep_btn = QPushButton("Import Keep")
@@ -615,12 +636,31 @@ class MainWindow(QMainWindow):
         if hasattr(self, "preview_quality"):
             preview_mode = self.preview_quality.currentText()
         else:
-            preview_mode = "Full Crop" if self.current_preview_label.startswith("Full crop") else "Proxy"
-        self.hud_preview.setText(f"Preview {preview_mode}")
+            preview_mode = "Full Crop" if "crop" in self.current_preview_label.lower() else "Proxy"
+        if preview_mode == "Full Crop" and self.full_rgb is not None:
+            crop_text = self._preview_crop_text()
+            cache_text = self._preview_cache_state_text("Full Crop")
+            self.hud_preview.setText(f"Preview Exact Crop · {crop_text} · {cache_text}")
+        elif self.full_rgb is not None:
+            cache_text = self._preview_cache_state_text("Proxy")
+            self.hud_preview.setText(f"Preview Proxy whole image · {cache_text}")
+        else:
+            self.hud_preview.setText("Preview Proxy · cache idle")
 
     def _connect_slider_rows(self, *rows: SliderRow) -> None:
         for row in rows:
-            row.value_changed.connect(self.schedule_preview)
+            row.value_changed.connect(lambda r=row: self._on_slider_row_value_changed(r))
+            row.editing_finished.connect(lambda r=row: self._on_slider_row_committed(r))
+
+    def _on_slider_row_value_changed(self, row: SliderRow) -> None:
+        if row.is_slider_dragging:
+            self.schedule_preview(draft=True, debounce_ms=400)
+        else:
+            self.schedule_preview()
+
+    def _on_slider_row_committed(self, row: SliderRow) -> None:
+        del row
+        self.schedule_preview(debounce_ms=0)
 
     def _set_control_tooltip(self, row: SliderRow, text: str) -> None:
         row.setToolTip(text)
@@ -811,6 +851,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded {path.name}")
         self._sync_imported_matte_status()
         self._sync_output_mode_status()
+        self._sync_preview_status()
         self._update_enabled_state()
         self.schedule_preview()
 
@@ -850,16 +891,65 @@ class MainWindow(QMainWindow):
     def _processing_alpha_input(self, settings: KeySettings, shape: tuple[int, int]) -> np.ndarray | None:
         return processing_alpha_input(settings, self.alpha_hint_mask, shape)
 
-    def schedule_preview(self) -> None:
-        self.preview_controller.schedule_preview()
+    def _preview_cache_state_text(self, mode: str | None = None) -> str:
+        if self.full_rgb is None or not hasattr(self, "preview_controller"):
+            return "cache idle"
+        try:
+            return self.preview_controller.cache_state_for_mode(mode or self.preview_quality.currentText(), self.current_settings())
+        except Exception:
+            return "cache unavailable"
+
+    def _preview_crop_text(self) -> str:
+        if self.full_rgb is None:
+            return "no image"
+        crop = self._full_crop_rect
+        if crop is None:
+            crop = self._current_full_crop()
+        x0, y0, x1, y1 = crop
+        return f"{x1 - x0}×{y1 - y0} pinned @ {x0},{y0}"
+
+    def _sync_preview_status(self) -> None:
+        if not hasattr(self, "preview_status"):
+            return
+        mode = self.preview_quality.currentText() if hasattr(self, "preview_quality") else "Proxy"
+        if self.full_rgb is None:
+            self.preview_status.setText("Preview: load an image to start proxy preview.")
+            return
+        cache_state = self._preview_cache_state_text(mode)
+        if mode == "Full Crop":
+            self.preview_status.setText(
+                "Preview: Full Crop is an exact pinned full-resolution ROI "
+                f"({self._preview_crop_text()}); {cache_state}. Cold runs may build the full-image matte first. "
+                "Use Refresh Crop to recapture the current viewport. Export PNG remains full image."
+            )
+        else:
+            self.preview_status.setText(
+                f"Preview: Proxy is a fast whole-image preview ({cache_state}); exact export remains full resolution."
+            )
+
+    def schedule_preview(self, *, draft: bool = False, debounce_ms: int | None = None) -> None:
+        self.preview_controller.schedule_preview(draft=draft, debounce_ms=debounce_ms)
 
     def _cancel_preview_threads(self) -> None:
         self.preview_controller.cancel_preview_threads()
 
     def _on_preview_quality_changed(self, mode: str) -> None:
         self._full_crop_rect = self._current_full_crop() if mode == "Full Crop" and self.full_rgb is not None else None
-        self.current_result = None
+        self._sync_preview_status()
         self._update_canvas_hud()
+        self._update_enabled_state()
+        self.schedule_preview()
+
+    def refresh_full_crop(self) -> None:
+        if self.full_rgb is None:
+            return
+        self._full_crop_rect = self._current_full_crop()
+        if self.preview_quality.currentText() != "Full Crop":
+            self.preview_quality.setCurrentText("Full Crop")
+            return
+        self._sync_preview_status()
+        self._update_canvas_hud()
+        self.statusBar().showMessage(f"Full Crop refreshed · {self._preview_crop_text()} · export remains full image")
         self.schedule_preview()
 
     def _start_preview(self) -> None:
@@ -927,8 +1017,15 @@ class MainWindow(QMainWindow):
         if cache_transaction is not None:
             cache_transaction.commit()
             key_result.cache_info = cache_transaction.info.as_dict()
+            job.cache_state = "matte cached" if key_result.cache_info.get("cache_hit") == "matte" or key_result.cache_info.get("transition_alpha") in {"hit", "miss"} else job.cache_state
         self.current_result = key_result
-        self._set_current_source(job.display_rgb, job.display_alpha, job.display_scale, job.crop_origin, job.label, reset_view=False)
+        source_changed = (
+            self.current_source_rgb is None
+            or self.current_source_rgb.shape != job.display_rgb.shape
+            or self.current_crop_origin != job.crop_origin
+            or abs(self.current_display_scale - job.display_scale) > 1e-6
+        )
+        self._set_current_source(job.display_rgb, job.display_alpha, job.display_scale, job.crop_origin, job.label, reset_view=source_changed)
         if key_result.screen_color is not None:
             self.color_chip.setToolTip(f"Screen sample used by engine: RGB {key_result.screen_color}")
             key_rgb = self.settings.key_color
@@ -938,10 +1035,16 @@ class MainWindow(QMainWindow):
                 self.color_chip.setStyleSheet(f"background: rgb({r}, {g}, {b});")
         engine_text = f" · engine RGB {key_result.screen_color}" if key_result.screen_color is not None else ""
         cache = key_result.cache_info or {}
-        cache_text = f" · cache {cache.get('cache_hit')}" if cache.get("cache_hit") else ""
-        self.statusBar().showMessage(f"Preview ready · {job.label}{engine_text}{cache_text}")
+        cache_text = f" · cache {cache.get('cache_hit')}" if cache.get("cache_hit") else f" · {job.cache_state}"
+        exact_text = "exact" if job.exact else "draft"
+        self.statusBar().showMessage(f"Preview ready · {job.label} · {exact_text}{engine_text}{cache_text}")
         self._sync_gpu_usage_status(key_result.gpu_acceleration)
+        self._sync_preview_status()
         self._update_enabled_state()
+        if job.followup_exact and self.preview_quality.currentText() == "Full Crop" and generation == self._preview_generation:
+            self._preview_stage = "exact"
+            self._preview_draft_only = False
+            self._preview_pending = True
 
     def on_preview_failed(self, generation: int, message: str) -> None:
         self._preview_jobs.pop(generation, None)
@@ -1279,6 +1382,7 @@ class MainWindow(QMainWindow):
         self.import_remove_btn.setEnabled(has_image and not export_running)
         self.import_hint_btn.setEnabled(has_image and not export_running)
         self.clear_hint_btn.setEnabled(has_image and self.alpha_hint_mask is not None and not export_running)
+        self.refresh_crop_btn.setEnabled(has_image and self.preview_quality.currentText() == "Full Crop" and not export_running)
         self.gpu_status_action.setEnabled(not gpu_running)
         self.gpu_status_btn.setEnabled(not gpu_running)
         self.fit_action.setEnabled(has_image)

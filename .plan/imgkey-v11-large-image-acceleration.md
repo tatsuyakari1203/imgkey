@@ -114,6 +114,7 @@ The implementation must define and test all `KeySettings` fields against at leas
 If a setting is ambiguous, classify it as matte-affecting until tests prove otherwise.
 
 
+
 Current:
 - No
 ### Cache contracts
@@ -136,6 +137,7 @@ Cache publication rules:
 - Evict/release old full-resolution cache generations on image change, mask/imported matte change, or conservative settings invalidation.
 
 
+
 Current:
 - No
 ### Target metrics
@@ -146,6 +148,7 @@ Use the three user PNGs plus synthetic baselines:
 - Full Crop target: crop changes should render from a valid matte cache in a few seconds, not recompute `~21-24s`; when cache is invalid, UI must show stale/proxy progress honestly.
 - Export target: if preview already computed a valid full matte, export should avoid the `~22-36s` global recompute.
 - Full export fresh target: reduce D3D12 Auto+PNG below current `~33-54s` by optimizing transition/reference/prep and PNG options.
+
 
 
 Current:
@@ -184,6 +187,7 @@ Scheduling note:
 - Default execution is serial by phase number, except Phase 6.1 (`Fast PNG compression option`) is low-risk and independent after Phase 1 profiling. Planner may pull only P6.1 forward before Phase 4/5 if the user wants an immediate export-save-time win.
 - Phase 6.2 (`Export progress and cache visibility`) depends on Phase 2 cache metadata; before Phase 2 it may only add generic stage progress, not cache-hit/cache-miss UX.
 - Phase 5 (`Persistent D3D12 large-image batch pipeline`) is conditional/follow-on: do not implement native batch/readback work unless Phase 4/P7 profiling proves color-stage overhead is still a meaningful whole-pipeline bottleneck after cache and CPU-prep improvements.
+
 
 
 Current:
@@ -269,6 +273,9 @@ Progress notes:
 - Implemented `imgkey_engine.cache_keys` with conservative field classification, stable settings/cache fingerprints, and source/mask/imported-matte generation-key payloads.
 - Added smoke regression coverage proving color-only/backend settings preserve matte fingerprints while source/original-alpha generations, key/tolerance/matte fields, imported matte/mask generations, transition-alpha fields, and tile geometry/local-screen caps invalidate the appropriate matte pipeline keys.
 
+
+Current:
+- No
 ### Phase 2 - Matte/transition cache split and export reuse
 
 Category:
@@ -286,8 +293,6 @@ Isolation:
 Status:
 - Completed
 
-Current:
-- No
 
 Progress notes:
 - Added `imgkey_engine.cache` with internal source/base matte/reference-prep/transition-alpha/color-render cache records, staged transactions, read-only cached arrays, `ProcessCacheContext`, and UI-owned `ProcessingGenerations` counters.
@@ -399,6 +404,9 @@ Status:
 
 
 
+
+Current:
+- No
 ### Phase 3 - Progressive preview and responsive large-image UX
 
 Category:
@@ -421,10 +429,14 @@ Design brief:
 - Anti-patterns: do not auto-run 25MP Full Crop on every pan/slider tick, do not silently treat approximate crop as exact, do not let preview crop affect full export, do not spawn multiple 25MP preview jobs.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
+
+Progress notes:
+- Phase 3 clarified preview semantics in the inspector/HUD/status: Proxy is a fast whole-image preview, Full Crop is an exact pinned full-resolution ROI, cache state/crop dimensions are visible, and Refresh Crop explicitly recaptures the current viewport without affecting full PNG export.
+- Preview scheduling is now progressive/latest-wins: cold Full Crop requests show a proxy draft first, exact crop runs after the full matte path, warm full matte cache goes straight to exact crop color render, only one preview worker runs at a time, stale results are ignored, staged stale cache is discarded, and the previous accepted preview remains visible during new work.
+- Slider rows now keep cheap value/label updates live while active drags request debounced draft/proxy preview; committed exact work is scheduled on release while plus/minus buttons and numeric boxes remain immediate.
+- Added stronger preview cancellation checkpoints after global matte substages, before GPU render setup/dispatch, and before each tile color render.
 
 
 
@@ -451,7 +463,11 @@ Verification:
 - `python smoke_test.py`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Full Crop remains pinned to `_full_crop_rect`; pan/zoom only changes the pin after Refresh Crop or a mode switch.
+- HUD/status now distinguish Proxy whole image vs exact pinned crop, show crop dimensions/origin, show cold/partial/matte-cached state, and state that export remains full image.
 
 
 
@@ -481,7 +497,12 @@ Verification:
 - `python smoke_test.py --gpu-parity`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Preview requests coalesce by generation; running jobs are cancelled cooperatively and pending work restarts only for the newest generation.
+- Cold Full Crop schedules Proxy draft first, then exact pinned crop; cached full matte skips straight to exact crop color render.
+- Accepted results stay visible until a newer accepted result arrives; stale completions discard staged cache and do not update the canvas.
 
 
 
@@ -505,15 +526,16 @@ Verification:
 - py_compile/import
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Slider drag tracking now separates live widget value updates from expensive preview processing with a 400 ms draft debounce during active drags and committed preview scheduling on release.
+- Plus/minus stepping and numeric spin boxes continue to emit immediate committed preview requests.
 
 
 
 ---
 
-
-Current:
-- No
 ### Phase 4 - CPU bottleneck reduction for transition/reference prep
 
 Category:
@@ -531,6 +553,8 @@ Isolation:
 Status:
 - Planned
 
+Current:
+- Yes
 
 
 #### P4.1 - Optimize transition alpha and global matte substages on CPU
@@ -606,9 +630,6 @@ Status:
 
 ---
 
-
-Current:
-- No
 ### Phase 5 - Conditional persistent D3D12 large-image batch pipeline
 
 Category:
@@ -709,6 +730,7 @@ Status:
 ---
 
 
+
 Current:
 - No
 ### Phase 6 - Fast export path and PNG encode options
@@ -778,6 +800,7 @@ Status:
 
 
 ---
+
 
 
 Current:
@@ -892,8 +915,8 @@ Stop and ask the user before:
 
 ## 8) Immediate next step
 
-Next execution target is Phase 3 using `deep-worker`:
+Next execution target is Phase 4 using `deep-worker`:
 
-1. Clarify exact vs draft preview semantics and cache status in UI/HUD.
-2. Add progressive latest-wins preview scheduling and stronger cancellation checkpoints.
-3. Add expensive-slider debounce/tracking policy without changing final export semantics.
+1. Optimize transition alpha and global matte substages on CPU using Phase 1 profiler data.
+2. Reuse valid tile-local screen/reference prep inside a render generation.
+3. Decide any D3D12 dense-prep candidates from post-cache/post-CPU timings.

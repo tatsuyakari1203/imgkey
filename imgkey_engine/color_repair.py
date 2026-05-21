@@ -23,6 +23,7 @@ from .references import (
     _u8_mask_or_empty,
 )
 from .profiling import record_count, record_timing, time_block
+from .tiling import _raise_if_cancelled
 from .types import KeySettings
 
 
@@ -273,9 +274,12 @@ def _process_color_tile(
     transition_nearest_valid: np.ndarray | None = None,
     gpu_stats: dict | None = None,
     gpu_session=None,
+    cancel_callback=None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    _raise_if_cancelled(cancel_callback)
     gpu_mode = _gpu_acceleration_mode(settings)
     if gpu_mode != "Off":
+        _raise_if_cancelled(cancel_callback)
         full_result: dict | None = None
         try:
             required = {"rgb_only", "full_color_tile", "screen_tile"} if screen_tile is not None else {"rgb_only", "full_color_tile", "constant_screen"}
@@ -317,6 +321,7 @@ def _process_color_tile(
             _record_gpu_tile_result(gpu_stats, full_result)
             raise RuntimeError(str(full_result.get("message") or "Force GPU requested, but full color GPU processing failed."))
 
+    _raise_if_cancelled(cancel_callback)
     with time_block("color.cpu_linear_prep"):
         rgb_linear = _srgb_u8_to_linear_f32(rgb_tile)
         alpha = alpha_u8.astype(np.float32) / 255.0
@@ -377,6 +382,7 @@ def _process_color_tile(
         repair_nearest_valid = nearest_inner_valid if transition_nearest_valid is None else transition_nearest_valid
         transition_rgb = transition_mask = None
         if gpu_mode != "Off" and _transition_reference_enabled(settings):
+            _raise_if_cancelled(cancel_callback)
             gpu_result: dict
             try:
                 required = {"rgb_only", "screen_tile"} if screen_tile is not None else {"rgb_only", "constant_screen"}
@@ -413,6 +419,7 @@ def _process_color_tile(
                 raise RuntimeError(str(gpu_result.get("message") or "Force GPU requested, but no compatible GPU backend is available."))
 
         if transition_rgb is None or transition_mask is None:
+            _raise_if_cancelled(cancel_callback)
             transition_rgb, transition_mask = _repair_transition_unmix(
                 rgb_tile,
                 alpha_u8,

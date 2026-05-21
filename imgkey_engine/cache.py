@@ -307,6 +307,16 @@ class ProcessCache:
                 "color_renders": len(self.color_render_records),
             }
 
+    def matte_status(self, *, base_key: str, reference_key: str, transition_key: str) -> dict[str, bool]:
+        """Return lightweight cache presence for preview UX/status labels."""
+
+        with self._lock:
+            return {
+                "base_matte": str(base_key) in self.base_matte_records,
+                "reference_prep": str(reference_key) in self.reference_prep_records,
+                "transition_alpha": str(transition_key) in self.transition_alpha_records,
+            }
+
 
 class ProcessCacheTransaction:
     """Read-through/staged cache writer for one keyer invocation."""

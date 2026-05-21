@@ -8,7 +8,12 @@ from PySide6.QtCore import QThread, QTimer, Signal
 
 from keyer import KeyResult, KeySettings, process_key_image
 from imgkey_engine.cache import ProcessCache, ProcessCacheContext, ProcessCacheTransaction
-from imgkey_engine.cache_keys import matte_pipeline_settings_fingerprint
+from imgkey_engine.cache_keys import (
+    matte_pipeline_settings_fingerprint,
+    reference_prep_cache_fingerprint,
+    runtime_base_matte_cache_fingerprint,
+    transition_alpha_cache_fingerprint,
+)
 
 
 @dataclass(slots=True)
@@ -26,6 +31,12 @@ class PreviewJob:
     label: str
     process_cache: ProcessCache | None = None
     cache_context: ProcessCacheContext | None = None
+    requested_mode: str = "Proxy"
+    work_mode: str = "proxy"
+    exact: bool = True
+    cache_state: str = "cache unavailable"
+    crop_rect: tuple[int, int, int, int] | None = None
+    followup_exact: bool = False
 
 
 @dataclass(slots=True)
@@ -91,11 +102,14 @@ class PreviewController:
         owner._preview_jobs: dict[int, PreviewJob] = {}
         owner._preview_threads: list[PreviewThread] = []
         owner._preview_pending = False
+        owner._preview_stage = "exact"
+        owner._preview_target_mode = "Proxy"
+        owner._preview_draft_only = False
         owner._preview_timer = QTimer(owner)
         owner._preview_timer.setSingleShot(True)
         owner._preview_timer.timeout.connect(owner._start_preview)
 
-    def schedule_preview(self) -> None:
+    def schedule_preview(self, *, draft: bool = False, debounce_ms: int | None = None) -> None:
         owner = self.owner
         if owner.full_rgb is None:
             return
@@ -106,11 +120,41 @@ class PreviewController:
                 cache.clear()
         owner.settings = next_settings
         owner._sync_output_mode_status()
+        owner._preview_target_mode = owner.preview_quality.currentText()
+        owner._preview_draft_only = bool(draft)
+        owner._preview_stage = self._initial_preview_stage(next_settings, draft=draft)
         owner._preview_generation += 1
         owner._preview_jobs.clear()
+        owner._preview_pending = False
         self.cancel_preview_threads()
-        owner.statusBar().showMessage("Preview queued…")
-        owner._preview_timer.start(150)
+        if hasattr(owner, "_sync_preview_status"):
+            owner._sync_preview_status()
+        if hasattr(owner, "_update_canvas_hud"):
+            owner._update_canvas_hud()
+        owner.statusBar().showMessage(self._queued_status_text())
+        delay = 150 if debounce_ms is None else max(0, int(debounce_ms))
+        owner._preview_timer.start(delay)
+
+    def _initial_preview_stage(self, settings: KeySettings, *, draft: bool) -> str:
+        owner = self.owner
+        target_mode = owner.preview_quality.currentText()
+        if draft:
+            return "draft"
+        if target_mode == "Full Crop" and not self.full_matte_cache_ready(settings):
+            return "draft"
+        return "exact"
+
+    def _queued_status_text(self) -> str:
+        owner = self.owner
+        target = getattr(owner, "_preview_target_mode", owner.preview_quality.currentText())
+        stage = getattr(owner, "_preview_stage", "exact")
+        if stage == "draft" and target == "Full Crop" and not getattr(owner, "_preview_draft_only", False):
+            return "Preview queued · proxy draft first, exact crop after matte cache"
+        if stage == "draft":
+            return "Preview queued · proxy draft"
+        if target == "Full Crop":
+            return "Preview queued · exact pinned full-resolution crop"
+        return "Preview queued · proxy whole image"
 
     def cancel_preview_threads(self) -> None:
         for thread in list(self.owner._preview_threads):
@@ -133,29 +177,31 @@ class PreviewController:
         owner._preview_jobs[generation] = job
         owner._preview_pending = False
 
-        if (
-            owner.current_source_rgb is None
-            or owner.current_source_rgb.shape != job.display_rgb.shape
-            or owner.current_crop_origin != job.crop_origin
-            or abs(owner.current_display_scale - job.display_scale) > 1e-6
-        ):
-            owner.current_result = None
-            owner._set_current_source(job.display_rgb, job.display_alpha, job.display_scale, job.crop_origin, job.label)
-
         thread = PreviewThread(generation, job)
         owner._preview_threads.append(thread)
         thread.done.connect(owner.on_preview_done)
         thread.progress.connect(owner.on_preview_progress)
         thread.failed.connect(owner.on_preview_failed)
         thread.finished.connect(lambda t=thread: owner._forget_preview_thread(t))
-        owner.statusBar().showMessage(f"Processing {job.label.lower()} preview…")
+        owner.statusBar().showMessage(f"Processing {job.label.lower()} preview · {job.cache_state}…")
         thread.start()
 
     def make_preview_job(self) -> PreviewJob:
         owner = self.owner
         assert owner.full_rgb is not None
         settings = owner.current_settings()
-        if owner.preview_quality.currentText() == "Full Crop":
+        target_mode = getattr(owner, "_preview_target_mode", owner.preview_quality.currentText())
+        stage = getattr(owner, "_preview_stage", "exact")
+        if stage == "draft":
+            return self._make_proxy_job(
+                settings,
+                requested_mode=target_mode,
+                exact=False,
+                label="Proxy draft" if target_mode != "Full Crop" else "Proxy draft for exact crop",
+                followup_exact=target_mode == "Full Crop" and not getattr(owner, "_preview_draft_only", False),
+                preserve_full_crop=True,
+            )
+        if target_mode == "Full Crop":
             if owner._full_crop_rect is None:
                 owner._full_crop_rect = owner._current_full_crop()
             crop = owner._full_crop_rect
@@ -166,6 +212,7 @@ class PreviewController:
             settings.use_tiling = True
             display_rgb = owner.full_rgb[y0:y1, x0:x1].copy()
             display_alpha = None if owner.full_alpha is None else owner.full_alpha[y0:y1, x0:x1].copy()
+            cache_state = self.cache_state_for("full", owner.full_rgb.shape[:2], settings)
             return PreviewJob(
                 input_rgb=owner.full_rgb,
                 original_alpha=owner.full_alpha,
@@ -177,17 +224,37 @@ class PreviewController:
                 display_alpha=display_alpha,
                 display_scale=1.0,
                 crop_origin=(x0, y0),
-                label=f"Full crop {x1 - x0}×{y1 - y0}",
+                label=f"Exact full crop {x1 - x0}×{y1 - y0} pinned",
                 process_cache=getattr(owner, "process_cache", None),
                 cache_context=owner._cache_context("full", owner.full_rgb.shape[:2]) if hasattr(owner, "_cache_context") else None,
+                requested_mode=target_mode,
+                work_mode="full_crop",
+                exact=True,
+                cache_state=cache_state,
+                crop_rect=crop,
             )
 
+        return self._make_proxy_job(settings, requested_mode=target_mode, exact=True)
+
+    def _make_proxy_job(
+        self,
+        settings: KeySettings,
+        *,
+        requested_mode: str,
+        exact: bool,
+        label: str = "Proxy",
+        followup_exact: bool = False,
+        preserve_full_crop: bool = False,
+    ) -> PreviewJob:
+        owner = self.owner
         assert owner.proxy_rgb is not None
         settings.full_res_crop = None
-        owner._full_crop_rect = None
+        if not preserve_full_crop:
+            owner._full_crop_rect = None
         settings.preview_scale = owner.proxy_scale
         shape = owner.proxy_rgb.shape[:2]
         alpha_hint = owner._processing_alpha_input(settings, shape)
+        cache_state = self.cache_state_for("proxy", shape, settings)
         return PreviewJob(
             input_rgb=owner.proxy_rgb,
             original_alpha=owner.proxy_alpha,
@@ -199,9 +266,15 @@ class PreviewController:
             display_alpha=owner.proxy_alpha,
             display_scale=owner.proxy_scale,
             crop_origin=(0, 0),
-            label="Proxy",
+            label=label,
             process_cache=getattr(owner, "process_cache", None),
             cache_context=owner._cache_context("proxy", owner.proxy_rgb.shape[:2]) if hasattr(owner, "_cache_context") else None,
+            requested_mode=requested_mode,
+            work_mode="proxy",
+            exact=exact,
+            cache_state=cache_state,
+            crop_rect=None,
+            followup_exact=bool(followup_exact),
         )
 
     def forget_preview_thread(self, thread: PreviewThread) -> None:
@@ -211,6 +284,40 @@ class PreviewController:
         if owner._preview_pending and owner.full_rgb is not None:
             owner._preview_pending = False
             owner._preview_timer.start(0)
+
+    def full_matte_cache_ready(self, settings: KeySettings | None = None) -> bool:
+        owner = self.owner
+        if owner.full_rgb is None:
+            return False
+        state = self.cache_state_for("full", owner.full_rgb.shape[:2], settings or owner.current_settings())
+        return state == "matte cached"
+
+    def cache_state_for_mode(self, mode: str, settings: KeySettings | None = None) -> str:
+        owner = self.owner
+        if owner.full_rgb is None:
+            return "cache idle"
+        settings = settings or owner.current_settings()
+        if mode == "Full Crop":
+            return self.cache_state_for("full", owner.full_rgb.shape[:2], settings)
+        if owner.proxy_rgb is None:
+            return "cache unavailable"
+        return self.cache_state_for("proxy", owner.proxy_rgb.shape[:2], settings)
+
+    def cache_state_for(self, resolution: str, shape: tuple[int, int], settings: KeySettings) -> str:
+        owner = self.owner
+        cache = getattr(owner, "process_cache", None)
+        if cache is None or not hasattr(owner, "_cache_context"):
+            return "cache unavailable"
+        context = owner._cache_context(resolution, shape)
+        base_key = runtime_base_matte_cache_fingerprint(settings, context.source_key, context.mask_key)
+        reference_key = reference_prep_cache_fingerprint(settings, base_key)
+        transition_key = transition_alpha_cache_fingerprint(settings, base_key, reference_key)
+        status = cache.matte_status(base_key=base_key, reference_key=reference_key, transition_key=transition_key)
+        if status.get("transition_alpha"):
+            return "matte cached"
+        if status.get("base_matte") or status.get("reference_prep"):
+            return "partial matte cache"
+        return "cold global matte"
 
 
 def resize_alpha_for_preview(alpha: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray | None:

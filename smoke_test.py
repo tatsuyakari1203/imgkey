@@ -6521,7 +6521,11 @@ def run_app_ui_tests() -> None:
         assert ui_settings.gpu_acceleration == "Auto"
         assert "Auto" in window.gpu_probe_status.text(), "High Accuracy reset should restore Auto GPU status"
 
-        window.full_rgb = np.zeros((4, 5, 3), dtype=np.uint8)
+        window.full_rgb = np.zeros((120, 160, 3), dtype=np.uint8)
+        window.proxy_rgb = window.full_rgb.copy()
+        window.proxy_alpha = None
+        window.proxy_scale = 1.0
+        window._set_current_source(window.proxy_rgb, None, window.proxy_scale, (0, 0), "Proxy", reset_view=False)
         before_zoom = window.canvas.transform().m11()
         generation = window._preview_generation
         window.transition_unmix.setChecked(False)
@@ -6546,6 +6550,162 @@ def run_app_ui_tests() -> None:
         assert window.current_settings().gpu_acceleration == "Auto"
         assert window._message_mentions_gpu_backend("compact CUDA DLL unavailable")
         window._preview_timer.stop()
+
+        window.preview_quality.setCurrentText("Full Crop")
+        window._preview_timer.stop()
+        assert window._full_crop_rect is not None, "Full Crop should pin a crop when selected"
+        assert window.refresh_crop_btn.text() == "Refresh Crop"
+        assert window.refresh_crop_btn.isEnabled(), "Refresh Crop should be enabled for Full Crop with an image"
+        window._sync_preview_status()
+        assert "Full Crop is an exact pinned full-resolution ROI" in window.preview_status.text()
+        assert "Export PNG remains full image" in window.preview_status.text()
+        assert "Exact Crop" in window.hud_preview.text() and "cold global matte" in window.hud_preview.text()
+        pinned = window._full_crop_rect
+        window.refresh_full_crop()
+        window._preview_timer.stop()
+        assert window._full_crop_rect is not None and window._full_crop_rect == pinned, "refreshing a static offscreen viewport should keep the same pinned crop"
+        window.process_cache.clear()
+        full_settings = window.current_settings()
+        full_context = window._cache_context("full", window.full_rgb.shape[:2])
+        base_key = runtime_base_matte_cache_fingerprint(full_settings, full_context.source_key, full_context.mask_key)
+        reference_key = reference_prep_cache_fingerprint(full_settings, base_key)
+        transition_key = transition_alpha_cache_fingerprint(full_settings, base_key, reference_key)
+        assert not window.preview_controller.full_matte_cache_ready(full_settings), "cold Full Crop should not report a warm matte"
+        window.schedule_preview()
+        assert window._preview_stage == "draft", "cold Full Crop should queue a proxy draft first"
+        draft_job = window._make_preview_job()
+        assert not draft_job.exact and draft_job.followup_exact, "cold Full Crop draft should request an exact follow-up"
+        window._preview_timer.stop()
+        window.process_cache.transition_alpha_records[transition_key] = object()
+        assert window.preview_controller.full_matte_cache_ready(full_settings), "valid transition cache should mark Full Crop matte warm"
+        assert window.preview_controller._initial_preview_stage(full_settings, draft=False) == "exact", "warm Full Crop should skip proxy draft"
+        window.process_cache.clear()
+
+        window.preview_quality.setCurrentText("Proxy")
+        window._preview_timer.stop()
+        assert window._full_crop_rect is None, "Proxy mode should not retain the exact crop pin"
+        assert "Proxy is a fast whole-image preview" in window.preview_status.text()
+
+        slider_row = window.alpha_recover
+        generation = window._preview_generation
+        slider_row.slider.sliderPressed.emit()
+        assert slider_row.is_slider_dragging, "slider press should enter drag tracking"
+        slider_row.slider.setValue(max(slider_row.slider.minimum(), slider_row.slider.value() - 1))
+        assert window._preview_generation == generation + 1, "slider drag should still update preview generation"
+        assert window._preview_stage == "draft", "active expensive slider drag should request a draft/proxy preview"
+        assert window._preview_timer.interval() == 400, "slider drag should use a 300-500ms trailing debounce"
+        window._preview_timer.stop()
+        generation = window._preview_generation
+        slider_row.slider.sliderReleased.emit()
+        assert not slider_row.is_slider_dragging, "slider release should leave drag tracking"
+        assert window._preview_generation == generation + 1, "slider release should schedule a committed preview"
+        assert window._preview_stage == "exact", "Proxy mode slider release should schedule exact proxy work"
+        assert window._preview_timer.interval() == 0, "slider release should immediately enqueue the committed preview"
+        window._preview_timer.stop()
+        generation = window._preview_generation
+        slider_row.plus_btn.click()
+        assert window._preview_generation == generation + 1, "plus step should schedule a committed preview"
+        assert window._preview_stage == "exact", "plus step should not be treated as an active drag draft"
+        window._preview_timer.stop()
+        generation = window._preview_generation
+        slider_row.spin.setValue(max(slider_row.spin.minimum(), slider_row.spin.value() - slider_row.spin.singleStep()))
+        assert window._preview_generation == generation + 1, "numeric spin edit should schedule a committed preview"
+        assert window._preview_stage == "exact", "numeric spin edit should not be treated as an active drag draft"
+        window._preview_timer.stop()
+
+        preview_mod = importlib.import_module("ui.preview_controller")
+        real_preview_thread = preview_mod.PreviewThread
+
+        class _FakeSignal:
+            def __init__(self) -> None:
+                self.callbacks: list[Any] = []
+
+            def connect(self, callback: Any) -> None:
+                self.callbacks.append(callback)
+
+        class _FakePreviewThread:
+            instances: list[Any] = []
+
+            def __init__(self, generation: int, job: Any) -> None:
+                self.generation = generation
+                self.job = job
+                self.done = _FakeSignal()
+                self.progress = _FakeSignal()
+                self.failed = _FakeSignal()
+                self.finished = _FakeSignal()
+                self.cancel_requested = False
+                self.started = False
+                _FakePreviewThread.instances.append(self)
+
+            def request_cancel(self) -> None:
+                self.cancel_requested = True
+
+            def isRunning(self) -> bool:  # noqa: N802
+                return self.started
+
+            def start(self) -> None:
+                self.started = True
+
+        previous = KeyResult(
+            rgba=np.zeros((12, 12, 4), dtype=np.uint8),
+            alpha=np.zeros((12, 12), dtype=np.uint8),
+            foreground=None,
+            background_mask=None,
+            edge_mask=None,
+            despill_mask=None,
+        )
+        window.current_result = previous
+        window.preview_quality.setCurrentText("Full Crop")
+        window._preview_timer.stop()
+        window._preview_stage = "exact"
+        window._preview_target_mode = "Full Crop"
+        window._preview_generation += 1
+        preview_mod.PreviewThread = _FakePreviewThread
+        try:
+            window._start_preview()
+            assert window.current_result is previous, "starting a new preview must keep the previous result visible"
+            assert len(_FakePreviewThread.instances) == 1, "only one preview job should start"
+            running = _FakePreviewThread.instances[-1]
+            window._start_preview()
+            assert len(_FakePreviewThread.instances) == 1, "start while running must not launch a second preview job"
+            assert window._preview_pending, "start while running should coalesce to one pending newest preview"
+            generation = window._preview_generation
+            window.schedule_preview()
+            window._preview_timer.stop()
+            window.schedule_preview()
+            window._preview_timer.stop()
+            assert window._preview_generation == generation + 2, "successive requests should coalesce by newest generation"
+            assert running.cancel_requested, "superseded running preview should receive cancellation"
+        finally:
+            preview_mod.PreviewThread = real_preview_thread
+            window._preview_threads.clear()
+            window._preview_pending = False
+            window._preview_timer.stop()
+
+        class _DiscardOnlyTransaction:
+            def __init__(self) -> None:
+                self.discarded = False
+
+            def discard(self) -> None:
+                self.discarded = True
+
+        stale_transaction = _DiscardOnlyTransaction()
+        stale_job = window._make_preview_job()
+        stale_generation = window._preview_generation
+        window._preview_jobs[stale_generation] = stale_job
+        window._preview_generation = stale_generation + 1
+        stale_result = KeyResult(
+            rgba=np.zeros((8, 8, 4), dtype=np.uint8),
+            alpha=np.zeros((8, 8), dtype=np.uint8),
+            foreground=None,
+            background_mask=None,
+            edge_mask=None,
+            despill_mask=None,
+        )
+        window.on_preview_done(stale_generation, app_module.PreviewResult(stale_result, stale_transaction))
+        assert stale_transaction.discarded, "stale preview completion must discard staged cache publication"
+        assert window.current_result is previous, "stale preview completion must not replace the visible previous result"
+
         window.full_rgb = None
         forbidden = ("Bi" + "RefNet", "Corridor" + "Key", "A" + "I Hint", "Hy" + "brid" + " Bi" + "RefNet")
         for phrase in forbidden:

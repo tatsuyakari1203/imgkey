@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 class SliderRow(QWidget):
     value_changed = Signal()
+    editing_finished = Signal()
 
     def __init__(
         self,
@@ -37,6 +38,7 @@ class SliderRow(QWidget):
         self.decimals = decimals
         self.integer = integer
         self._steps = max(1, int(round((self.maximum - self.minimum) / self.step)))
+        self._slider_dragging = False
 
         root = QGridLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -92,9 +94,15 @@ class SliderRow(QWidget):
         self.minus_btn.clicked.connect(lambda: self.nudge(-1))
         self.plus_btn.clicked.connect(lambda: self.nudge(1))
         self.slider.valueChanged.connect(self._from_slider_changed)
+        self.slider.sliderPressed.connect(self._slider_pressed)
+        self.slider.sliderReleased.connect(self._slider_released)
         self.spin.valueChanged.connect(self._from_spin_changed)
         self.reset_btn.clicked.connect(self.reset)
         self.set_value(self.default, emit=False)
+
+    @property
+    def is_slider_dragging(self) -> bool:
+        return bool(self._slider_dragging)
 
     def value(self) -> int | float:
         value = self.spin.value()
@@ -120,6 +128,15 @@ class SliderRow(QWidget):
         modifiers = QApplication.keyboardModifiers()
         multiplier = 10 if modifiers & (Qt.ControlModifier | Qt.ShiftModifier) else 1
         self.set_value(float(self.value()) + (self.step * multiplier * (1 if direction >= 0 else -1)))
+
+    def _slider_pressed(self) -> None:
+        self._slider_dragging = True
+
+    def _slider_released(self) -> None:
+        was_dragging = self._slider_dragging
+        self._slider_dragging = False
+        if was_dragging:
+            self.editing_finished.emit()
 
     def _from_slider_changed(self, position: int) -> None:
         value = self._pos_to_value(position)
