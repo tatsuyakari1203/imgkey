@@ -61,7 +61,12 @@ from ui.canvas import (
     rgb_to_qimage,
     rgba_to_qimage,
 )
-from ui.export_controller import ExportController, ExportThread
+from ui.export_controller import (
+    ExportController,
+    ExportThread,
+    PNG_COMPRESSION_CHOICES,
+    PNG_COMPRESSION_TOOLTIP,
+)
 from ui.gpu_probe_controller import (
     GPUProbeController,
     format_gpu_probe_details,
@@ -508,6 +513,13 @@ class MainWindow(QMainWindow):
         self.gpu_acceleration.setToolTip("Optional native GPU backend acceleration. Auto falls back to CPU; Force GPU reports runtime errors clearly.")
         self.gpu_acceleration.currentTextChanged.connect(self._on_gpu_acceleration_changed)
         layout.addLayout(label_row("GPU Acceleration", self.gpu_acceleration))
+
+        self.png_compression = QComboBox()
+        self.png_compression.setObjectName("PNGCompressionCombo")
+        for label, level in PNG_COMPRESSION_CHOICES:
+            self.png_compression.addItem(label, int(level))
+        self.png_compression.setToolTip(PNG_COMPRESSION_TOOLTIP)
+        layout.addLayout(label_row("PNG Save", self.png_compression))
 
         self.gpu_status_btn = QPushButton("GPU Status")
         self.gpu_status_btn.setObjectName("GPUStatusButton")

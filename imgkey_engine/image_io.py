@@ -7,6 +7,16 @@ import numpy as np
 from PIL import Image, ImageOps
 
 
+PNG_DEFAULT_COMPRESSION_LEVEL = 6
+PNG_FAST_COMPRESSION_LEVEL = 1
+
+
+def _normalized_png_compression_level(compression_level: int | None) -> int:
+    if compression_level is None:
+        return PNG_DEFAULT_COMPRESSION_LEVEL
+    return max(0, min(9, int(compression_level)))
+
+
 def read_image_rgb(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
     try:
         image = ImageOps.exif_transpose(Image.open(path))
@@ -20,11 +30,17 @@ def read_image_rgb(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
     return rgb, original_alpha
 
 
-def write_png_rgba(path: str | Path, rgba: np.ndarray) -> None:
+def write_png_rgba(
+    path: str | Path,
+    rgba: np.ndarray,
+    *,
+    compression_level: int | None = PNG_DEFAULT_COMPRESSION_LEVEL,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
-    ok, encoded = cv2.imencode(".png", bgra, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+    level = _normalized_png_compression_level(compression_level)
+    ok, encoded = cv2.imencode(".png", bgra, [cv2.IMWRITE_PNG_COMPRESSION, level])
     if not ok:
         raise ValueError(f"Cannot encode PNG: {path}")
     encoded.tofile(str(path))

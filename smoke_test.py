@@ -2560,6 +2560,53 @@ def run_process_cache_contract_tests() -> None:
     print("Process cache contract checks: full/proxy boundaries, crop export reuse, color-only matte/tile-prep hit, stale/cancel discard")
 
 
+def run_png_export_option_tests() -> None:
+    h, w = 256, 384
+    yy, xx = np.indices((h, w), dtype=np.int32)
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[:, :, 0] = ((xx // 16) * 17 % 256).astype(np.uint8)
+    rgba[:, :, 1] = ((yy // 16) * 19 % 256).astype(np.uint8)
+    rgba[:, :, 2] = 96
+    rgba[:, :, 3] = np.where((xx - w // 2) ** 2 + (yy - h // 2) ** 2 < 92 ** 2, 255, 0).astype(np.uint8)
+    rgba[rgba[:, :, 3] == 0, :3] = 0
+
+    timings: dict[str, float] = {}
+    sizes: dict[str, int] = {}
+    with tempfile.TemporaryDirectory(prefix="imgkey-png-option-") as tmp:
+        tmp_dir = Path(tmp)
+        outputs = {
+            "default": tmp_dir / "default.png",
+            "fast": tmp_dir / "fast.png",
+        }
+        for name, level in (
+            ("default", keyer_module.PNG_DEFAULT_COMPRESSION_LEVEL),
+            ("fast", keyer_module.PNG_FAST_COMPRESSION_LEVEL),
+        ):
+            start = time.perf_counter()
+            keyer_module.write_png_rgba(outputs[name], rgba, compression_level=level)
+            timings[name] = (time.perf_counter() - start) * 1000.0
+            sizes[name] = outputs[name].stat().st_size
+            decoded = np.asarray(Image.open(outputs[name]).convert("RGBA"), dtype=np.uint8)
+            assert np.array_equal(decoded, rgba), f"{name} PNG compression must preserve decoded pixel identity"
+        assert sizes["fast"] >= sizes["default"], f"fast PNG should trade size for speed on compressible content: {sizes}"
+
+    export_mod = importlib.import_module("ui.export_controller")
+    assert export_mod.format_export_process_stage("sample screen", cache_state="cold global matte").startswith(
+        "CPU global matte"
+    )
+    assert export_mod.format_export_process_stage("cached matte", cache_state="matte cached") == "Using cached matte"
+    assert export_mod.format_export_process_stage("tile 1/4 · D3D12 color render", cache_state="matte cached").startswith(
+        "D3D12 color render"
+    )
+    assert "Fast PNG" in export_mod.png_compression_label(keyer_module.PNG_FAST_COMPRESSION_LEVEL)
+
+    print(
+        "PNG export option checks: "
+        f"default={timings['default']:.3f}ms/{sizes['default']} bytes; "
+        f"fast={timings['fast']:.3f}ms/{sizes['fast']} bytes; decoded pixels identical"
+    )
+
+
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
     rgb, _, settings = _edge_fringe_fixture(key_color)
     before_settings = replace(
@@ -6547,6 +6594,12 @@ def run_app_ui_tests() -> None:
         assert window.gpu_status_action.text() == "GPU Status"
         assert window.gpu_status_btn.text() == "GPU Status"
         assert [window.gpu_acceleration.itemText(i) for i in range(window.gpu_acceleration.count())] == ["Auto", "Off", "Force GPU"]
+        assert [window.png_compression.itemData(i) for i in range(window.png_compression.count())] == [
+            keyer_module.PNG_DEFAULT_COMPRESSION_LEVEL,
+            keyer_module.PNG_FAST_COMPRESSION_LEVEL,
+        ]
+        assert window.png_compression.currentData() == keyer_module.PNG_DEFAULT_COMPRESSION_LEVEL
+        assert "larger lossless files" in window.png_compression.toolTip()
         assert window.output_mode.findText("Classical") >= 0
         assert window.output_mode.findText("Imported Matte") >= 0
         assert window.alpha_hint_mask is None
@@ -7229,6 +7282,7 @@ def main(argv: list[str] | None = None) -> None:
     run_gpu_runtime_probe_tests()
     run_gpu_accel_backend_tests()
     run_gpu_backend_registry_tests()
+    run_png_export_option_tests()
     run_app_ui_tests()
     run_v6_screen_analysis_tests()
     run_geometric_benchmark_gate_tests()

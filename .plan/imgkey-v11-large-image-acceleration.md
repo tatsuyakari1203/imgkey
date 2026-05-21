@@ -778,7 +778,13 @@ Isolation:
 - Own export options, PNG compression setting, docs, and tests. Do not change default output quality without explicit acceptance.
 
 Status:
-- Planned
+- Completed
+
+
+Progress notes:
+- Added a PNG Save export option with the current lossless default compression level 6 and a Fast PNG level 1 choice labeled as faster save/larger file. `write_png_rgba` now accepts an explicit compression level while preserving decoded RGBA identity.
+- Export status now surfaces full-export cache state before work starts, distinguishes CPU global matte/transition prep, cached matte reuse, actual D3D12/GPU/CPU-fallback tile color render progress, and the PNG encode stage. Cancel support remains unchanged at processing checkpoints and around encode.
+- Targeted Phase 6 PNG benchmark on `C:\Users\Admin\Downloads\zzz` wrote `.artifact/phase6-png-benchmark/png_encode_benchmark.md`: fast level 1 was 2.55x-4.98x faster than default level 6 with 1.09x-1.20x larger files, and decoded pixels were identical.
 
 
 
@@ -804,7 +810,11 @@ Verification:
 - `python smoke_test.py`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Implemented the UI option as `Default PNG (level 6 · smaller file)` and `Fast PNG (level 1 · faster save, larger file)`. Default remains level 6.
+- Added smoke coverage proving default and fast PNG decode back to identical RGBA pixels and documenting the size/speed tradeoff on compressible synthetic content.
 
 
 
@@ -826,7 +836,11 @@ Verification:
 - focused status/progress tests where possible
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Export progress now scales keyer processing to leave explicit room for `PNG encode`, and the status bar reports cache/cold matte state plus color-render backend/fallback labels from tile progress.
+- Offscreen GUI export smoke completed with the Fast PNG option and observed CPU global matte plus PNG encode stages.
 
 
 
@@ -836,7 +850,7 @@ Status:
 
 
 Current:
-- Yes
+- No
 ### Phase 7 - Full verification, packaging, and release-readiness gate
 
 Category:
@@ -853,6 +867,9 @@ Isolation:
 
 Status:
 - Planned
+
+Current:
+- Yes
 
 
 
@@ -947,8 +964,8 @@ Stop and ask the user before:
 
 ## 8) Immediate next step
 
-Next execution target is Phase 6 using `worker`:
+Next execution target is Phase 7 using `deep-worker`:
 
-1. Add a fast PNG compression option while preserving lossless pixels.
-2. Surface export progress/cache/GPU status during long saves.
-3. Keep Phase 5 deferred unless new timing evidence reopens native D3D12 batch ROI.
+1. Run the full real-image benchmark matrix, including fast PNG export.
+2. Run the full regression/build/packaging gate.
+3. Complete docs/plan with final performance summary and known limitations.

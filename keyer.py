@@ -52,6 +52,8 @@ from imgkey_engine.color_repair import (
     _screen_linear_for_tile,
 )
 from imgkey_engine.image_io import (
+    PNG_DEFAULT_COMPRESSION_LEVEL,
+    PNG_FAST_COMPRESSION_LEVEL,
     checkerboard_composite,
     read_alpha_hint_mask,
     read_grayscale_mask,
@@ -1010,7 +1012,11 @@ def _render_tiled_rgba(
                 rgba[out_y, out_x, :3] = rgb_tile[rel_y, rel_x]
                 if despill_mask is not None:
                     despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
-            _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
+            _report(
+                progress_callback,
+                0.18 + 0.82 * (index / total),
+                _color_render_progress_stage(settings, gpu_stats, index, total),
+            )
         if tile_prep_enabled and cache_transaction is not None and tile_prep_key is not None:
             cache_transaction.info.details["tile_prep"] = {
                 "hits": int(tile_prep_hits),
@@ -1041,6 +1047,23 @@ def _render_tiled_rgba(
     with time_block("render.transparent_rgb_zero"):
         rgba[alpha_out <= 0, :3] = 0
     return rgba, despill_mask
+
+
+def _color_render_progress_stage(settings: KeySettings, gpu_stats: dict | None, index: int, total: int) -> str:
+    prefix = f"tile {index}/{total}"
+    mode = _gpu_acceleration_mode(settings)
+    if mode == "Off":
+        return f"{prefix} · CPU color render"
+    stats = gpu_stats or {}
+    used = int(stats.get("used_tiles", 0) or 0)
+    fallback = int(stats.get("fallback_tiles", 0) or 0)
+    backend = str(stats.get("backend") or stats.get("backend_name") or "").strip()
+    if used > 0:
+        label = "D3D12 color render" if "d3d12" in backend.lower() else "GPU color render"
+        return f"{prefix} · {label}"
+    if fallback > 0 or str(stats.get("status") or "").lower() == "fallback":
+        return f"{prefix} · CPU color render (GPU fallback)"
+    return f"{prefix} · color render (GPU {mode} requested)"
 
 
 def _tile_extra_overlap(
