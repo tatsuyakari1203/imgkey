@@ -20,7 +20,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
 pwsh -NoProfile -ExecutionPolicy Bypass -File native/imgkey_gpu/build.ps1 -Clean
 python smoke_test.py
+python smoke_test.py --gpu-parity
+python smoke_test.py --gpu-benchmark
+python smoke_test.py --write-perf-baseline
 python -m gpu_runtime --probe --json
+$files = @("app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py", "gpu_accel.py", "gpu_backend.py", "native_toolchain.py", "vulkan_runtime.py", "subprocess_utils.py", "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py") + (Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py").FullName
+python -m py_compile @files
+python -c "import app, keyer; print('import ok')"
 python -m PyInstaller --noconfirm --clean ImgKey.spec
 .\dist\ImgKey.exe --gpu-probe --json
 ```
@@ -179,3 +185,8 @@ pip packages, no CUDA Toolkit, no Windows SDK, and no shader compiler on PATH.
    DXC, Vulkan SDK, or CUDA toolkit payloads in the primary bundle.
 5. Confirm `build/`, `dist/`, wheels, caches, native build outputs, and
    `.artifact/` outputs remain ignored and are not committed.
+
+For v11 large-image release readiness, also run a real-image benchmark matrix under
+`.artifact/large-image-perf/` covering `Off`, `Auto`, and `Force GPU` for proxy,
+exact crop, cold export, cache-hit export, and Fast PNG export. Those artifacts are
+diagnostic only and must not be staged.

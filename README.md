@@ -1,6 +1,6 @@
 # ImgKey
 
-ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The default build is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, crop-only full-resolution preview rendering, and tile-local large-image fallbacks.
+ImgKey is a Windows/Python desktop app for removing green, blue, or custom-color screens from large still images and exporting straight-alpha PNGs. The default build is a classical NumPy/OpenCV/PySide6 path with linear-light edge color reconstruction, cache-aware proxy/exact-crop previews, and tile-local large-image fallbacks.
 
 The public Windows release artifact is `ImgKey.exe`: a one-file CPU+D3D12 build with automatic CPU fallback. `ImgKey-GPU.exe` is retained only as a legacy/development CUDA compatibility package.
 
@@ -24,9 +24,9 @@ python app.py
    - **Matte**: clip background/foreground, matte gamma, core strength, despeckle, connected vs aggressive interior removal.
    - **Edges**: refine radius, edge softness, erode/expand.
    - **Spill Cleanup**: despill, decontaminate, luminance restore/protect, fringe remove, edge color repair, inner color pull, and fringe band.
-   - **Masks & Export**: proxy/full-crop preview, imported matte, matte export, and full-resolution PNG export.
+   - **Masks & Export**: proxy/full-crop preview, imported matte, matte export, full-resolution PNG export, and default-vs-fast PNG save mode.
 6. Optionally import grayscale masks with **Import Keep**, **Import Remove**, or **Import Matte**. Bright imported-matte pixels protect foreground/core and can raise alpha where the classical connected-background decision does not mark background. Dark matte pixels do not force removal; use **Import Remove** for forced removal.
-7. Click **Export PNG** to process the full-resolution image in a worker with progress/cancel support.
+7. Click **Export PNG** to process the full-resolution image in a worker with progress/cancel support. Export status reports cache reuse/cold matte work, D3D12/CPU tile rendering, and PNG encode; **Fast PNG** saves lossless pixels faster with larger files.
 
 ## Large-image behavior
 
@@ -35,7 +35,9 @@ python app.py
 - Source pixels remain `uint8`; masks are `uint8`; nearest-inner repair labels are bounded `int32` only when under the memory cap; float work is limited to tiles, crop regions, and edge-band ROIs.
 - The local screen estimate builds a full-image `uint8` screen map only below its cap. Large tiled renders fall back to tile-local screen estimates from connected/background-safe pixels inside each read tile.
 - Nearest-inner foreground references use the global label map when it is within the cap. If the label map is skipped, tile-local nearest-inner labels are built inside the overlapped read tile and fall back to unmix/channel-clamp repair when too few/too-far inner pixels are available.
-- **Full Crop** preview renders only the requested full-resolution crop plus required read overlap; result/debug arrays are crop-shaped and aligned while source-size UI metadata is preserved.
+- Preview keeps proxy and full-resolution cache layers separate. A proxy preview never seeds full export, but an exact **Full Crop** preview can publish the full matte/transition cache so a later full export skips global matte recomputation when source, masks, imported matte, and matte-affecting settings are unchanged.
+- **Full Crop** preview is an exact pinned full-resolution ROI: it still uses full-image matte decisions, renders only the requested crop plus required read overlap, and keeps result/debug arrays crop-shaped and aligned while source-size UI metadata is preserved. Pan/zoom does not silently change the pinned crop; use **Refresh Crop** to recapture it.
+- Expensive preview changes are latest-wins: slider drags use draft/proxy scheduling and committed releases request exact work, avoiding multiple concurrent 25MP preview jobs.
 
 ## Classical keying notes
 
@@ -52,11 +54,14 @@ python app.py
 ```powershell
 python smoke_test.py
 python smoke_test.py --write-geometric-benchmark
+python smoke_test.py --tune-geometric-defaults
 python smoke_test.py --write-edge-repair-diagnostics
 python smoke_test.py --gpu-parity
 python smoke_test.py --gpu-benchmark
+python smoke_test.py --write-perf-baseline
+python smoke_test.py --profile-large-images C:\Users\Admin\Downloads\zzz
 python -m gpu_runtime --probe --json
-$files = @("app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py", "gpu_accel.py", "gpu_backend.py", "native_toolchain.py", "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py") + (Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py").FullName
+$files = @("app.py", "keyer.py", "smoke_test.py", "gpu_runtime.py", "screen_analysis.py", "gpu_accel.py", "gpu_backend.py", "native_toolchain.py", "vulkan_runtime.py", "subprocess_utils.py", "packaging/pyinstaller/rthooks/imgkey_cuda_runtime.py") + (Get-ChildItem -Path "imgkey_engine", "ui" -Filter "*.py").FullName
 python -m py_compile @files
 python -c "import app, keyer; print('import ok')"
 ```

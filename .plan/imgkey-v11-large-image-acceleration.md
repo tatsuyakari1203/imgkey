@@ -1,7 +1,7 @@
 # 11 - ImgKey Large-Image Acceleration
 
 Date: 2026-05-21
-Status: In progress
+Status: Completed
 Owner: ImgKey Large-Image Pipeline + GUI Responsiveness
 Scope: Make 25MP+ blue/green-key workflows feel materially faster by reducing CPU-global recomputation, improving preview responsiveness, and extending D3D12 acceleration where whole-pipeline profiling shows ROI.
 
@@ -866,10 +866,19 @@ Isolation:
 - Own verification, docs, packaging checks, plan completion. No broad new features.
 
 Status:
-- Planned
+- Completed
 
 Current:
-- Yes
+- No
+
+Progress notes:
+- Phase 7 real-image matrix completed on the three non-keyed 6688x3776 PNGs under `.artifact/large-image-perf/p7_benchmark_matrix.md`. P7 averages: proxy Off/Auto/Force `6.23s / 3.44s / 3.00s`; exact crop Auto `36.35s`; cold export Auto default PNG `50.47s`; cold export Auto Fast PNG `43.79s`; preview-then-export cache-hit Auto default PNG `18.99s`; cold export Off default PNG `128.71s`. D3D12 parity stayed within max RGB diff `1`, alpha diff `0` across proxy, exact crop, cache-hit export, and cold export.
+- Against the original v10/v11 profiling ranges, Auto D3D12 default export is still in the prior `33.4-53.8s` band on this run, Fast PNG shortens the final save path, and warm full-matte export is the visible win at about `19s` because it skips the global matte/transition recompute. CPU-only export is slower in this full matrix run than the earlier baseline, likely due current machine/load and full matrix sequencing; D3D12 remains the practical release path.
+- Full regression/build gate passed: smoke, geometric benchmark, geometric tuning, GPU parity, GPU benchmark, synthetic perf baseline, GPU runtime probe, expanded `py_compile`, import check, PyInstaller primary build, packaged EXE probes from temp cwd and sanitized PATH, GUI lifetime smoke, archive exclusion check, and `git diff --check`.
+- Native D3D12 rebuild was not rerun before PyInstaller because `native/imgkey_gpu/`, `gpu_backend.py`, and `ImgKey.spec` did not change during v11 after the plan baseline; existing `native/imgkey_gpu/build/imgkey_gpu.dll` was bundled and probed successfully.
+- Primary EXE: `D:\keyphong\dist\ImgKey.exe`, `100394157` bytes (`95.743 MiB`), SHA256 `bfc3e5817be99c9d7698b7c3884e0ea51887eb7c2f7d67e79fcd8595b3fc7a10`. Runtime probe selected `d3d12_compute` on NVIDIA GeForce RTX 5060 Ti; sanitized packaged probe also selected `d3d12_compute`; archive contains `imgkey_gpu.dll` and no forbidden Torch/model/CuPy/ONNX/PyOpenCL/CUDA-toolkit/DXC/Vulkan-SDK payloads.
+- Docs updated in `README.md`, `docs/build-gpu.md`, and `AGENTS.md` for v11 cache/profiler/preview/Fast PNG/release gate semantics.
+- Known limitations: exact Full Crop still needs full-image matte work on cold cache; cache-hit export skips base matte/transition but still runs tile color rendering and PNG encode; tile-local screen/reference CPU prep remains the main non-PNG large-image bottleneck; proxy first response is materially faster with D3D12 but not sub-second on this machine; Fast PNG writes larger lossless files.
 
 
 
@@ -892,7 +901,11 @@ Verification:
 - parity max channel diff within tolerance
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Generated `.artifact/large-image-perf/p7_benchmark_matrix.json` and `.artifact/large-image-perf/p7_benchmark_matrix.md` for the three user PNGs, covering Off/Auto/Force proxy, exact 1920x1080 central crop, cold export, exact-preview-then-cache-hit export, and Fast PNG export.
+- Parity vs CPU Off stayed at max RGB diff `1` and alpha diff `0` for Auto/Force across benchmarked preview/export surfaces. Perceived-latency notes are included in the report.
 
 
 
@@ -920,7 +933,13 @@ Verification:
 - `git diff --check`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Full verification floor passed, including PyInstaller build of `ImgKey.spec`.
+- Packaged probes from a temp cwd and with sanitized PATH both returned `status=available`, `backend=d3d12_compute`.
+- Source GUI lifetime closed cleanly under Qt offscreen; packaged GUI stayed alive for the smoke interval and was terminated by the smoke harness.
+- Archive inspection found `imgkey_gpu.dll` and no forbidden heavy runtime/toolchain payloads.
 
 
 
@@ -944,7 +963,11 @@ Verification:
 - final `git status --short --branch`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Updated README workflow/large-image/verification notes, `docs/build-gpu.md` release-gate notes, and `AGENTS.md` v11 source-of-truth/cache/preview/Fast PNG context.
+- Marked this plan completed with final performance summary and known limitations.
 
 
 
@@ -962,10 +985,9 @@ Stop and ask the user before:
 
 ---
 
-## 8) Immediate next step
+## 8) Completion summary
 
-Next execution target is Phase 7 using `deep-worker`:
+Phase 7 is complete. Planner may push the final commit after review.
 
-1. Run the full real-image benchmark matrix, including fast PNG export.
-2. Run the full regression/build/packaging gate.
-3. Complete docs/plan with final performance summary and known limitations.
+Current:
+- No
