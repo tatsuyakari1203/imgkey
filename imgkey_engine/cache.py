@@ -192,6 +192,22 @@ class ColorRenderRecord:
     despill_mask: np.ndarray | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TilePrepEntry:
+    screen_tile: np.ndarray | None = None
+    nearest_inner_rgb: np.ndarray | None = None
+    nearest_inner_valid: np.ndarray | None = None
+    transition_inner_rgb: np.ndarray | None = None
+    transition_inner_valid: np.ndarray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TilePrepRecord:
+    key: str
+    transition_key: str
+    entries: dict[str, TilePrepEntry]
+
+
 @dataclass(slots=True)
 class CacheRunInfo:
     enabled: bool = False
@@ -199,6 +215,7 @@ class CacheRunInfo:
     base_matte: str = "disabled"
     reference_prep: str = "disabled"
     transition_alpha: str = "disabled"
+    tile_prep: str = "disabled"
     color_render: str = "disabled"
     cache_hit: str | bool = False
     cache_miss_reason: str | None = "cache_disabled"
@@ -213,6 +230,7 @@ class CacheRunInfo:
             "base_matte": self.base_matte,
             "reference_prep": self.reference_prep,
             "transition_alpha": self.transition_alpha,
+            "tile_prep": self.tile_prep,
             "color_render": self.color_render,
             "cache_hit": self.cache_hit,
             "cache_miss_reason": self.cache_miss_reason,
@@ -241,6 +259,7 @@ class ProcessCache:
         self.base_matte_records: dict[str, BaseMatteRecord] = {}
         self.reference_prep_records: dict[str, ReferencePrepRecord] = {}
         self.transition_alpha_records: dict[str, TransitionAlphaRecord] = {}
+        self.tile_prep_records: dict[str, TilePrepRecord] = {}
         self.color_render_records: dict[str, ColorRenderRecord] = {}
 
     def clear(self) -> None:
@@ -249,6 +268,7 @@ class ProcessCache:
             self.base_matte_records.clear()
             self.reference_prep_records.clear()
             self.transition_alpha_records.clear()
+            self.tile_prep_records.clear()
             self.color_render_records.clear()
             self._active_generation_token = None
 
@@ -260,6 +280,7 @@ class ProcessCache:
                 self.base_matte_records.clear()
                 self.reference_prep_records.clear()
                 self.transition_alpha_records.clear()
+                self.tile_prep_records.clear()
                 self.color_render_records.clear()
                 self._active_generation_token = token
         return ProcessCacheTransaction(self, context)
@@ -276,6 +297,7 @@ class ProcessCache:
         for key, transition in list(self.transition_alpha_records.items()):
             if transition.base_key != record.key:
                 self.transition_alpha_records.pop(key, None)
+        self.tile_prep_records.clear()
         self._trim(self.base_matte_records)
 
     def _store_reference(self, record: ReferencePrepRecord) -> None:
@@ -283,11 +305,19 @@ class ProcessCache:
         for key, transition in list(self.transition_alpha_records.items()):
             if transition.reference_key != record.key:
                 self.transition_alpha_records.pop(key, None)
+        self.tile_prep_records.clear()
         self._trim(self.reference_prep_records)
 
     def _store_transition(self, record: TransitionAlphaRecord) -> None:
         self.transition_alpha_records[record.key] = record
+        for key, tile_prep in list(self.tile_prep_records.items()):
+            if tile_prep.transition_key != record.key:
+                self.tile_prep_records.pop(key, None)
         self._trim(self.transition_alpha_records)
+
+    def _store_tile_prep(self, record: TilePrepRecord) -> None:
+        self.tile_prep_records[record.key] = record
+        self._trim(self.tile_prep_records)
 
     def _store_color(self, record: ColorRenderRecord) -> None:
         self.color_render_records[record.key] = record
@@ -304,6 +334,7 @@ class ProcessCache:
                 "base_mattes": len(self.base_matte_records),
                 "reference_preps": len(self.reference_prep_records),
                 "transition_alphas": len(self.transition_alpha_records),
+                "tile_preps": len(self.tile_prep_records),
                 "color_renders": len(self.color_render_records),
             }
 
@@ -329,6 +360,7 @@ class ProcessCacheTransaction:
         self._staged_base: dict[str, BaseMatteRecord] = {}
         self._staged_reference: dict[str, ReferencePrepRecord] = {}
         self._staged_transition: dict[str, TransitionAlphaRecord] = {}
+        self._staged_tile_prep: dict[str, TilePrepRecord] = {}
         self._staged_color: dict[str, ColorRenderRecord] = {}
         self._closed = False
 
@@ -362,6 +394,12 @@ class ProcessCacheTransaction:
         with self.cache._lock:
             return self.cache.transition_alpha_records.get(key)
 
+    def get_tile_prep(self, key: str) -> TilePrepRecord | None:
+        if key in self._staged_tile_prep:
+            return self._staged_tile_prep[key]
+        with self.cache._lock:
+            return self.cache.tile_prep_records.get(key)
+
     def stage_base(self, record: BaseMatteRecord) -> None:
         self._staged_base[record.key] = record
         self._refresh_staged_count()
@@ -372,6 +410,10 @@ class ProcessCacheTransaction:
 
     def stage_transition(self, record: TransitionAlphaRecord) -> None:
         self._staged_transition[record.key] = record
+        self._refresh_staged_count()
+
+    def stage_tile_prep(self, record: TilePrepRecord) -> None:
+        self._staged_tile_prep[record.key] = record
         self._refresh_staged_count()
 
     def stage_color(self, record: ColorRenderRecord) -> None:
@@ -390,6 +432,8 @@ class ProcessCacheTransaction:
                 self.cache._store_reference(record)
             for record in self._staged_transition.values():
                 self.cache._store_transition(record)
+            for record in self._staged_tile_prep.values():
+                self.cache._store_tile_prep(record)
             for record in self._staged_color.values():
                 self.cache._store_color(record)
         self.info.committed = True
@@ -400,6 +444,7 @@ class ProcessCacheTransaction:
         self._staged_base.clear()
         self._staged_reference.clear()
         self._staged_transition.clear()
+        self._staged_tile_prep.clear()
         self._staged_color.clear()
         self._refresh_staged_count()
         self._closed = True
@@ -410,5 +455,6 @@ class ProcessCacheTransaction:
             + len(self._staged_base)
             + len(self._staged_reference)
             + len(self._staged_transition)
+            + len(self._staged_tile_prep)
             + len(self._staged_color)
         )

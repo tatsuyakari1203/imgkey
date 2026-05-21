@@ -153,3 +153,6 @@ class _GlobalMatte:
     inner_labels: np.ndarray | None
     inner_label_to_flat: np.ndarray | None
     inner_distance: np.ndarray | None
+    base_key: str | None = None
+    reference_key: str | None = None
+    transition_key: str | None = None

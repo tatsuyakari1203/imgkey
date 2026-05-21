@@ -183,6 +183,23 @@ def _recover_transition_alpha_tile_local(
     total = max(1, len(tiles))
     for index, (read_y, read_x, core_y, core_x) in enumerate(tiles, start=1):
         _raise_if_cancelled(cancel_callback)
+        with time_block("transition_alpha.tile_candidate_mask"):
+            transition_hint = _transition_repair_candidate_mask(
+                rgb[core_y, core_x],
+                alpha[core_y, core_x],
+                background_mask[core_y, core_x],
+                edge_mask[core_y, core_x],
+                fringe_mask[core_y, core_x],
+                screen_color,
+                foreground_core[core_y, core_x],
+                None if keep_mask is None else keep_mask[core_y, core_x],
+                None if remove_mask is None else remove_mask[core_y, core_x],
+                settings,
+            )
+            has_transition_candidates = bool(np.any(transition_hint & (alpha[core_y, core_x] > 0)))
+        if not has_transition_candidates:
+            _report(progress_callback, 0.175 + 0.005 * (index / total), "transition alpha")
+            continue
         bounded_radius = _bounded_tile_local_nearest_inner_radius(radius, read_y, read_x, core_y, core_x, (h, w))
         with time_block("screen_reference.transition_nearest_inner_tile_local"):
             foreground_ref_rgb, foreground_ref_valid, foreground_ref_distance = _build_tile_local_nearest_inner_reference(
@@ -226,6 +243,7 @@ def _recover_transition_alpha_tile_local(
                 None if keep_mask is None else keep_mask[core_y, core_x],
                 None if remove_mask is None else remove_mask[core_y, core_x],
                 settings,
+                transition_mask=transition_hint,
             )
         _report(progress_callback, 0.175 + 0.005 * (index / total), "transition alpha")
 
@@ -246,50 +264,57 @@ def _recover_transition_alpha_block(
     keep_block: np.ndarray | None,
     remove_block: np.ndarray | None,
     settings: KeySettings,
+    *,
+    transition_mask: np.ndarray | None = None,
 ) -> None:
     if foreground_ref_rgb is None or foreground_ref_valid is None or not np.any(foreground_ref_valid):
         return
-    spill = _compute_key_spill_strength(rgb_block, screen_color)
-    transition = _build_transition_repair_mask(
-        alpha_block,
-        edge_block,
-        fringe_block,
-        spill,
-        background_block,
-        keep_block,
-        remove_block,
-        foreground_core_block,
-        settings,
-    )
-    eligible = transition & foreground_ref_valid & (alpha_block > 0)
-    if foreground_ref_distance is not None:
-        eligible &= foreground_ref_distance <= _foreground_reference_radius(settings)
+    with time_block("transition_alpha.spill_mask"):
+        if transition_mask is None:
+            transition = _transition_repair_candidate_mask(
+                rgb_block,
+                alpha_block,
+                background_block,
+                edge_block,
+                fringe_block,
+                screen_color,
+                foreground_core_block,
+                keep_block,
+                remove_block,
+                settings,
+            )
+        else:
+            transition = np.asarray(transition_mask, dtype=bool)
+            if transition.shape != alpha_block.shape:
+                raise ValueError("transition_mask must match alpha_block shape")
+    with time_block("transition_alpha.eligible_mask"):
+        eligible = transition & foreground_ref_valid & (alpha_block > 0)
+        if foreground_ref_distance is not None:
+            eligible &= foreground_ref_distance <= _foreground_reference_radius(settings)
     if not np.any(eligible):
         return
 
-    source_linear = _srgb_u8_to_linear_f32(rgb_block)
-    foreground_linear = _srgb_u8_to_linear_f32(foreground_ref_rgb)
-    if screen_block is None:
-        screen_u8 = np.empty_like(rgb_block)
-        screen_u8[:, :, :] = np.asarray(screen_color, dtype=np.uint8).reshape(1, 1, 3)
-        screen_linear = _srgb_u8_to_linear_f32(screen_u8)
-    else:
-        screen_linear = _srgb_u8_to_linear_f32(screen_block)
+    with time_block("transition_alpha.linearize_eligible"):
+        i = _srgb_u8_to_linear_f32(rgb_block[eligible])
+        f = _srgb_u8_to_linear_f32(foreground_ref_rgb[eligible])
+        if screen_block is None:
+            b = _srgb_u8_to_linear_f32(np.asarray(screen_color, dtype=np.uint8).reshape(1, 3))
+        else:
+            b = _srgb_u8_to_linear_f32(screen_block[eligible])
 
-    i = source_linear[eligible]
-    b = screen_linear[eligible]
-    f = foreground_linear[eligible]
-    v = f - b
-    denom = np.sum(v * v, axis=1)
-    stable = denom > 1e-6
-    if not np.any(stable):
-        return
-    solved = np.zeros(denom.shape, dtype=np.float32)
-    solved[stable] = np.sum((i[stable] - b[stable]) * v[stable], axis=1) / denom[stable]
-    solved = np.clip(solved, 0.0, 1.0)
-    recon = solved[:, None] * f + (1.0 - solved[:, None]) * b
-    err = np.linalg.norm(i - recon, axis=1)
-    plausible = stable & (err < float(settings.transition_reconstruction_error))
+    with time_block("transition_alpha.solve_eligible"):
+        v = f - b
+        denom = np.sum(v * v, axis=1)
+        stable = denom > 1e-6
+        if not np.any(stable):
+            return
+        solved = np.zeros(denom.shape, dtype=np.float32)
+        b_stable = b if b.shape[0] == 1 else b[stable]
+        solved[stable] = np.sum((i[stable] - b_stable) * v[stable], axis=1) / denom[stable]
+        solved = np.clip(solved, 0.0, 1.0)
+        recon = solved[:, None] * f + (1.0 - solved[:, None]) * b
+        err = np.linalg.norm(i - recon, axis=1)
+        plausible = stable & (err < float(settings.transition_reconstruction_error))
     if not np.any(plausible):
         return
 
@@ -301,6 +326,32 @@ def _recover_transition_alpha_block(
     updated = current_u8.copy()
     updated[plausible] = np.maximum(updated[plausible], recovered_u8[plausible])
     alpha_block[eligible] = updated
+
+
+def _transition_repair_candidate_mask(
+    rgb_block: np.ndarray,
+    alpha_block: np.ndarray,
+    background_block: np.ndarray,
+    edge_block: np.ndarray,
+    fringe_block: np.ndarray,
+    screen_color: tuple[int, int, int],
+    foreground_core_block: np.ndarray,
+    keep_block: np.ndarray | None,
+    remove_block: np.ndarray | None,
+    settings: KeySettings,
+) -> np.ndarray:
+    spill = _compute_key_spill_strength(rgb_block, screen_color)
+    return _build_transition_repair_mask(
+        alpha_block,
+        edge_block,
+        fringe_block,
+        spill,
+        background_block,
+        keep_block,
+        remove_block,
+        foreground_core_block,
+        settings,
+    )
 
 
 def _finalize_recovered_transition_alpha(

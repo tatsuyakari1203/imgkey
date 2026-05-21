@@ -15,20 +15,23 @@ def _linear_luma_from_rgb_u8(rgb: np.ndarray) -> np.ndarray:
 
 
 def _compute_key_spill_strength(rgb: np.ndarray, screen_color: tuple[int, int, int]) -> np.ndarray:
-    pix = rgb.astype(np.float32) / 255.0
     key = np.asarray(screen_color, dtype=np.float32) / 255.0
     key = np.clip(key, 1e-4, 1.0)
     key_channel = int(np.argmax(key))
     other = [c for c in range(3) if c != key_channel]
     key_dom = float(key[key_channel] - max(key[other[0]], key[other[1]]))
     if key_dom > 0.12:
-        key_values = pix[:, :, key_channel]
-        other_max = np.maximum(pix[:, :, other[0]], pix[:, :, other[1]])
+        key_values = rgb[:, :, key_channel].astype(np.float32) / 255.0
+        other_max = np.maximum(
+            rgb[:, :, other[0]].astype(np.float32) / 255.0,
+            rgb[:, :, other[1]].astype(np.float32) / 255.0,
+        )
         return np.clip(np.maximum(key_values - other_max, 0.0) / np.maximum(key_values, 1.0 / 255.0), 0.0, 1.0)
 
     # Custom-key fallback: subtract perceived luminance, then project the color
     # residual onto the screen-color residual vector. This detects magenta/cyan
     # halos without treating neutral bright edges as spill.
+    pix = rgb.astype(np.float32) / 255.0
     luma_weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     key_luma = float(key @ luma_weights)
     key_vec = key - key_luma

@@ -65,6 +65,7 @@ from imgkey_engine.cache_keys import (
     runtime_base_matte_cache_fingerprint,
     source_generation_fingerprint,
     source_generation_key,
+    tile_prep_cache_fingerprint,
     transition_alpha_cache_fingerprint,
     validate_settings_classification,
 )
@@ -2331,6 +2332,54 @@ def run_cache_key_classification_tests() -> None:
     assert transition_alpha_cache_fingerprint(color_changed, runtime_base, runtime_reference) == runtime_transition
     assert transition_alpha_cache_fingerprint(replace(base, full_res_crop=(0, 0, 64, 64)), runtime_base, runtime_reference) == runtime_transition
     assert transition_alpha_cache_fingerprint(replace(base, alpha_recover_strength=0.2), runtime_base, runtime_reference) != runtime_transition
+    runtime_tile_prep = tile_prep_cache_fingerprint(
+        base,
+        runtime_transition,
+        source_shape=(100, 120),
+        render_crop=None,
+        screen_radius=12,
+        local_nearest_radius=96,
+        transition_nearest_radius=96,
+        extra_overlap=96,
+        legacy_reference_enabled=True,
+        transition_reference_enabled=True,
+    )
+    assert tile_prep_cache_fingerprint(
+        color_changed,
+        runtime_transition,
+        source_shape=(100, 120),
+        render_crop=None,
+        screen_radius=12,
+        local_nearest_radius=96,
+        transition_nearest_radius=96,
+        extra_overlap=96,
+        legacy_reference_enabled=True,
+        transition_reference_enabled=True,
+    ) == runtime_tile_prep, "same derived tile geometry should reuse tile-local prep across color-only changes"
+    assert tile_prep_cache_fingerprint(
+        replace(base, tile_overlap=64),
+        runtime_transition,
+        source_shape=(100, 120),
+        render_crop=None,
+        screen_radius=12,
+        local_nearest_radius=96,
+        transition_nearest_radius=96,
+        extra_overlap=96,
+        legacy_reference_enabled=True,
+        transition_reference_enabled=True,
+    ) != runtime_tile_prep, "tile overlap must invalidate tile-local prep"
+    assert tile_prep_cache_fingerprint(
+        base,
+        runtime_transition,
+        source_shape=(100, 120),
+        render_crop=(0, 0, 64, 64),
+        screen_radius=12,
+        local_nearest_radius=96,
+        transition_nearest_radius=96,
+        extra_overlap=96,
+        legacy_reference_enabled=True,
+        transition_reference_enabled=True,
+    ) != runtime_tile_prep, "render crop changes tile-local prep coverage"
     proxy_source = source_generation_key("image-a.png", 1, resolution="proxy", shape=(50, 60), proxy_generation=1)
     assert runtime_base_matte_cache_fingerprint(base, proxy_source, mask_base) != runtime_base, "proxy and full cache keys must stay separate"
 
@@ -2417,6 +2466,46 @@ def run_process_cache_contract_tests() -> None:
     assert "transition_alpha.global_recovery" not in color_profile["timings"], "color-only change must not rerun transition alpha"
     assert np.array_equal(color_hit.rgba, color_cold.rgba), "color-only cache hit must equal cold final settings"
 
+    tile_fixture = tile_local_nearest_inner_fixture()
+    tile_settings = replace(
+        tile_fixture.settings,
+        transition_unmix=True,
+        alpha_recover_strength=0.85,
+        local_screen_model=False,
+        use_tiling=True,
+        tile_size=173,
+        tile_overlap=5,
+        gpu_acceleration="Off",
+    )
+    tile_cache = ProcessCache()
+    tile_context = _cache_context("tile-prep-cache", tile_fixture.rgb.shape[:2], resolution="full")
+    original_inner_label_cap = keyer_module._MAX_INNER_LABEL_PIXELS
+    try:
+        keyer_module._MAX_INNER_LABEL_PIXELS = 1
+        tile_first = process_key_image(tile_fixture.rgb, tile_settings, process_cache=tile_cache, cache_context=tile_context)
+        assert tile_first.cache_info is not None and tile_first.cache_info["tile_prep"] == "miss", tile_first.cache_info
+        assert tile_cache.stats()["tile_preps"] == 1, "tile-local prep should publish one bounded per-generation record"
+        tile_color_settings = replace(tile_settings, despill=0.05, fringe_remove=0.20)
+        tile_color_cold = process_key_image(tile_fixture.rgb, tile_color_settings)
+        tile_color_hit, tile_color_profile = _profiled_process_key_image(
+            tile_fixture.rgb,
+            tile_color_settings,
+            process_cache=tile_cache,
+            cache_context=tile_context,
+        )
+        mismatch_cache = ProcessCache()
+        mismatch_context = _cache_context("tile-prep-shape-mismatch", (tile_fixture.rgb.shape[0] + 1, tile_fixture.rgb.shape[1]), resolution="full")
+        mismatch = process_key_image(tile_fixture.rgb, tile_settings, process_cache=mismatch_cache, cache_context=mismatch_context)
+    finally:
+        keyer_module._MAX_INNER_LABEL_PIXELS = original_inner_label_cap
+    assert tile_color_hit.cache_info is not None and tile_color_hit.cache_info["cache_hit"] == "matte", tile_color_hit.cache_info
+    assert tile_color_hit.cache_info["tile_prep"] == "hit", tile_color_hit.cache_info
+    assert int(tile_color_profile.get("counters", {}).get("cache.tile_prep.entry_hit", 0)) > 0, "color-only rerender should reuse tile-local prep entries"
+    assert np.array_equal(tile_color_hit.rgba, tile_color_cold.rgba), "tile-prep cache hit must equal cold color-only output"
+    assert mismatch.cache_info is not None and mismatch.cache_info["cache_miss_reason"] == "context_shape_mismatch", mismatch.cache_info
+    assert mismatch.cache_info["tile_prep"] == "disabled", "shape-mismatched cache contexts must not stage tile prep"
+    assert mismatch_cache.stats()["tile_preps"] == 0, "shape-mismatched cache contexts must not publish stale tile prep"
+
     alpha_changed = replace(settings, tolerance=min(0.44, settings.tolerance + 0.04))
     alpha_miss, alpha_profile = _profiled_process_key_image(rgb, alpha_changed, process_cache=cache, cache_context=full_context)
     assert alpha_miss.cache_info is not None and alpha_miss.cache_info["cache_hit"] is False
@@ -2468,7 +2557,7 @@ def run_process_cache_contract_tests() -> None:
     cancel_tx.discard()
     assert cancel_cache.stats()["transition_alphas"] == 0, "cancelled preview must not publish cache"
 
-    print("Process cache contract checks: full/proxy boundaries, crop export reuse, color-only matte hit, stale/cancel discard")
+    print("Process cache contract checks: full/proxy boundaries, crop export reuse, color-only matte/tile-prep hit, stale/cancel discard")
 
 
 def _write_edge_case_diagnostics(name: str, key_color: tuple[int, int, int]) -> list[str]:
@@ -4901,9 +4990,17 @@ def _large_image_profile_report_text(summary: dict[str, Any]) -> str:
         "global_matte.screen_probability",
         "global_matte.connected_background",
         "global_matte.trimap_alpha",
+        "global_matte.trimap_morphology",
+        "global_matte.trimap_alpha_math",
+        "global_matte.trimap_blur",
         "global_matte.screen_cleanup",
         "transition_alpha.global_recovery",
+        "transition_alpha.tile_candidate_mask",
         "transition_alpha.block",
+        "transition_alpha.spill_mask",
+        "transition_alpha.eligible_mask",
+        "transition_alpha.linearize_eligible",
+        "transition_alpha.solve_eligible",
         "screen_reference.screen_map_global",
         "screen_reference.transition_screen_tile_local",
         "screen_reference.transition_nearest_inner_tile_local",

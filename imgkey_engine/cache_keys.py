@@ -436,3 +436,50 @@ def color_render_cache_fingerprint(settings: KeySettings, transition_key: str, *
             "settings": settings_fields_payload(settings, COLOR_RENDER_RUNTIME_FIELDS),
         }
     )
+
+
+def tile_prep_cache_fingerprint(
+    settings: KeySettings,
+    transition_key: str,
+    *,
+    source_shape: tuple[int, int],
+    render_crop: tuple[int, int, int, int] | None,
+    screen_radius: int,
+    local_nearest_radius: int,
+    transition_nearest_radius: int,
+    extra_overlap: int,
+    legacy_reference_enabled: bool,
+    transition_reference_enabled: bool,
+) -> str:
+    """Fingerprint bounded per-tile screen/reference prep for one render geometry."""
+
+    return stable_fingerprint(
+        {
+            "kind": "tile_prep_cache",
+            "algorithm_version": ALGORITHM_VERSION,
+            "transition_key": str(transition_key),
+            "source_shape": [int(source_shape[0]), int(source_shape[1])],
+            "render_crop": None if render_crop is None else [int(v) for v in render_crop],
+            "settings": settings_fields_payload(
+                settings,
+                (
+                    "local_screen_model",
+                    "max_local_screen_model_pixels",
+                    "use_tiling",
+                    "tile_size",
+                    "tile_overlap",
+                    "fringe_band_radius",
+                    "guided_alpha_refine",
+                    "guided_radius",
+                ),
+            ),
+            "derived": {
+                "screen_radius": int(screen_radius),
+                "local_nearest_radius": int(local_nearest_radius),
+                "transition_nearest_radius": int(transition_nearest_radius),
+                "extra_overlap": int(extra_overlap),
+                "legacy_reference_enabled": bool(legacy_reference_enabled),
+                "transition_reference_enabled": bool(transition_reference_enabled),
+            },
+        }
+    )

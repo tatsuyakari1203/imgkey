@@ -11,6 +11,8 @@ from imgkey_engine.cache import (
     ProcessCacheContext,
     ProcessCacheTransaction,
     ReferencePrepRecord,
+    TilePrepEntry,
+    TilePrepRecord,
     TransitionAlphaRecord,
     mutable_result_copy,
     readonly_array,
@@ -18,6 +20,7 @@ from imgkey_engine.cache import (
 from imgkey_engine.cache_keys import (
     reference_prep_cache_fingerprint,
     runtime_base_matte_cache_fingerprint,
+    tile_prep_cache_fingerprint,
     transition_alpha_cache_fingerprint,
 )
 from imgkey_engine.color_math import (
@@ -229,6 +232,7 @@ def process_key_image(
                 render_crop=crop,
                 include_debug=include_debug,
                 gpu_stats=gpu_stats,
+                cache_transaction=transaction,
             )
         cache_info = _cache_info_dict(transaction)
         if cache_info is not None:
@@ -750,6 +754,9 @@ def _compose_global_matte(
         inner_labels=reference.inner_labels,
         inner_label_to_flat=reference.inner_label_to_flat,
         inner_distance=reference.inner_distance,
+        base_key=base.key,
+        reference_key=reference.key,
+        transition_key=transition.key,
     )
 
 
@@ -763,6 +770,7 @@ def _render_tiled_rgba(
     render_crop: tuple[int, int, int, int] | None = None,
     include_debug: bool = True,
     gpu_stats: dict | None = None,
+    cache_transaction: ProcessCacheTransaction | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     h, w = rgb.shape[:2]
     crop = _normalized_crop(render_crop, w, h)
@@ -789,6 +797,43 @@ def _render_tiled_rgba(
             tiles = [tile for tile in tiles if _tile_intersects_crop(tile[2], tile[3], crop)]
     record_count("render.tiles", len(tiles))
     total = max(1, len(tiles))
+    transition_radius = _foreground_reference_radius(settings) if _transition_reference_enabled(settings) else 0
+    tile_prep_key: str | None = None
+    cached_tile_prep_entries: dict[str, TilePrepEntry] = {}
+    staged_tile_prep_entries: dict[str, TilePrepEntry] = {}
+    tile_prep_hits = 0
+    tile_prep_misses = 0
+    tile_prep_enabled = (
+        cache_transaction is not None
+        and matte.transition_key is not None
+        and cache_transaction.info.transition_alpha != "disabled"
+        and not str(matte.transition_key).startswith("uncached-")
+        and (screen_radius > 0 or (matte.inner_labels is None and local_nearest_radius > 0))
+    )
+    if cache_transaction is not None:
+        cache_transaction.info.tile_prep = "disabled"
+    if tile_prep_enabled and cache_transaction is not None and matte.transition_key is not None:
+        tile_prep_key = tile_prep_cache_fingerprint(
+            settings,
+            matte.transition_key,
+            source_shape=(h, w),
+            render_crop=crop,
+            screen_radius=screen_radius,
+            local_nearest_radius=local_nearest_radius,
+            transition_nearest_radius=transition_radius,
+            extra_overlap=extra_overlap,
+            legacy_reference_enabled=_legacy_inner_repair_enabled(settings),
+            transition_reference_enabled=_transition_reference_enabled(settings),
+        )
+        tile_prep_record = cache_transaction.get_tile_prep(tile_prep_key)
+        if tile_prep_record is not None:
+            cached_tile_prep_entries = dict(tile_prep_record.entries)
+            cache_transaction.info.tile_prep = "hit"
+            record_count("cache.tile_prep.hit")
+        else:
+            cache_transaction.info.tile_prep = "miss"
+            record_count("cache.tile_prep.miss")
+        cache_transaction.info.details["tile_prep_key"] = tile_prep_key[:16]
     gpu_session = None
     if _gpu_acceleration_mode(settings) != "Off":
         _raise_if_cancelled(cancel_callback)
@@ -822,16 +867,29 @@ def _render_tiled_rgba(
             out_y = slice(write_y0 - out_y0, write_y1 - out_y0)
             out_x = slice(write_x0 - out_x0, write_x1 - out_x0)
             rgb_read = rgb[read_y, read_x]
+            tile_entry_key = _tile_prep_entry_key(read_y, read_x, core_y, core_x)
+            cached_tile_entry = cached_tile_prep_entries.get(tile_entry_key) if tile_prep_enabled else None
+            cacheable_screen_tile: np.ndarray | None = None
+            cacheable_nearest_rgb: np.ndarray | None = None
+            cacheable_nearest_valid: np.ndarray | None = None
+            cacheable_transition_rgb: np.ndarray | None = None
+            cacheable_transition_valid: np.ndarray | None = None
+            used_tile_entry = False
             with time_block("screen_reference.screen_tile_resolve"):
                 if matte.screen_map is not None:
                     screen_tile = matte.screen_map[read_y, read_x]
                 elif settings.local_screen_model:
-                    screen_tile = _estimate_screen_tile(
-                        rgb_read,
-                        matte.background_mask[read_y, read_x],
-                        matte.screen_color,
-                        screen_radius,
-                    )
+                    if cached_tile_entry is not None and cached_tile_entry.screen_tile is not None:
+                        screen_tile = cached_tile_entry.screen_tile
+                        used_tile_entry = True
+                    else:
+                        screen_tile = _estimate_screen_tile(
+                            rgb_read,
+                            matte.background_mask[read_y, read_x],
+                            matte.screen_color,
+                            screen_radius,
+                        )
+                        cacheable_screen_tile = screen_tile
                 else:
                     screen_tile = None
             with time_block("screen_reference.nearest_inner_tile"):
@@ -855,6 +913,12 @@ def _render_tiled_rgba(
                         )
                     else:
                         transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
+                elif cached_tile_entry is not None:
+                    nearest_inner_rgb = cached_tile_entry.nearest_inner_rgb
+                    nearest_inner_valid = cached_tile_entry.nearest_inner_valid
+                    transition_inner_rgb = cached_tile_entry.transition_inner_rgb
+                    transition_inner_valid = cached_tile_entry.transition_inner_valid
+                    used_tile_entry = True
                 else:
                     bounded_local_radius = _bounded_tile_local_nearest_inner_radius(
                         local_nearest_radius,
@@ -899,9 +963,29 @@ def _render_tiled_rgba(
                                 transition_inner_rgb, transition_inner_valid = None, None
                         else:
                             transition_inner_rgb, transition_inner_valid = nearest_inner_rgb, nearest_inner_valid
+                        cacheable_nearest_rgb = nearest_inner_rgb
+                        cacheable_nearest_valid = nearest_inner_valid
+                        cacheable_transition_rgb = transition_inner_rgb
+                        cacheable_transition_valid = transition_inner_valid
                     else:
                         nearest_inner_rgb, nearest_inner_valid = None, None
                         transition_inner_rgb, transition_inner_valid = None, None
+                        cacheable_nearest_rgb = None
+                        cacheable_nearest_valid = None
+                        cacheable_transition_rgb = None
+                        cacheable_transition_valid = None
+            if tile_prep_enabled:
+                if used_tile_entry:
+                    tile_prep_hits += 1
+                else:
+                    tile_prep_misses += 1
+                    staged_tile_prep_entries[tile_entry_key] = _make_tile_prep_entry(
+                        screen_tile=cacheable_screen_tile,
+                        nearest_inner_rgb=cacheable_nearest_rgb,
+                        nearest_inner_valid=cacheable_nearest_valid,
+                        transition_inner_rgb=cacheable_transition_rgb,
+                        transition_inner_valid=cacheable_transition_valid,
+                    )
             _raise_if_cancelled(cancel_callback)
             with time_block("render.per_tile_color_render"):
                 rgb_tile, spill_tile = _process_color_tile(
@@ -927,6 +1011,26 @@ def _render_tiled_rgba(
                 if despill_mask is not None:
                     despill_mask[out_y, out_x] = spill_tile[rel_y, rel_x]
             _report(progress_callback, 0.18 + 0.82 * (index / total), f"tile {index}/{total}")
+        if tile_prep_enabled and cache_transaction is not None and tile_prep_key is not None:
+            cache_transaction.info.details["tile_prep"] = {
+                "hits": int(tile_prep_hits),
+                "misses": int(tile_prep_misses),
+                "entries": int(len(cached_tile_prep_entries) + len(staged_tile_prep_entries)),
+            }
+            record_count("cache.tile_prep.entry_hit", tile_prep_hits)
+            record_count("cache.tile_prep.entry_miss", tile_prep_misses)
+            if staged_tile_prep_entries:
+                merged_entries = dict(cached_tile_prep_entries)
+                merged_entries.update(staged_tile_prep_entries)
+                cache_transaction.stage_tile_prep(
+                    TilePrepRecord(
+                        key=tile_prep_key,
+                        transition_key=str(matte.transition_key),
+                        entries=merged_entries,
+                    )
+                )
+                if cached_tile_prep_entries:
+                    cache_transaction.info.tile_prep = "partial"
     finally:
         if gpu_session is not None:
             try:
@@ -955,4 +1059,28 @@ def _tile_extra_overlap(
         max(0, int(settings.fringe_band_radius)),
         guided_radius,
         int(local_nearest_radius),
+    )
+
+
+def _tile_prep_entry_key(read_y: slice, read_x: slice, core_y: slice, core_x: slice) -> str:
+    return (
+        f"ry{int(read_y.start)}:{int(read_y.stop)}|rx{int(read_x.start)}:{int(read_x.stop)}|"
+        f"cy{int(core_y.start)}:{int(core_y.stop)}|cx{int(core_x.start)}:{int(core_x.stop)}"
+    )
+
+
+def _make_tile_prep_entry(
+    *,
+    screen_tile: np.ndarray | None,
+    nearest_inner_rgb: np.ndarray | None,
+    nearest_inner_valid: np.ndarray | None,
+    transition_inner_rgb: np.ndarray | None,
+    transition_inner_valid: np.ndarray | None,
+) -> TilePrepEntry:
+    return TilePrepEntry(
+        screen_tile=readonly_array(screen_tile),
+        nearest_inner_rgb=readonly_array(nearest_inner_rgb),
+        nearest_inner_valid=readonly_array(nearest_inner_valid),
+        transition_inner_rgb=readonly_array(transition_inner_rgb),
+        transition_inner_valid=readonly_array(transition_inner_valid),
     )

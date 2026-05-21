@@ -12,6 +12,7 @@ from .tiling import (
     _raise_if_cancelled,
     _report,
 )
+from .profiling import time_block
 from .types import CancelCallback, KeySettings, ProgressCallback
 
 
@@ -167,39 +168,54 @@ def _build_alpha_from_trimap(
     settings: KeySettings,
 ) -> tuple[np.ndarray, np.ndarray]:
     radius = _effective_edge_radius(settings)
-    bg_u8 = background.astype(np.uint8)
-    kernel = _ellipse_kernel(radius)
-    dilated = cv2.dilate(bg_u8, kernel) > 0
-    eroded = cv2.erode(bg_u8, kernel) > 0
-    edge_mask = dilated & ~eroded
+    with time_block("global_matte.trimap_morphology"):
+        bg_u8 = background.astype(np.uint8)
+        kernel = _ellipse_kernel(radius)
+        dilated = cv2.dilate(bg_u8, kernel) > 0
+        eroded = cv2.erode(bg_u8, kernel) > 0
+        edge_mask = dilated & ~eroded
 
-    transition = (probability > fg_threshold) & (probability < bg_threshold)
-    if np.any(transition):
-        near_bg = cv2.dilate(bg_u8, _ellipse_kernel(max(1, radius * 2))) > 0
-        edge_mask |= transition & near_bg
+        transition = (probability > fg_threshold) & (probability < bg_threshold)
+        if np.any(transition):
+            near_bg = cv2.dilate(bg_u8, _ellipse_kernel(max(1, radius * 2))) > 0
+            edge_mask |= transition & near_bg
 
-    alpha_f = np.ones(probability.shape, dtype=np.float32)
-    alpha_f[background & ~edge_mask] = 0.0
-    prob_f = probability.astype(np.float32) / 255.0
-    fg = fg_threshold / 255.0
-    bg = bg_threshold / 255.0
-    core_bias = (_clip01(settings.core_strength) - 0.5) * 0.08
-    fg = np.clip(fg + core_bias, 0.0, 0.92)
-    soft = max(0.0, float(settings.edge_softness))
-    fg = max(0.0, fg - soft * 0.02)
-    bg = min(1.0, bg + soft * 0.02)
-    edge_alpha = 1.0 - _smoothstep(fg, bg, prob_f)
-    gamma = max(0.05, float(settings.matte_gamma))
-    if abs(gamma - 1.0) > 1e-3:
-        edge_alpha = np.power(np.clip(edge_alpha, 0.0, 1.0), 1.0 / gamma)
-    alpha_f[edge_mask] = edge_alpha[edge_mask]
+    with time_block("global_matte.trimap_alpha_math"):
+        alpha_f = np.ones(probability.shape, dtype=np.float32)
+        alpha_f[background & ~edge_mask] = 0.0
+        fg = fg_threshold / 255.0
+        bg = bg_threshold / 255.0
+        core_bias = (_clip01(settings.core_strength) - 0.5) * 0.08
+        fg = np.clip(fg + core_bias, 0.0, 0.92)
+        soft = max(0.0, float(settings.edge_softness))
+        fg = max(0.0, fg - soft * 0.02)
+        bg = min(1.0, bg + soft * 0.02)
+        if np.any(edge_mask):
+            edge_probability = probability[edge_mask].astype(np.float32) / 255.0
+            edge_alpha = 1.0 - _smoothstep(fg, bg, edge_probability)
+            gamma = max(0.05, float(settings.matte_gamma))
+            if abs(gamma - 1.0) > 1e-3:
+                edge_alpha = np.power(np.clip(edge_alpha, 0.0, 1.0), 1.0 / gamma)
+            alpha_f[edge_mask] = edge_alpha
 
-    if soft > 0 and radius > 1 and np.any(edge_mask):
-        k = _odd_kernel_from_radius(max(0.35, min(radius / 3.0, radius * soft * 0.55)))
-        if k > 1:
-            blurred = cv2.GaussianBlur(alpha_f, (k, k), sigmaX=max(0.2, k / 5.0))
-            blend = min(0.55, soft * 0.45)
-            alpha_f[edge_mask] = alpha_f[edge_mask] * (1.0 - blend) + blurred[edge_mask] * blend
+    with time_block("global_matte.trimap_blur"):
+        if soft > 0 and radius > 1 and np.any(edge_mask):
+            k = _odd_kernel_from_radius(max(0.35, min(radius / 3.0, radius * soft * 0.55)))
+            if k > 1:
+                blend = min(0.55, soft * 0.45)
+                margin = k // 2
+                y0, y1, x0, x1 = _expanded_mask_bounds(edge_mask, margin=margin, shape=alpha_f.shape)
+                roi_area = max(0, y1 - y0) * max(0, x1 - x0)
+                if roi_area > 0 and roi_area < alpha_f.size:
+                    roi_y = slice(y0, y1)
+                    roi_x = slice(x0, x1)
+                    blurred_roi = cv2.GaussianBlur(alpha_f[roi_y, roi_x], (k, k), sigmaX=max(0.2, k / 5.0))
+                    edge_roi = edge_mask[roi_y, roi_x]
+                    alpha_roi = alpha_f[roi_y, roi_x]
+                    alpha_roi[edge_roi] = alpha_roi[edge_roi] * (1.0 - blend) + blurred_roi[edge_roi] * blend
+                else:
+                    blurred = cv2.GaussianBlur(alpha_f, (k, k), sigmaX=max(0.2, k / 5.0))
+                    alpha_f[edge_mask] = alpha_f[edge_mask] * (1.0 - blend) + blurred[edge_mask] * blend
 
     # Keep core regions exact after edge-only smoothing.
     alpha_f[background & ~edge_mask] = 0.0

@@ -115,6 +115,7 @@ If a setting is ambiguous, classify it as matte-affecting until tests prove othe
 
 
 
+
 Current:
 - No
 ### Cache contracts
@@ -138,6 +139,7 @@ Cache publication rules:
 
 
 
+
 Current:
 - No
 ### Target metrics
@@ -148,6 +150,7 @@ Use the three user PNGs plus synthetic baselines:
 - Full Crop target: crop changes should render from a valid matte cache in a few seconds, not recompute `~21-24s`; when cache is invalid, UI must show stale/proxy progress honestly.
 - Export target: if preview already computed a valid full matte, export should avoid the `~22-36s` global recompute.
 - Full export fresh target: reduce D3D12 Auto+PNG below current `~33-54s` by optimizing transition/reference/prep and PNG options.
+
 
 
 
@@ -187,6 +190,7 @@ Scheduling note:
 - Default execution is serial by phase number, except Phase 6.1 (`Fast PNG compression option`) is low-risk and independent after Phase 1 profiling. Planner may pull only P6.1 forward before Phase 4/5 if the user wants an immediate export-save-time win.
 - Phase 6.2 (`Export progress and cache visibility`) depends on Phase 2 cache metadata; before Phase 2 it may only add generic stage progress, not cache-hit/cache-miss UX.
 - Phase 5 (`Persistent D3D12 large-image batch pipeline`) is conditional/follow-on: do not implement native batch/readback work unless Phase 4/P7 profiling proves color-stage overhead is still a meaningful whole-pipeline bottleneck after cache and CPU-prep improvements.
+
 
 
 
@@ -272,6 +276,7 @@ Status:
 Progress notes:
 - Implemented `imgkey_engine.cache_keys` with conservative field classification, stable settings/cache fingerprints, and source/mask/imported-matte generation-key payloads.
 - Added smoke regression coverage proving color-only/backend settings preserve matte fingerprints while source/original-alpha generations, key/tolerance/matte fields, imported matte/mask generations, transition-alpha fields, and tile geometry/local-screen caps invalidate the appropriate matte pipeline keys.
+
 
 
 Current:
@@ -401,6 +406,7 @@ Verification:
 
 Status:
 - Completed
+
 
 
 
@@ -536,6 +542,9 @@ Progress notes:
 
 ---
 
+
+Current:
+- No
 ### Phase 4 - CPU bottleneck reduction for transition/reference prep
 
 Category:
@@ -551,10 +560,15 @@ Isolation:
 - Own `imgkey_engine/transition_alpha.py`, `screen_model.py`, `references.py`, and tests. D3D12 native API changes are out of scope unless explicitly proven small.
 
 Status:
-- Planned
+- Completed
 
-Current:
-- Yes
+
+
+Progress notes:
+- Phase 4 optimized the hot CPU matte-prep stages from profiler data without changing behavior intent: transition alpha now computes spill/linear solve only for eligible pixels and skips tile-local screen/reference prep for tiles with no transition candidates, while trimap alpha computes smoothstep/gamma only on the edge mask and blurs bounded edge ROIs.
+- Added bounded tile-prep cache records keyed by transition matte generation and tile geometry so color-only rerenders reuse tile-local screen/reference artifacts without full-image float maps; stale/cancel publication remains transaction-gated.
+- Real-image Phase 4 timing report is under `.artifact/phase4-large-image/phase4_timing_comparison.md`: compared 25MP user cases show D3D12 export process avg `42.50s -> 21.27s`, global matte `34.29s -> 16.03s`, transition alpha `19.70s -> 8.29s`, transition block `8.67s -> 0.49s`, and trimap alpha `8.87s -> 3.52s`.
+- D3D12 prep-port decision: defer Phase 5. Remaining candidates are readback-heavy CPU-reference prep artifacts (local screen/reference maps, distance labels, trimap morphology) rather than RGB-only color work; if reopened, native work should be limited to a bounded tile-prep batch API with CPU fallback/parity gates.
 
 
 #### P4.1 - Optimize transition alpha and global matte substages on CPU
@@ -578,7 +592,10 @@ Verification:
 - `python smoke_test.py --write-geometric-benchmark`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Optimized transition alpha candidate/linear solve and trimap alpha subpasses; added profiler stages `global_matte.trimap_morphology`, `global_matte.trimap_alpha_math`, `global_matte.trimap_blur`, `transition_alpha.tile_candidate_mask`, `transition_alpha.spill_mask`, `transition_alpha.eligible_mask`, `transition_alpha.linearize_eligible`, and `transition_alpha.solve_eligible`.
 
 
 
@@ -601,7 +618,10 @@ Verification:
 - `python smoke_test.py --gpu-parity`
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Added per-generation `TilePrepRecord`/`TilePrepEntry` cache with compact uint8/bool per-read-tile screen/reference artifacts. Color-only rerenders with the same matte/tile geometry hit `cache_info["tile_prep"] == "hit"` and preserve seam/crop parity.
 
 
 
@@ -624,12 +644,18 @@ Verification:
 - reviewer sanity check before native API expansion if scope is large
 
 Status:
-- Planned
+- Completed
+
+Progress notes:
+- Phase 5 native D3D12 expansion is deferred: post-CPU/cache profiling shows transition solve math is no longer a large kernel target, and remaining prep stages would require CPU-owned alpha/reference-map readbacks with limited reuse. Follow-on spec, if ROI returns, is a bounded native tile-prep batch API only.
 
 
 
 ---
 
+
+Current:
+- No
 ### Phase 5 - Conditional persistent D3D12 large-image batch pipeline
 
 Category:
@@ -648,7 +674,11 @@ Precondition:
 - Execute only if post-Phase-2/4 profiling shows native color-stage overhead, Python/native round trips, or GPU resource churn still materially affects end-to-end preview/export time. If D3D12 color remains `~1-2s` while CPU/PNG dominate, skip or defer this phase and document the reason.
 
 Status:
-- Planned
+- Deferred
+
+
+Progress notes:
+- Deferred after Phase 4 timing review. D3D12 color dispatch remains under roughly `0.9-1.0s` averaged on 25MP exports after CPU prep improvements, while the remaining expensive prep stages are CPU-reference/readback-heavy local screen/reference and trimap morphology work. No native API expansion is justified before the PNG/export UX phase.
 
 
 
@@ -752,6 +782,7 @@ Status:
 
 
 
+
 #### P6.1 - Add Fast PNG compression option
 - Add an export option for faster PNG compression level while preserving lossless pixels.
 - Default may remain current compression unless benchmark and UX justify changing it.
@@ -803,8 +834,9 @@ Status:
 
 
 
+
 Current:
-- No
+- Yes
 ### Phase 7 - Full verification, packaging, and release-readiness gate
 
 Category:
@@ -915,8 +947,8 @@ Stop and ask the user before:
 
 ## 8) Immediate next step
 
-Next execution target is Phase 4 using `deep-worker`:
+Next execution target is Phase 6 using `worker`:
 
-1. Optimize transition alpha and global matte substages on CPU using Phase 1 profiler data.
-2. Reuse valid tile-local screen/reference prep inside a render generation.
-3. Decide any D3D12 dense-prep candidates from post-cache/post-CPU timings.
+1. Add a fast PNG compression option while preserving lossless pixels.
+2. Surface export progress/cache/GPU status during long saves.
+3. Keep Phase 5 deferred unless new timing evidence reopens native D3D12 batch ROI.
