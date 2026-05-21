@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import glob
 import os
 from pathlib import Path
@@ -8,15 +9,19 @@ import subprocess
 import sys
 from typing import Any
 
+from subprocess_utils import run_hidden
+
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 ONE_EXE_PREFERRED_MAX_MB = 150
 ONE_EXE_HARD_STOP_MB = 250
 
+_TOOLCHAIN_PROBE_CACHE: dict[bool, dict[str, Any]] = {}
+
 
 def _command(args: list[str], *, timeout_seconds: float = 4.0) -> dict[str, Any]:
     try:
-        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout_seconds)
+        completed = run_hidden(args, check=False, capture_output=True, text=True, timeout=timeout_seconds)
     except FileNotFoundError as exc:
         return {"ok": False, "returncode": None, "stdout": "", "stderr": "", "error": str(exc)}
     except subprocess.TimeoutExpired as exc:
@@ -350,10 +355,13 @@ def _one_exe_decision(components: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def probe_native_toolchain(*, vulkan_enabled: bool | None = None) -> dict[str, Any]:
+def probe_native_toolchain(*, vulkan_enabled: bool | None = None, refresh: bool = False) -> dict[str, Any]:
     if vulkan_enabled is None:
         raw_vulkan_enabled = os.environ.get("IMGKEY_ENABLE_VULKAN_PROBE")
         vulkan_enabled = True if raw_vulkan_enabled is None else str(raw_vulkan_enabled).strip().lower() in {"1", "true", "yes", "on"}
+    cache_key = bool(vulkan_enabled)
+    if not refresh and cache_key in _TOOLCHAIN_PROBE_CACHE:
+        return copy.deepcopy(_TOOLCHAIN_PROBE_CACHE[cache_key])
     components = {
         "msvc": _probe_msvc(),
         "windows_sdk": _probe_windows_sdk(),
@@ -377,4 +385,5 @@ def probe_native_toolchain(*, vulkan_enabled: bool | None = None) -> dict[str, A
         "packaging_decision": _one_exe_decision(components),
     }
     report["message"] = "Native D3D12 build/audit toolchain appears ready." if status == "ready" else "Native D3D12 build/audit toolchain is incomplete on this machine."
+    _TOOLCHAIN_PROBE_CACHE[cache_key] = copy.deepcopy(report)
     return report

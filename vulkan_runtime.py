@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import os
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any
 
 VULKAN_RUNTIME_SCHEMA_VERSION = 1
 VULKAN_LOADER_NAME = "vulkan-1.dll" if sys.platform == "win32" else "libvulkan.so.1"
+
+_VULKAN_RUNTIME_PROBE_CACHE: dict[str, dict[str, Any]] = {}
 
 VK_SUCCESS = 0
 VK_QUEUE_GRAPHICS_BIT = 0x00000001
@@ -156,6 +159,11 @@ def _device_type_name(device_type: int) -> str:
     }.get(int(device_type), f"unknown_{int(device_type)}")
 
 
+def _remember_vulkan_probe(cache_key: str, result: dict[str, Any]) -> dict[str, Any]:
+    _VULKAN_RUNTIME_PROBE_CACHE[cache_key] = copy.deepcopy(result)
+    return copy.deepcopy(result)
+
+
 def _vendor_name(vendor_id: int) -> str | None:
     return {
         0x10DE: "NVIDIA",
@@ -216,7 +224,7 @@ def _queue_family_properties(vk: ctypes.CDLL, device: ctypes.c_void_p) -> list[d
     return out
 
 
-def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None, *, refresh: bool = False) -> dict[str, Any]:
     """Runtime-load the Vulkan loader and enumerate compute-capable devices.
 
     This probe intentionally uses ctypes and the installed Vulkan loader only. It
@@ -224,6 +232,10 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
     validation layers, because validation layers are development-only and must
     never become packaged app dependencies.
     """
+
+    cache_key = "<default>" if loader_path is None else str(Path(loader_path).expanduser())
+    if not refresh and cache_key in _VULKAN_RUNTIME_PROBE_CACHE:
+        return copy.deepcopy(_VULKAN_RUNTIME_PROBE_CACHE[cache_key])
 
     result: dict[str, Any] = {
         "schema_version": VULKAN_RUNTIME_SCHEMA_VERSION,
@@ -258,7 +270,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                 "message": f"Vulkan loader is unavailable: {type(exc).__name__}: {exc}. CPU/D3D12 fallback remains active.",
             }
         )
-        return result
+        return _remember_vulkan_probe(cache_key, result)
 
     try:
         api_version = ctypes.c_uint32(VK_API_VERSION_1_0)
@@ -303,7 +315,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                     "message": f"Vulkan loader loaded, but vkCreateInstance failed with {_result_name(create_status)}. CPU/D3D12 fallback remains active.",
                 }
             )
-            return result
+            return _remember_vulkan_probe(cache_key, result)
 
         vk.vkEnumeratePhysicalDevices.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_void_p)]
         vk.vkEnumeratePhysicalDevices.restype = ctypes.c_int32
@@ -317,7 +329,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                     "message": f"Vulkan device enumeration failed with {_result_name(enum_status)}. CPU/D3D12 fallback remains active.",
                 }
             )
-            return result
+            return _remember_vulkan_probe(cache_key, result)
         if count.value <= 0:
             result.update(
                 {
@@ -326,7 +338,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                     "message": "Vulkan loader is present, but no Vulkan physical devices were reported. CPU/D3D12 fallback remains active.",
                 }
             )
-            return result
+            return _remember_vulkan_probe(cache_key, result)
 
         device_array_type = ctypes.c_void_p * int(count.value)
         device_handles = device_array_type()
@@ -339,7 +351,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                     "message": f"Vulkan physical device retrieval failed with {_result_name(enum_status)}. CPU/D3D12 fallback remains active.",
                 }
             )
-            return result
+            return _remember_vulkan_probe(cache_key, result)
 
         devices: list[dict[str, Any]] = []
         compute_count = 0
@@ -371,7 +383,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                     "message": "Vulkan devices were found, but none expose a compute queue. CPU/D3D12 fallback remains active.",
                 }
             )
-            return result
+            return _remember_vulkan_probe(cache_key, result)
         result.update(
             {
                 "status": "available",
@@ -380,7 +392,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                 "message": f"Vulkan runtime loader and {compute_count} compute-capable physical device(s) are available.",
             }
         )
-        return result
+        return _remember_vulkan_probe(cache_key, result)
     except Exception as exc:  # pragma: no cover - OS/driver boundary
         result.update(
             {
@@ -390,7 +402,7 @@ def probe_vulkan_runtime(loader_path: str | os.PathLike[str] | None = None) -> d
                 "message": f"Vulkan runtime probe failed: {type(exc).__name__}: {exc}. CPU/D3D12 fallback remains active.",
             }
         )
-        return result
+        return _remember_vulkan_probe(cache_key, result)
     finally:
         if vk is not None and instance.value and hasattr(vk, "vkDestroyInstance"):
             try:

@@ -15,6 +15,7 @@ from typing import Any
 
 import gpu_backend
 import native_toolchain
+from subprocess_utils import run_hidden
 import vulkan_runtime
 
 
@@ -110,7 +111,7 @@ def _base_probe() -> dict[str, Any]:
 
 def _command_result(args: list[str], *, timeout_seconds: float) -> dict[str, Any]:
     try:
-        completed = subprocess.run(
+        completed = run_hidden(
             args,
             check=False,
             capture_output=True,

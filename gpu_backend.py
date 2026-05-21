@@ -98,6 +98,9 @@ _ERROR_REASONS = {
 GPU_BACKEND_ERROR_REASONS = frozenset(_ERROR_REASONS)
 
 _THREAD_STATE = threading.local()
+_DEFAULT_BACKEND_PROBE_LOCK = threading.Lock()
+_DEFAULT_BACKEND_OBJECTS: list["GpuBackend"] | None = None
+_DEFAULT_BACKEND_PROBES: list[dict[str, Any]] | None = None
 
 
 class NativeAbiError(ValueError):
@@ -1272,14 +1275,13 @@ class VulkanComputeBackend:
         self._last_availability: dict[str, Any] | None = None
 
     def probe(self, *, refresh: bool = False) -> dict[str, Any]:
-        del refresh
         try:
             if self._toolchain_probe is not None:
                 toolchain = self._toolchain_probe()
             else:
                 import native_toolchain
 
-                toolchain = native_toolchain.probe_native_toolchain(vulkan_enabled=True)
+                toolchain = native_toolchain.probe_native_toolchain(vulkan_enabled=True, refresh=refresh)
         except Exception as exc:
             toolchain = {
                 "vulkan_gate": {
@@ -1301,7 +1303,7 @@ class VulkanComputeBackend:
             else:
                 import vulkan_runtime
 
-                runtime = vulkan_runtime.probe_vulkan_runtime()
+                runtime = vulkan_runtime.probe_vulkan_runtime(refresh=refresh)
         except Exception as exc:
             runtime = {
                 "schema_version": 1,
@@ -1622,6 +1624,22 @@ def registered_backends() -> list[GpuBackend]:
     return [D3D12ComputeBackend(), VulkanComputeBackend(), CudaCompatBackend()]
 
 
+def _copy_backend_probe_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(item) for item in results]
+
+
+def _cached_default_backend_probe(*, refresh: bool = False) -> tuple[list[GpuBackend], list[dict[str, Any]]]:
+    global _DEFAULT_BACKEND_OBJECTS, _DEFAULT_BACKEND_PROBES
+    with _DEFAULT_BACKEND_PROBE_LOCK:
+        if not refresh and _DEFAULT_BACKEND_OBJECTS is not None and _DEFAULT_BACKEND_PROBES is not None:
+            return _DEFAULT_BACKEND_OBJECTS, _copy_backend_probe_results(_DEFAULT_BACKEND_PROBES)
+        backend_objects = registered_backends()
+        probed = probe_backends(backends=backend_objects, include_cpu=False, refresh=refresh)
+        _DEFAULT_BACKEND_OBJECTS = backend_objects
+        _DEFAULT_BACKEND_PROBES = _copy_backend_probe_results(probed)
+        return backend_objects, _copy_backend_probe_results(probed)
+
+
 def probe_backends(
     *,
     backends: list[GpuBackend] | None = None,
@@ -1765,8 +1783,11 @@ def begin_render(
     refresh: bool = False,
 ) -> GpuBackendSession:
     selected_mode = _normalize_mode(_setting(settings, "gpu_acceleration", "Off") if mode is None else mode)
-    backend_objects = backends if backends is not None else registered_backends()
-    probed = probe_backends(backends=backend_objects, include_cpu=False, refresh=refresh)
+    if backends is None:
+        backend_objects, probed = _cached_default_backend_probe(refresh=refresh)
+    else:
+        backend_objects = backends
+        probed = probe_backends(backends=backend_objects, include_cpu=False, refresh=refresh)
     selection = select_backend(selected_mode, required_capabilities, backends=backend_objects, probed_backends=probed)
     required = capabilities_to_mask(required_capabilities)
     if _should_try_next_backend_for_tile_limit(selection, settings, image_shape, required):

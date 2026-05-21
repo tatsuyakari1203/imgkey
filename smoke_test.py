@@ -2990,6 +2990,14 @@ def run_gpu_runtime_probe_tests() -> None:
     before = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert "torch" not in sys.modules, "smoke test start should not have torch imported"
     gpu_runtime = importlib.import_module("gpu_runtime")
+    subprocess_utils = importlib.import_module("subprocess_utils")
+    hidden_kwargs = subprocess_utils.hidden_subprocess_kwargs()
+    if sys.platform == "win32":
+        assert hidden_kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, "probe subprocesses must use CREATE_NO_WINDOW on Windows"
+        startupinfo = hidden_kwargs.get("startupinfo")
+        assert startupinfo is not None, "probe subprocesses must provide hidden-window STARTUPINFO on Windows"
+        assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW, "probe subprocesses must request hidden startup windows"
+        assert startupinfo.wShowWindow == subprocess.SW_HIDE, "probe subprocesses must set SW_HIDE on Windows"
     after_import = {name for name in HEAVY_OPTIONAL_MODULES if name in sys.modules}
     assert after_import == before, f"importing gpu_runtime must not import heavy runtimes: {after_import - before}"
 
